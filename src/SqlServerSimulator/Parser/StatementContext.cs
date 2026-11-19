@@ -777,6 +777,13 @@ internal sealed class StatementContext
     public bool InsertsTuples;
 
     /// <summary>
+    /// The inline function bodies this statement's execution has bound, by
+    /// call site (the call's argument list): a call made once per outer row
+    /// binds its body once and replays it after (see <see cref="InlineTvfBodyPlan"/>).
+    /// </summary>
+    public Dictionary<object, InlineTvfBodyPlan>? InlineTvfBodies;
+
+    /// <summary>
     /// Freezes the current time for one run of the statement's text and
     /// clears the caches that run fills — once per run, a re-read for the
     /// statement's whole binder report included.
@@ -787,6 +794,7 @@ internal sealed class StatementContext
         this.UtcNow = DateTime.UtcNow;
         this.StatementScopedValues = null;
         this.SubqueryResults = null;
+        this.InlineTvfBodies = null;
         this.MaterializedEqualityIndexes = null;
         this.CorrelatedScanPartitions = null;
         this.OrderedSequenceDraws = null;

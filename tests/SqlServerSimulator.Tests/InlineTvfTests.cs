@@ -547,4 +547,89 @@ public sealed class InlineTvfTests
         AreEqual((byte)state, error.State);
         AreEqual(line, error.LineNumber);
     }
+
+    /// <summary>
+    /// A call made once per outer row binds its body once per statement and
+    /// replays it after, so each of these reads a body whose answer depends on
+    /// the row's argument in a place a parse could have settled it: a filter
+    /// an index seeks, a <c>TOP (@n)</c>, a subquery, a <c>CASE</c>, a string
+    /// pattern and an <c>OPENJSON</c> document.
+    /// </summary>
+    [TestMethod]
+    public void PerRowCalls_EachReadTheirOwnArguments()
+    {
+        var sim = new Simulation();
+        sim.ExecuteBatches(
+            "create table dbo.n (k int not null primary key, tag nvarchar(20) not null, doc nvarchar(max) not null)",
+            """
+            declare @i int = 1;
+            while @i <= 60
+            begin
+                insert dbo.n values (@i, concat(N't', @i % 7), concat(N'[{"p":"a","v":', @i, N'},{"p":"b","v":', @i * 3, N'}]'));
+                set @i += 1;
+            end
+            """,
+            "create function dbo.seek(@k int) returns table as return (select k * 10 as v from dbo.n where k = @k)",
+            "create function dbo.firstn(@n int) returns table as return (select top (@n) k from dbo.n order by k)",
+            "create function dbo.below(@k int) returns table as return (select (select count(*) from dbo.n where k < @k) as c, case when @k % 2 = 0 then N'even' else N'odd' end as parity)",
+            "create function dbo.tagged(@tag nvarchar(20)) returns table as return (select count(*) as c from dbo.n where tag like @tag + N'%')",
+            "create function dbo.vals(@doc nvarchar(max)) returns table as return (select j.p, j.v from openjson(@doc) with (p nvarchar(10) '$.p', v int '$.v') as j)");
+
+        using var connection = sim.CreateOpenConnection();
+        using (var reader = connection.CreateCommand(
+            """
+            select n.k, s.v, (select count(*) from dbo.firstn(n.k)), b.c, b.parity, t.c, (select sum(x.v) from dbo.vals(n.doc) x)
+            from dbo.n cross apply dbo.seek(n.k) s cross apply dbo.below(n.k) b cross apply dbo.tagged(n.tag) t
+            order by n.k
+            """).ExecuteReader())
+        {
+            for (var k = 1; k <= 60; k++)
+            {
+                IsTrue(reader.Read());
+                AreEqual(k, reader.GetInt32(0));
+                AreEqual(k * 10, reader.GetInt32(1));
+                AreEqual(k, reader.GetInt32(2));
+                AreEqual(k - 1, reader.GetInt32(3));
+                AreEqual(k % 2 == 0 ? "even" : "odd", reader.GetString(4));
+                AreEqual(Enumerable.Range(1, 60).Count(i => i % 7 == k % 7), reader.GetInt32(5));
+                AreEqual(k * 4, reader.GetInt32(6));
+            }
+            IsFalse(reader.Read());
+        }
+
+        // The same statement again, and a filter over the function's rows that an EXISTS leaves early.
+        AreEqual(30, connection.CreateCommand(
+            "select count(*) from dbo.n where exists (select 1 from dbo.vals(n.doc) x where x.p = N'b' and x.v % 2 = 0)").ExecuteScalar());
+        AreEqual(30, connection.CreateCommand(
+            "select count(*) from dbo.n where exists (select 1 from dbo.vals(n.doc) x where x.p = N'b' and x.v % 2 = 0)").ExecuteScalar());
+    }
+
+    /// <summary>
+    /// A body bound for one statement is bound again by the next, so a
+    /// function altered between two statements answers with its new body, and
+    /// two statements of one batch each read their own arguments.
+    /// </summary>
+    [TestMethod]
+    public void PerRowCalls_BindAgainForTheNextStatement()
+    {
+        var sim = new Simulation();
+        sim.ExecuteBatches(
+            "create table dbo.n (k int not null primary key)",
+            "insert dbo.n values (1), (2), (3)",
+            "create function dbo.f(@k int) returns table as return (select @k + 1 as v)");
+        using var connection = sim.CreateOpenConnection();
+        AreEqual(9, connection.CreateCommand("select sum(x.v) from dbo.n cross apply dbo.f(n.k) x").ExecuteScalar());
+        _ = connection.CreateCommand("alter function dbo.f(@k int) returns table as return (select @k + 100 as v)").ExecuteNonQuery();
+        AreEqual(306, connection.CreateCommand("select sum(x.v) from dbo.n cross apply dbo.f(n.k) x").ExecuteScalar());
+        using var reader = connection.CreateCommand(
+            """
+            select sum(x.v) from dbo.n cross apply dbo.f(n.k) x;
+            select sum(x.v) from dbo.n cross apply dbo.f(n.k * 2) x;
+            """).ExecuteReader();
+        IsTrue(reader.Read());
+        AreEqual(306, reader.GetInt32(0));
+        IsTrue(reader.NextResult());
+        IsTrue(reader.Read());
+        AreEqual(312, reader.GetInt32(0));
+    }
 }
