@@ -123,40 +123,68 @@ partial class Simulation
         var prefixCount = densityOrdinals.Length;
         var prefixSets = new HashSet<SqlValueKey>[prefixCount];
         var prefixLengths = new double[prefixCount];
-        for (var p = 0; p < prefixCount; p++)
+        // With the density vector leading on the histogram's column, the
+        // one-column prefix's distinct set is the histogram's distinct values
+        // plus one for NULL (two NULLs are one key), which `counts` and
+        // `nulls` already hold, so that set is never filled.
+        var firstTrackedPrefix = prefixCount > 0 && densityOrdinals[0] == leading ? 1 : 0;
+        for (var p = firstTrackedPrefix; p < prefixCount; p++)
             prefixSets[p] = [];
         double keyLength = 0;
         var counts = new Dictionary<SqlValueKey, (SqlValue Value, long Count)>();
         long nulls = 0, rows = 0, unfiltered = 0;
         SqlValue[]? fullRow = null;
+        SqlValue[]? narrowRow = null;
+        var neededOrdinals = NeededOrdinalsWithoutFullDecode(table, keyOrdinals, densityOrdinals, filter);
+        var storedColumns = table.StoredColumns;
+        var storageOrdinals = table.StorageOrdinals;
+        var layout = RowLayout.For(storedColumns);
+        if (neededOrdinals is not null)
+            narrowRow = new SqlValue[table.Columns.Length];
         foreach (var rowBytes in table.Heap.EnumerateRows())
         {
             unfiltered++;
-            fullRow = DecodeFullRowWithComputed(table, rowBytes, batch, ref fullRow);
-            if (filter is not null && EvaluateIndexFilter(filter, table, fullRow, batch) != true)
-                continue;
+            SqlValue[] row;
+            if (neededOrdinals is not null)
+            {
+                // Only the key and density columns are read below; each is a
+                // stored column (checked above), so a per-column decode
+                // through the table's cached layout reads exactly what the
+                // full decode would have put in these slots.
+                foreach (var ordinal in neededOrdinals)
+                    narrowRow![ordinal] = RowDecoder.DecodeColumn(storedColumns, layout, rowBytes, storageOrdinals[ordinal], table.Heap);
+                row = narrowRow!;
+            }
+            else
+            {
+                row = fullRow = DecodeFullRowWithComputed(table, rowBytes, batch, ref fullRow);
+                if (filter is not null && EvaluateIndexFilter(filter, table, row, batch) != true)
+                    continue;
+            }
             rows++;
             double length = 0;
             for (var p = 0; p < prefixCount; p++)
             {
-                var value = fullRow[densityOrdinals[p]];
+                var value = row[densityOrdinals[p]];
                 length += value.IsNull ? 0 : Parser.Expressions.DataLength.ByteCount(value);
                 prefixLengths[p] += length;
+                if (p < firstTrackedPrefix)
+                    continue;
                 var tuple = new SqlValue[p + 1];
                 for (var k = 0; k <= p; k++)
-                    tuple[k] = fullRow[densityOrdinals[k]];
+                    tuple[k] = row[densityOrdinals[k]];
                 _ = prefixSets[p].Add(new SqlValueKey(tuple));
             }
             foreach (var ordinal in keyOrdinals)
-                keyLength += fullRow[ordinal] is { IsNull: false } part ? Parser.Expressions.DataLength.ByteCount(part) : 0;
-            var lead = fullRow[leading];
+                keyLength += row[ordinal] is { IsNull: false } part ? Parser.Expressions.DataLength.ByteCount(part) : 0;
+            var lead = row[leading];
             if (lead.IsNull)
             {
                 nulls++;
                 continue;
             }
-            var key = new SqlValueKey([lead]);
-            counts[key] = counts.TryGetValue(key, out var existing) ? (existing.Value, existing.Count + 1) : (lead, 1);
+            ref var entry = ref System.Runtime.InteropServices.CollectionsMarshal.GetValueRefOrAddDefault(counts, new SqlValueKey([lead]), out var seen);
+            entry = seen ? (entry.Value, entry.Count + 1) : (lead, 1);
         }
 
         var histogram = BuildHistogramSteps(table.Columns[leading].Type, counts, nulls);
@@ -172,7 +200,7 @@ partial class Simulation
         {
             names.Add(table.Columns[densityOrdinals[p]].Name);
             densityVector[p] = new DensityVectorRow(
-                rows == 0 ? 0 : 1f / prefixSets[p].Count,
+                rows == 0 ? 0 : 1f / (p < firstTrackedPrefix ? counts.Count + (nulls > 0 ? 1 : 0) : prefixSets[p].Count),
                 rows == 0 ? 0 : (float)(prefixLengths[p] / rows),
                 string.Join(", ", names));
         }
@@ -187,6 +215,45 @@ partial class Simulation
             table.Columns[leading].Type.Category == SqlTypeCategory.String,
             table.Columns[leading].Type,
             table.ModificationCount(leading));
+    }
+
+    /// <summary>
+    /// The distinct columns a statistic build reads, when it can decode just
+    /// those per row instead of the whole row; null when it needs the full
+    /// decode — a filter to evaluate over every column, a needed column with no
+    /// storage slot, or any computed column in the table that the full decode's
+    /// evaluation could raise from (a persisted or keyed one; an unkeyed
+    /// non-persisted one swallows its error and is never read here).
+    /// </summary>
+    private static int[]? NeededOrdinalsWithoutFullDecode(HeapTable table, int[] keyOrdinals, int[] densityOrdinals, BooleanExpression? filter)
+    {
+        if (filter is not null)
+            return null;
+        for (var i = 0; i < table.Columns.Length; i++)
+        {
+            if (table.Columns[i].Computed is null)
+                continue;
+            if (table.Columns[i].IsPersisted || IsKeyedColumn(table, i))
+                return null;
+        }
+
+        var needed = new List<int>(keyOrdinals.Length + densityOrdinals.Length);
+        foreach (var ordinal in keyOrdinals)
+        {
+            if (!needed.Contains(ordinal))
+                needed.Add(ordinal);
+        }
+        foreach (var ordinal in densityOrdinals)
+        {
+            if (!needed.Contains(ordinal))
+                needed.Add(ordinal);
+        }
+        foreach (var ordinal in needed)
+        {
+            if (table.StorageOrdinals[ordinal] < 0)
+                return null;
+        }
+        return [.. needed];
     }
 
     private static HistogramStep[] BuildHistogramSteps(SqlType keyType, Dictionary<SqlValueKey, (SqlValue Value, long Count)> counts, long nulls)
