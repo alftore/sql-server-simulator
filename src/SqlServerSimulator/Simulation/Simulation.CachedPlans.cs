@@ -102,7 +102,7 @@ partial class Simulation
             return null;
         }
 
-        if (batch.CachedPlanMemo?.Value is { Removed: false } memo && memo.Key.DatabaseId == database.Id && SettingsMatch(batch, memo.Key))
+        if (batch.CachedPlanMemo?.Value is { Removed: false } memo && memo.Key.DatabaseId == database.Id && ReferenceEquals(memo.Database, database) && SettingsMatch(batch, memo.Key))
         {
             _ = Interlocked.Increment(ref memo.UseCount);
             batch.CachedPlan = memo;

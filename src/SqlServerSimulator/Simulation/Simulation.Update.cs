@@ -3047,8 +3047,10 @@ partial class Simulation
         HashSet<(int, int)>? affectedAddrs = null;
 
         var storedColumns = table.StoredColumns;
-        var affectedKeys = new AffectedKeyIndex?[table.KeyConstraints.Count];
-        var existingComputedKeys = new HashSet<SqlValueKey>?[table.KeyConstraints.Count];
+        // Allocated by the first key that moved, which a statement leaving its
+        // key columns alone never meets.
+        AffectedKeyIndex?[]? affectedKeys = null;
+        HashSet<SqlValueKey>?[]? existingComputedKeys = null;
 
         for (var i = Math.Max(onlyRow, 0); i < (onlyRow < 0 ? affected.Count : onlyRow + 1); i++)
         {
@@ -3067,7 +3069,7 @@ partial class Simulation
                     if (!ComputedKeyMoved(constraint.FullOrdinals, affected[i], table, batch))
                         continue;
                     if ((onlyRow < 0 && ComputedKeySharedByAnotherAffectedRow(affected, i, constraint.FullOrdinals, table, filter: null, batch))
-                        || (existingComputedKeys[c] ??= BuildComputedKeySet(table, constraint.FullOrdinals, filter: null, batch, affectedAddrs ??= AffectedAddresses(affected)))
+                        || ((existingComputedKeys ??= new HashSet<SqlValueKey>?[table.KeyConstraints.Count])[c] ??= BuildComputedKeySet(table, constraint.FullOrdinals, filter: null, batch, affectedAddrs ??= AffectedAddresses(affected)))
                             .Contains(new SqlValueKey(ReadKeyByFullOrdinals(constraint.FullOrdinals, affected[i].FullNew))))
                     {
                         UpdateKeyViolations.Note(ref violations, table, affected.Count, i, constraint, KeyConstraintViolationOnComputedKey(table, constraint, affected[i].FullNew));
@@ -3078,7 +3080,7 @@ partial class Simulation
                 if (!KeyTupleMoved(constraint.StorageOrdinals, myStored, affected[i], table))
                     continue;
 
-                if (storedSnapshots is not null && (affectedKeys[c] ??= AffectedKeyIndex.Build(storedSnapshots, constraint.StorageOrdinals, participates: null)).SharedByAnotherRow(i))
+                if (storedSnapshots is not null && ((affectedKeys ??= new AffectedKeyIndex?[table.KeyConstraints.Count])[c] ??= AffectedKeyIndex.Build(storedSnapshots, constraint.StorageOrdinals, participates: null)).SharedByAnotherRow(i))
                 {
                     UpdateKeyViolations.Note(ref violations, table, affected.Count, i, constraint, KeyConstraintViolation(table, constraint, myStored));
                     continue;

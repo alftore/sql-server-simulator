@@ -59,6 +59,17 @@ partial class Simulation
             && parameter.TypeName.Length == 0;
     }
 
+    /// <summary>Whether every one of <paramref name="parameters"/> is an input.</summary>
+    private static bool AllInputParameters(SimulatedDbParameterCollection parameters)
+    {
+        for (var i = 0; i < parameters.Count; i++)
+        {
+            if (parameters[i].Direction is not ParameterDirection.Input)
+                return false;
+        }
+        return true;
+    }
+
     /// <summary>
     /// The declaration SqlClient's <c>sp_executesql</c> call carries for
     /// <paramref name="parameters"/>: each non-return parameter in order,

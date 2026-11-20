@@ -140,6 +140,37 @@ public sealed class PlanCacheDmvTests
         CollectionAssert.AreEqual(new[] { (16, 70, 2L, 2L) }, Statements(sim, text));
     }
 
+    // A parameterized write's plan is remembered on its statement plans, so a
+    // run finding it held counts a use and no new plan; one finding it gone —
+    // the cache cleared between runs — compiles it afresh.
+    [TestMethod]
+    public void ParameterizedInsert_CountsEachRun_AndCompilesAgainOnceTheCacheIsCleared()
+    {
+        var sim = WithTable();
+        const string text = "(@a int)insert t values (@a, 'z')";
+        using var connection = sim.CreateOpenConnection();
+        for (var value = 10; value < 15; value++)
+        {
+            using var command = connection.CreateCommand("insert t values (@a, 'z')", ("@a", value));
+            _ = command.ExecuteNonQuery();
+        }
+        var firstStatements = Statements(sim, text);
+        CollectionAssert.AreEqual(new[] { ("Prepared", 5) }, Plans(sim, text));
+        HasCount(1, firstStatements);
+        AreEqual(5L, firstStatements[0].Executions);
+        AreEqual(5L, firstStatements[0].Rows);
+
+        _ = sim.ExecuteNonQuery("dbcc freeproccache with no_infomsgs");
+        IsEmpty(Plans(sim, text));
+        for (var value = 20; value < 22; value++)
+        {
+            using var command = connection.CreateCommand("insert t values (@a, 'z')", ("@a", value));
+            _ = command.ExecuteNonQuery();
+        }
+        CollectionAssert.AreEqual(new[] { ("Prepared", 2) }, Plans(sim, text));
+        AreEqual(2L, Statements(sim, text)[0].Executions);
+    }
+
     [TestMethod]
     public void DynamicSql_ExecString_IsAdHoc_ExecuteSqlPreparedOnlyWithDeclarations()
     {

@@ -1898,6 +1898,12 @@ public sealed partial class Simulation
             batch.PlanCacheSchemaVersion = schemaVersionAtStart;
             batch.PlanCacheKey = prepared;
             batch.StatementPlans = this.statementPlanSets.TryGetValue(prepared, out var statementPlans) ? statementPlans : null;
+            // The plan's declaration is built from the parameters' names and
+            // types, which the key holds, and their directions, which it
+            // doesn't: only an all-input command with no declaration of its
+            // own reads and writes the memo.
+            if (statementPlans is not null && command.ParameterDeclaration is null && AllInputParameters(command.Parameters))
+                batch.CachedPlanMemo = statementPlans.DmvPlan;
             // The batch resolves unqualified names through the default schema
             // its key was taken under, rather than reading the principal as it
             // parses.
