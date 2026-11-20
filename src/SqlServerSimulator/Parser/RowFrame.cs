@@ -57,14 +57,20 @@ internal sealed class RowFrame(FromSource[] sources, BatchContext batch, Func<Mu
     /// does. It has no outer frame or resolver and never computes through
     /// another frame (Msg 1759 keeps a computed column off a computed one).
     /// </summary>
-    private readonly bool withinSource;
+    private bool IsWithinSource => ReferenceEquals(this.computeFrames, WithinSource);
 
-    /// <summary>One within-source child frame per source, made on the first read of a computed column of it.</summary>
+    /// <summary>
+    /// One within-source child frame per source, made on the first read of a
+    /// computed column of it; <see cref="WithinSource"/> in a child frame
+    /// itself, so the flag costs the frame no field of its own.
+    /// </summary>
     private RowFrame?[]? computeFrames;
+
+    private static readonly RowFrame?[] WithinSource = [];
 
     private RowFrame(FromSource source, BatchContext batch) : this([source], batch, null)
     {
-        this.withinSource = true;
+        this.computeFrames = WithinSource;
         this.Tuple = new byte[1][];
     }
 
@@ -90,17 +96,24 @@ internal sealed class RowFrame(FromSource[] sources, BatchContext batch, Func<Mu
     {
         public Reference? Owner;
         public int Source;
-        public int Column;
 
-        /// <summary>The column is a non-persisted computed column the frame reads through a child frame.</summary>
-        public bool Computed;
+        // The column's ordinal, complemented when it is a non-persisted
+        // computed column the frame reads through a child frame: a flag field
+        // would pad the entry from 16 to 24 bytes, and every frame's table
+        // with it. Only a local source (Source >= 0) carries the flag; an
+        // unbound name (-1, -1) and a row locator keep their column as is.
+        public int StoredColumn;
+
+        public readonly bool Computed => this.Source >= 0 && this.StoredColumn < 0;
+
+        public readonly int Column => this.Computed ? ~this.StoredColumn : this.StoredColumn;
 #if DEBUG
         public int Hits;
 #endif
     }
 
     private SqlValue ResolveByName(MultiPartName name) =>
-        this.withinSource
+        this.IsWithinSource
             ? Selection.ResolveWithinSource(sources[0], this.Tuple[0]!, batch, name)
             : Selection.ResolveAcrossTuple(sources, this.Tuple, name, batch, outerResolver, this.memo ??= new());
 
@@ -122,7 +135,7 @@ internal sealed class RowFrame(FromSource[] sources, BatchContext batch, Func<Mu
     {
         if (computed)
             return this.ComputeThroughFrame(source, column);
-        if (this.withinSource)
+        if (this.IsWithinSource)
             return Selection.DecodeOrCompute(sources[0], column, this.Tuple[0]!, batch);
         if (source >= 0)
             return Selection.ReadSourceColumn(sources, this.Tuple, source, column, batch, outerResolver, this.memo);
@@ -171,7 +184,7 @@ internal sealed class RowFrame(FromSource[] sources, BatchContext batch, Func<Mu
         // column's refusal) and stores nothing when it does.
         var name = reference.ReferencedName;
         var (source, column) = this.Resolve(name);
-        var computed = !this.withinSource && source >= 0 && Selection.ReadsComputedExpression(sources[source], column);
+        var computed = !this.IsWithinSource && source >= 0 && Selection.ReadsComputedExpression(sources[source], column);
 
         var bindings = this.bindings;
         if (ReferenceEquals(bindings, NoBindings))
@@ -193,7 +206,7 @@ internal sealed class RowFrame(FromSource[] sources, BatchContext batch, Func<Mu
             index = reference.Slot & (bindings.Length - 1);
         }
 
-        bindings[index] = new Binding { Owner = reference, Source = source, Column = column, Computed = computed };
+        bindings[index] = new Binding { Owner = reference, Source = source, StoredColumn = computed ? ~column : column };
 
         // A deferred column evaluates through the memo, which it shares with
         // the by-name path so the two resolve one name once.
@@ -205,7 +218,7 @@ internal sealed class RowFrame(FromSource[] sources, BatchContext batch, Func<Mu
 
     private (int Source, int Column) Resolve(MultiPartName name)
     {
-        if (!this.withinSource)
+        if (!this.IsWithinSource)
             return RowLocator.IsLocatorName(name) ? RowLocator.Find(sources, name) : Selection.FindSourceColumn(sources, name);
 
         // Inside a computed column's expression the name is matched on its
