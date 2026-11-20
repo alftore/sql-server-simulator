@@ -632,4 +632,27 @@ public sealed class InlineTvfTests
         IsTrue(reader.Read());
         AreEqual(312, reader.GetInt32(0));
     }
+
+    /// <summary>
+    /// Two functions called without arguments in one statement each answer
+    /// with their own body, and so does one called twice: a call without
+    /// arguments has no argument list of its own to stand for its call site.
+    /// </summary>
+    [TestMethod]
+    public void CallsWithoutArguments_EachReadTheirOwnBody()
+    {
+        var sim = new Simulation();
+        sim.ExecuteBatches(
+            "create table dbo.a (k int not null primary key)",
+            "create table dbo.b (k int not null primary key)",
+            "insert dbo.a values (1), (2), (3)",
+            "insert dbo.b values (10), (20)",
+            "create function dbo.fa() returns table as return (select k from dbo.a)",
+            "create function dbo.fb() returns table as return (select k from dbo.b)");
+        using var connection = sim.CreateOpenConnection();
+        AreEqual("6|30|6", connection.CreateCommand(
+            "select concat_ws('|', (select sum(k) from dbo.fa()), (select sum(k) from dbo.fb()), (select sum(k) from dbo.fa()))").ExecuteScalar());
+        AreEqual(306, connection.CreateCommand(
+            "select sum(x.k + y.k) from dbo.a n cross apply dbo.fa() x cross apply dbo.fb() y").ExecuteScalar());
+    }
 }

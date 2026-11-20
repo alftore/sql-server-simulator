@@ -168,11 +168,16 @@ partial class Simulation
             // and parameter values, which the body reads as it runs. A body
             // of a shape no replay reproduces parses every call, as before.
             var outerStatement = outerBatch.CurrentStatement;
-            var records = tableArguments is null && !browseFlatten;
+            // The call's argument list stands for the call site, which holds
+            // only while it is the site's own array: every call without
+            // arguments passes the one shared empty array, so those bind
+            // every time.
+            var records = tableArguments is null && !browseFlatten && callSite.Length != 0;
             Selection? bodySelection = null;
             if (records && outerStatement.InlineTvfBodies is { } bound && bound.TryGetValue(callSite, out var plan))
             {
-                if (ReferenceEquals(plan.Demand, readerDemand)
+                if (ReferenceEquals(plan.Function, function)
+                    && ReferenceEquals(plan.Demand, readerDemand)
                     && innerBatch.TakeReplayedLocks(plan.Locks, plan.SchemaVersion)
                     && Volatile.Read(ref this.SchemaVersion) == plan.SchemaVersion)
                 {
@@ -208,7 +213,7 @@ partial class Simulation
                         && bodySelection.IntoTarget is null)
                     {
                         (outerStatement.InlineTvfBodies ??= new Dictionary<object, InlineTvfBodyPlan>(ReferenceEqualityComparer.Instance))[callSite] =
-                            new InlineTvfBodyPlan(bodySelection, [.. taken], schemaVersion, readerDemand, bodyStatement);
+                            new InlineTvfBodyPlan(function, bodySelection, [.. taken], schemaVersion, readerDemand, bodyStatement);
                     }
                 }
                 finally
@@ -466,8 +471,9 @@ partial class Simulation
 /// besides building it (the locks and checks it took, the statement-frame
 /// flags it set) and the schema version and reader demand it was bound under.
 /// </summary>
-internal sealed class InlineTvfBodyPlan(Selection body, ReplayedLock[] locks, long schemaVersion, bool[]? demand, StatementContext parsed)
+internal sealed class InlineTvfBodyPlan(InlineTableValuedFunction function, Selection body, ReplayedLock[] locks, long schemaVersion, bool[]? demand, StatementContext parsed)
 {
+    public readonly InlineTableValuedFunction Function = function;
     public readonly Selection Body = body;
     public readonly ReplayedLock[] Locks = locks;
     public readonly long SchemaVersion = schemaVersion;
