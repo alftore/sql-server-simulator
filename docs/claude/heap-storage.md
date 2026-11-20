@@ -71,7 +71,7 @@ See [`catalog-views.md`](catalog-views.md) for the self-consistency contract.
 
 A heap source hands each row to the executor as a fresh `byte[]`, and expressions see a row only through the tuple's column resolver, so nothing downstream of a scan knew which `(page, slot)` a value came from.
 `RowLocator` carries it: a consumer asks for a name no identifier can spell — a marker character in front of a column's leaf for its `TEXTPTR`, or in front of a source index for the bare address — and the name travels the ordinary resolver chain, correlation to an enclosing query included.
-`SourceColumnMemo` binds it on its miss path as a source below -1, which `ResolveAcrossTuple` already branches on for the outer-scope fallthrough, so an ordinary column resolution pays nothing for it.
+A `RowFrame` binds it when a `Reference` first reads it, and `SourceColumnMemo` on its miss path, each as a source below -1, which `ResolveAcrossTuple` already branches on for the outer-scope fallthrough, so an ordinary column resolution pays nothing for it.
 
 The address comes from `RowAddressMap` on `StatementContext.RowAddresses`, keyed by the yielded array's reference: every heap row producer a query source reads through — the lock-checked scan (heap and clustered order, snapshot versions), the unlocked scan, the index-seek and snapshot seek materializations, and the cursor's slot scan — records the array against the address it read, but only while the statement has installed a map.
 A plan whose query block reads a locator installs one as it starts (`Selection.InstallsRowAddresses`, settled at parse by `ParserContext.ReadsRowLocators`), and `Selection.ExecuteWithRowAddresses` installs one around a body it runs with the address of each row appended to its projection.

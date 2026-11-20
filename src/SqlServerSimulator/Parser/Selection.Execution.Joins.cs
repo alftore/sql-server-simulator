@@ -25,7 +25,7 @@ internal sealed partial class Selection
     /// reference reads as a typed NULL.
     /// Falls through to the outer-scope resolver when no local source matches.
     /// </summary>
-    private static SqlValue ResolveAcrossTuple(
+    internal static SqlValue ResolveAcrossTuple(
         FromSource[] sources,
         byte[]?[] tuple,
         MultiPartName name,
@@ -107,14 +107,14 @@ internal sealed partial class Selection
         if (sources.Length == 0)
             return [tuple];
 
-        var memo = new SourceColumnMemo();
-
-        // One cached delegate per enumeration, NOT a local function converted
-        // per call: the conversion allocates a fresh delegate every time, once
-        // per column resolution per row, which was the single largest
-        // allocation source of scan-bound queries (41% of bytes in the
-        // allocation profile).
-        SqlValue resolve(MultiPartName name) => ResolveAcrossTuple(sources, tuple, name, batch, outerResolver, memo);
+        // One frame per enumeration: its by-name delegate is created once, NOT
+        // a local function converted per call — the conversion allocates a
+        // fresh delegate every time, once per column resolution per row, which
+        // was the single largest allocation source of scan-bound queries (41%
+        // of bytes in the allocation profile) — and the operators read their
+        // predicates' references through the frame by reference
+        // (RuntimeContext.Over), the tuple being the one array they mutate.
+        var resolve = new RowFrame(sources, batch, outerResolver) { Tuple = tuple }.Resolver;
 
         var rows = EnumerateFoldRange(sources, joins, 0, sources.Length, tuple, batch, resolve, outerResolver);
         if (sources.Length > 1)
@@ -258,7 +258,7 @@ internal sealed partial class Selection
             tuple[s] = null;
 
         var predicate = join.OnPredicate;
-        var runtime = new RuntimeContext(resolve, batch);
+        var runtime = RuntimeContext.Over(resolve, batch);
         var emitUnmatchedLeft = join.Kind is JoinKind.Left or JoinKind.Full;
         var emitUnmatchedRight = join.Kind is JoinKind.Right or JoinKind.Full;
         var matched = new bool[groupRows.Count];
@@ -383,6 +383,7 @@ internal sealed partial class Selection
         BatchContext batch,
         Func<MultiPartName, SqlValue> resolve)
     {
+        var runtime = RuntimeContext.Over(resolve, batch);
         foreach (var _ in left)
         {
             batch.ThrowIfCancelled();
@@ -392,7 +393,7 @@ internal sealed partial class Selection
             foreach (var row in rows)
             {
                 tuple[level] = row;
-                if (join.OnPredicate is null || join.OnPredicate.Run(new RuntimeContext(resolve, batch)) == true)
+                if (join.OnPredicate is null || join.OnPredicate.Run(runtime) == true)
                     yield return tuple;
             }
             tuple[level] = null;
@@ -415,6 +416,7 @@ internal sealed partial class Selection
         BatchContext batch,
         Func<MultiPartName, SqlValue> resolve)
     {
+        var runtime = RuntimeContext.Over(resolve, batch);
         foreach (var _ in left)
         {
             batch.ThrowIfCancelled();
@@ -425,7 +427,7 @@ internal sealed partial class Selection
             foreach (var row in rows)
             {
                 tuple[level] = row;
-                if (join.OnPredicate is null || join.OnPredicate.Run(new RuntimeContext(resolve, batch)) == true)
+                if (join.OnPredicate is null || join.OnPredicate.Run(runtime) == true)
                 {
                     matched = true;
                     yield return tuple;
@@ -465,6 +467,7 @@ internal sealed partial class Selection
         Func<MultiPartName, SqlValue> resolve,
         Func<MultiPartName, SqlValue>? outerResolver)
     {
+        var runtime = RuntimeContext.Over(resolve, batch);
         List<byte[]> rightRows = right.LateralPlan is { } plan
             ? [.. plan.Execute(batch, outerResolver).RowBytes]
             : [.. right.RowsFor(batch)];
@@ -476,7 +479,7 @@ internal sealed partial class Selection
             for (var i = 0; i < rightRows.Count; i++)
             {
                 tuple[level] = rightRows[i];
-                if (join.OnPredicate is null || join.OnPredicate.Run(new RuntimeContext(resolve, batch)) == true)
+                if (join.OnPredicate is null || join.OnPredicate.Run(runtime) == true)
                 {
                     matched[i] = true;
                     yield return tuple;
@@ -516,6 +519,7 @@ internal sealed partial class Selection
         Func<MultiPartName, SqlValue> resolve,
         Func<MultiPartName, SqlValue>? outerResolver)
     {
+        var runtime = RuntimeContext.Over(resolve, batch);
         List<byte[]> rightRows = right.LateralPlan is { } plan
             ? [.. plan.Execute(batch, outerResolver).RowBytes]
             : [.. right.RowsFor(batch)];
@@ -528,7 +532,7 @@ internal sealed partial class Selection
             for (var i = 0; i < rightRows.Count; i++)
             {
                 tuple[level] = rightRows[i];
-                if (join.OnPredicate is null || join.OnPredicate.Run(new RuntimeContext(resolve, batch)) == true)
+                if (join.OnPredicate is null || join.OnPredicate.Run(runtime) == true)
                 {
                     matched[i] = true;
                     leftMatched = true;
@@ -999,7 +1003,7 @@ internal sealed partial class Selection
         }
 
         JoinDiagnostics.Sink?.Add($"{join.Kind}:NestedLoopIndexSeek(keys={plan.Keys.Length})");
-        var runtime = new RuntimeContext(resolve, batch);
+        var runtime = RuntimeContext.Over(resolve, batch);
         for (var i = 0; i < buffer.Count; i++)
         {
             batch.ThrowIfCancelled();
@@ -1074,7 +1078,7 @@ internal sealed partial class Selection
         bool emitUnmatchedLeft,
         bool emitUnmatchedRight)
     {
-        var runtime = new RuntimeContext(resolve, batch);
+        var runtime = RuntimeContext.Over(resolve, batch);
 
         // Bucket membership is a forward-linked chain over row ordinals —
         // buckets[key] holds the chain's (head, tail) and next[ordinal] links
@@ -1209,7 +1213,7 @@ internal sealed partial class Selection
         Func<MultiPartName, SqlValue> resolve,
         bool emitUnmatchedLeft)
     {
-        var runtime = new RuntimeContext(resolve, batch);
+        var runtime = RuntimeContext.Over(resolve, batch);
         var rightRows = new List<byte[]>(right.BackingTable?.Heap.RowCount ?? 0);
         foreach (var row in right.RowsFor(batch))
             rightRows.Add(row);

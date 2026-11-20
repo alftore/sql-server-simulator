@@ -221,4 +221,20 @@ public sealed class UncorrelatedSubqueryCacheTests
             connection,
             "select a.k2 from outer_rows o cross apply (select o.k as k2 where o.k in (select v from inner_rows)) a"));
     }
+
+    /// <summary>
+    /// A subquery in a join's <c>ON</c> runs under the join fold's own column
+    /// reader, which the subquery's probe wraps to see whether the plan reads
+    /// the outer row. Reading by reference must not skip that wrapper: the
+    /// uncorrelated one still runs once, and the correlated one once per
+    /// distinct value of the names it reads.
+    /// </summary>
+    [TestMethod]
+    [DataRow("select o.id from outer_rows o join g on g.id = o.id and exists (select 1 from inner_rows where v = 40)", 8, 1L)]
+    [DataRow("select o.id from outer_rows o join g on g.id = o.id and g.grp * 40 >= all (select i.v from inner_rows i where i.v < g.grp * 50)", 8, 2L)]
+    public void SubqueryInJoinOn_StillProbesAndReplays(string sql, int rows, long executions)
+    {
+        using var connection = OpenWithGroups();
+        AreEqual((rows, executions), Measure(connection, sql));
+    }
 }

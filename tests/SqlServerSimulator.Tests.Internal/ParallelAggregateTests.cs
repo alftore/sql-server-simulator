@@ -362,6 +362,22 @@ public sealed class ParallelAggregateTests
             """);
 
     /// <summary>
+    /// Every worker reads its columns through a frame of its own: a filter
+    /// reading two columns and a grouping key expression reading a third, so a
+    /// worker's bindings, tuple and decoded values are all its own and the merged
+    /// answer is the serial one.
+    /// </summary>
+    [TestMethod]
+    public void FilterAndKeyExpressionReadingSeveralColumns_ParallelMatchesSerial() =>
+        AssertParallelAgreesWithSerial("""
+            select grp, month(whenOn), count(*), sum(price), min(label)
+            from t
+            where measure > 100 and amount > 50
+            group by grp, month(whenOn)
+            order by grp, month(whenOn)
+            """);
+
+    /// <summary>
     /// A variable reference is pure — it is read once per row but never
     /// written by one — so a WHERE naming one still engages.
     /// </summary>
