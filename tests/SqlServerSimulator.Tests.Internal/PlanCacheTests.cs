@@ -44,6 +44,87 @@ public sealed class PlanCacheTests
         return rows;
     }
 
+    /// <summary>The parameters of each execution in <see cref="ChangedParameterSequence"/>: the command text, then each parameter's name, type (null leaves it to the value), size, direction and value.</summary>
+    private static readonly (string Text, (string Name, System.Data.DbType? Type, int Size, System.Data.ParameterDirection Direction, object? Value)[] Parameters)[] ChangedParameterSequence =
+    [
+        ("select val from t where id = @s", [("@s", System.Data.DbType.Int32, 0, System.Data.ParameterDirection.Input, 1)]),
+        ("select val from t where id = @s", [("@s", System.Data.DbType.Int32, 0, System.Data.ParameterDirection.Input, 2)]),
+        ("select val from t where id = @s", [("@s", System.Data.DbType.Int64, 0, System.Data.ParameterDirection.Input, 2L)]),
+        ("select val from t where id = @s", [("@s", System.Data.DbType.String, 10, System.Data.ParameterDirection.Input, "2")]),
+        ("select val from t where id = @s", [("@s", System.Data.DbType.String, 20, System.Data.ParameterDirection.Input, "2")]),
+        ("select val from t where id = @s", [("@s", System.Data.DbType.String, 20, System.Data.ParameterDirection.InputOutput, "2")]),
+        ("select val from t where id = @s", [("@s", null, 0, System.Data.ParameterDirection.Input, 1)]),
+        ("select val from t where id = @s", [("@s", null, 0, System.Data.ParameterDirection.Input, 3L)]),
+        ("select val from t where id = @s", [("@s", null, 0, System.Data.ParameterDirection.Input, 1)]),
+        ("select val from t where id = @s", [("@s", System.Data.DbType.Int32, 0, System.Data.ParameterDirection.Input, 1), ("@z", System.Data.DbType.Int32, 0, System.Data.ParameterDirection.Input, 5)]),
+        ("select val from t where id = @s", [("@s", System.Data.DbType.Int32, 0, System.Data.ParameterDirection.Input, 1)]),
+        ("select val from t where id = @s", [("@s", System.Data.DbType.Int32, 0, System.Data.ParameterDirection.Input, 1), ("@u", System.Data.DbType.Int32, 0, System.Data.ParameterDirection.Input, 0)]),
+        ("select val from t where id = @s", [("@s", System.Data.DbType.Int32, 0, System.Data.ParameterDirection.Input, 1), ("@v", System.Data.DbType.Int32, 0, System.Data.ParameterDirection.Input, 0)]),
+        ("select val from t where id = @s", [("@s", System.Data.DbType.Int32, 0, System.Data.ParameterDirection.Input, 1), ("@u", System.Data.DbType.Int32, 0, System.Data.ParameterDirection.Input, 0)]),
+    ];
+
+    /// <summary>
+    /// The hits and misses each execution of <see cref="ChangedParameterSequence"/>
+    /// adds, through one command object whose parameters are changed in place
+    /// or through a new command each time.
+    /// </summary>
+    private static List<(long Hits, long Misses)> CacheDeltasOfChangedParameters(bool reuseCommand)
+    {
+        var (sim, connection) = OpenWithTable();
+        var deltas = new List<(long, long)>();
+        using (connection)
+        {
+            using var reused = connection.CreateCommand();
+            foreach (var (text, parameters) in ChangedParameterSequence)
+            {
+                using var fresh = reuseCommand ? null : connection.CreateCommand();
+                var command = fresh ?? reused;
+                command.CommandText = text;
+                while (command.Parameters.Count > parameters.Length)
+                    command.Parameters.RemoveAt(command.Parameters.Count - 1);
+                for (var i = 0; i < parameters.Length; i++)
+                {
+                    var (name, type, size, direction, value) = parameters[i];
+                    if (i >= command.Parameters.Count)
+                    {
+                        _ = command.Parameters.Add(command.CreateParameter());
+                    }
+                    var parameter = command.Parameters[i];
+                    parameter.ParameterName = name;
+                    if (type is { } declared)
+                        parameter.DbType = declared;
+                    else
+                        parameter.ResetDbType();
+                    parameter.Size = size;
+                    parameter.Direction = direction;
+                    parameter.Value = value;
+                }
+                var (hits, misses) = (sim.PlanCacheHits, sim.PlanCacheMisses);
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                }
+                reader.Close();
+                deltas.Add((sim.PlanCacheHits - hits, sim.PlanCacheMisses - misses));
+            }
+        }
+        return deltas;
+    }
+
+    // A command's memo of its parameter shape is checked against the live
+    // parameters on each execution, so changing one between executions keys
+    // the plan as a new command object would.
+    [TestMethod]
+    public void ReusedCommand_WithChangedParameters_HitsAndMissesAsANewCommandEachTime()
+    {
+        var fresh = CacheDeltasOfChangedParameters(reuseCommand: false);
+        var reused = CacheDeltasOfChangedParameters(reuseCommand: true);
+        CollectionAssert.AreEqual(fresh, reused);
+        // The sequence has both outcomes, so the comparison isn't of one constant.
+        Contains(delta => delta.Misses > 0, fresh);
+        Contains(delta => delta.Hits > 0, fresh);
+    }
+
     [TestMethod]
     public void RepeatedQuery_SecondCallHits()
     {

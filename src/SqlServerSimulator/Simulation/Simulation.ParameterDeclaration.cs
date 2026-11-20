@@ -75,51 +75,101 @@ partial class Simulation
             var parameter = parameters[i];
             if (parameter.Direction is ParameterDirection.ReturnValue)
                 continue;
-            if (declaration.Length != 0)
-                _ = declaration.Append(',');
-            if (!parameter.ParameterName.StartsWith('@'))
-                _ = declaration.Append('@');
-            _ = declaration.Append(parameter.ParameterName).Append(' ').Append(SqlClientTypeName(parameter));
-            if (parameter.Direction is ParameterDirection.Output or ParameterDirection.InputOutput)
-                _ = declaration.Append(" output");
+            AppendDeclaredParameter(declaration, parameter.ParameterName, parameter.DbType, parameter.Size, parameter.Precision, parameter.Scale, parameter.Direction);
         }
         return declaration.ToString();
+    }
 
-        static string SqlClientTypeName(SimulatedDbParameter parameter)
+    internal static void AppendDeclaredParameter(StringBuilder declaration, string name, DbType dbType, int size, byte precision, byte scale, ParameterDirection direction)
+    {
+        if (declaration.Length != 0)
+            _ = declaration.Append(',');
+        if (!name.StartsWith('@'))
+            _ = declaration.Append('@');
+        _ = declaration.Append(name).Append(' ').Append(SqlClientTypeName(dbType, size, precision, scale));
+        if (direction is ParameterDirection.Output or ParameterDirection.InputOutput)
+            _ = declaration.Append(" output");
+    }
+
+    private static string SqlClientTypeName(DbType dbType, int size, byte precision, byte scale)
+    {
+        return dbType switch
         {
-            var size = parameter.Size;
-            return parameter.DbType switch
+            DbType.AnsiString => Sized("varchar", 8000, size),
+            DbType.AnsiStringFixedLength => Sized("char", 8000, size),
+            DbType.Binary => Sized("varbinary", 8000, size),
+            DbType.Boolean => "bit",
+            DbType.Byte => "tinyint",
+            DbType.Currency => "money",
+            DbType.Date => "date",
+            DbType.DateTime => "datetime",
+            DbType.DateTime2 => Scaled("datetime2", scale),
+            DbType.DateTimeOffset => Scaled("datetimeoffset", scale),
+            DbType.Decimal => string.Create(CultureInfo.InvariantCulture, $"decimal({(precision == 0 ? 29 : precision)},{scale})"),
+            DbType.Double => "float",
+            DbType.Guid => "uniqueidentifier",
+            DbType.Int16 => "smallint",
+            DbType.Int32 => "int",
+            DbType.Int64 => "bigint",
+            DbType.Object => "sql_variant",
+            DbType.Single => "real",
+            DbType.StringFixedLength => Sized("nchar", 4000, size),
+            DbType.Time => Scaled("time", scale),
+            DbType.Xml => "xml",
+            _ => Sized("nvarchar", 4000, size),
+        };
+
+        static string Sized(string name, int limit, int size) =>
+            size < 0 || size > limit ? $"{name}(max) "
+            : string.Create(CultureInfo.InvariantCulture, $"{name}({(size == 0 ? limit : size)})");
+
+        static string Scaled(string name, byte scale) => string.Create(CultureInfo.InvariantCulture, $"{name}({(scale == 0 ? 7 : scale)})");
+    }
+
+    /// <summary>
+    /// <paramref name="command"/>'s parameters as the plan-cache key and the
+    /// cached-plan declaration read them: the command's memo when every
+    /// parameter still matches it, else a fresh snapshot, which replaces the
+    /// memo. Null when a parameter's DbType can't be
+    /// read (a value mapping to no type, the table-valued-parameter reader),
+    /// which bypasses the cache and keeps no plan, with the memo left as it
+    /// was. Each field is compared through its getter, so an unset type that
+    /// follows its value changes the shape as the value changes it.
+    /// </summary>
+    internal static CommandParameterShape? ParameterShapeOf(SimulatedDbCommand command)
+    {
+        var parameters = command.Parameters;
+        var memo = command.ParameterShape;
+        var count = parameters.Count;
+        var matches = memo is not null && memo.Entries.Length == count;
+        var entries = matches ? memo!.Entries : new ParameterShapeEntry[count];
+        for (var i = 0; i < count; i++)
+        {
+            var p = parameters[i];
+            DbType dbType;
+            try
             {
-                DbType.AnsiString => Sized("varchar", 8000),
-                DbType.AnsiStringFixedLength => Sized("char", 8000),
-                DbType.Binary => Sized("varbinary", 8000),
-                DbType.Boolean => "bit",
-                DbType.Byte => "tinyint",
-                DbType.Currency => "money",
-                DbType.Date => "date",
-                DbType.DateTime => "datetime",
-                DbType.DateTime2 => Scaled("datetime2"),
-                DbType.DateTimeOffset => Scaled("datetimeoffset"),
-                DbType.Decimal => string.Create(CultureInfo.InvariantCulture, $"decimal({(parameter.Precision == 0 ? 29 : parameter.Precision)},{parameter.Scale})"),
-                DbType.Double => "float",
-                DbType.Guid => "uniqueidentifier",
-                DbType.Int16 => "smallint",
-                DbType.Int32 => "int",
-                DbType.Int64 => "bigint",
-                DbType.Object => "sql_variant",
-                DbType.Single => "real",
-                DbType.StringFixedLength => Sized("nchar", 4000),
-                DbType.Time => Scaled("time"),
-                DbType.Xml => "xml",
-                _ => Sized("nvarchar", 4000),
-            };
-
-            string Sized(string name, int limit) =>
-                size < 0 || size > limit ? $"{name}(max) "
-                : string.Create(CultureInfo.InvariantCulture, $"{name}({(size == 0 ? limit : size)})");
-
-            string Scaled(string name) => string.Create(CultureInfo.InvariantCulture, $"{name}({(parameter.Scale == 0 ? 7 : parameter.Scale)})");
+                dbType = p.DbType;
+            }
+            catch (ArgumentException)
+            {
+                return null;
+            }
+            if (matches)
+            {
+                ref readonly var known = ref entries[i];
+                if (known.DbType == dbType && known.Size == p.Size && known.Precision == p.Precision && known.Scale == p.Scale
+                    && known.Direction == p.Direction && string.Equals(known.Name, p.ParameterName, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+                matches = false;
+                entries = new ParameterShapeEntry[count];
+                Array.Copy(memo!.Entries, entries, i);
+            }
+            entries[i] = new ParameterShapeEntry(p.ParameterName, dbType, p.Size, p.Precision, p.Scale, p.Direction);
         }
+        return matches ? memo : command.ParameterShape = new CommandParameterShape(entries);
     }
 
     /// <summary>
@@ -170,5 +220,65 @@ partial class Simulation
         }
 
         return declared;
+    }
+}
+
+/// <summary>One parameter as <see cref="Simulation.ParameterShapeOf"/> read it.</summary>
+internal readonly struct ParameterShapeEntry(string name, DbType dbType, int size, byte precision, byte scale, ParameterDirection direction)
+{
+    public readonly string Name = name;
+    public readonly DbType DbType = dbType;
+    public readonly int Size = size;
+    public readonly byte Precision = precision;
+    public readonly byte Scale = scale;
+    public readonly ParameterDirection Direction = direction;
+}
+
+/// <summary>
+/// A command's parameters as of one execution, immutable: the plan-cache key's
+/// signature and the SqlClient declaration the cached-plan views show, each
+/// built once from the same snapshot so the declaration can't disagree with
+/// the key. Held on the command, which compares it with its parameters before
+/// each use.
+/// </summary>
+internal sealed class CommandParameterShape
+{
+    public readonly ParameterShapeEntry[] Entries;
+
+    /// <summary>
+    /// <c>name:dbtype:size:precision:scale</c> of each parameter, in order,
+    /// joined by <c>|</c>; the empty string for none.
+    /// </summary>
+    public readonly string Signature;
+
+    // Built on first use; two threads building it make the same string.
+    private string? declaration;
+
+    public CommandParameterShape(ParameterShapeEntry[] entries)
+    {
+        this.Entries = entries;
+        var sb = new StringBuilder();
+        foreach (var e in entries)
+        {
+            if (sb.Length > 0)
+                _ = sb.Append('|');
+            _ = sb.Append(e.Name).Append(':').Append((int)e.DbType).Append(':')
+                .Append(e.Size).Append(':').Append((int)e.Precision).Append(':').Append((int)e.Scale);
+        }
+        this.Signature = sb.ToString();
+    }
+
+    /// <summary>The declaration <see cref="Simulation.SqlClientParameterDeclaration"/> builds for the same parameters.</summary>
+    public string GetDeclaration()
+    {
+        if (this.declaration is { } built)
+            return built;
+        var sb = new StringBuilder();
+        foreach (var e in this.Entries)
+        {
+            if (e.Direction is not ParameterDirection.ReturnValue)
+                Simulation.AppendDeclaredParameter(sb, e.Name, e.DbType, e.Size, e.Precision, e.Scale, e.Direction);
+        }
+        return this.declaration = sb.ToString();
     }
 }

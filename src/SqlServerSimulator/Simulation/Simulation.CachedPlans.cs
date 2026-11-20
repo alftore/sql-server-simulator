@@ -112,23 +112,32 @@ partial class Simulation
 
         var command = batch.Parser.Command;
         string? declaration;
-        try
+        switch (batch.CachedPlanOrigin)
         {
-            declaration = batch.CachedPlanOrigin switch
-            {
-                CachedPlanOrigin.ClientBatch when command.Parameters.Count != 0 || command.ParameterDeclaration is not null =>
-                    command.ParameterDeclaration ?? SqlClientParameterDeclaration(command.Parameters),
-                CachedPlanOrigin.ExecuteSql when batch.CachedPlanDeclaration is { Length: > 0 } declared => declared,
-                _ => null,
-            };
-        }
-        catch (ArgumentException)
-        {
-            // A parameter whose value maps to no DbType — the simulator's own
-            // commands binding SqlValues, a TVP bound to a reader — has no
-            // declaration SqlClient would send, so its batch keeps no plan.
-            batch.CachedPlanDeclined = true;
-            return null;
+            case CachedPlanOrigin.ClientBatch when command.Parameters.Count != 0 || command.ParameterDeclaration is not null:
+                if (command.ParameterDeclaration is { } sent)
+                {
+                    declaration = sent;
+                }
+                else if (ParameterShapeOf(command) is { } shape)
+                {
+                    declaration = shape.GetDeclaration();
+                }
+                else
+                {
+                    // A parameter whose value maps to no DbType — the simulator's own
+                    // commands binding SqlValues, a TVP bound to a reader — has no
+                    // declaration SqlClient would send, so its batch keeps no plan.
+                    batch.CachedPlanDeclined = true;
+                    return null;
+                }
+                break;
+            case CachedPlanOrigin.ExecuteSql when batch.CachedPlanDeclaration is { Length: > 0 } declared:
+                declaration = declared;
+                break;
+            default:
+                declaration = null;
+                break;
         }
         var kind = declaration is null ? CachedPlanKind.Adhoc : CachedPlanKind.Prepared;
         // A batch carrying a secret is cached under its masked text — one
@@ -262,10 +271,14 @@ partial class Simulation
             }
             // The plan of a dropped, restored-over or detached database whose id
             // this one took is no plan of this one's.
-            registry.Remove(plan => ReferenceEquals(plan, found));
+            RemoveFoundPlan(registry, found);
         }
         var planText = declaration is null ? text : "(" + declaration + ")" + text;
         return registry.Add(new CachedPlan(key, database, planText, module: null, userId, batch.CurrentStatement.UtcNow), out created);
+
+        // Apart from the caller so the closure's capture is allocated only on this branch.
+        static void RemoveFoundPlan(CachedPlanRegistry registry, CachedPlan found) =>
+            registry.Remove(plan => ReferenceEquals(plan, found));
     }
 
     /// <summary>

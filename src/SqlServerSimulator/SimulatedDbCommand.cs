@@ -39,6 +39,13 @@ public sealed class SimulatedDbCommand : DbCommand
     internal string? ParameterDeclaration;
 
     /// <summary>
+    /// The parameters as the last execution that needed them read them;
+    /// <see cref="Simulation.ParameterShapeOf"/> compares it with the live
+    /// collection before every use.
+    /// </summary>
+    internal CommandParameterShape? ParameterShape;
+
+    /// <summary>
     /// When set, a <c>DECLARE … CURSOR</c> in this command's batch opens an API
     /// server cursor rather than a T-SQL one. Set by the TDS endpoint's
     /// <c>sp_cursoropen</c> family, which synthesizes the DECLARE / OPEN pair;

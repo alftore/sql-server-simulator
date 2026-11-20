@@ -1,3 +1,4 @@
+using System.Data;
 using static Microsoft.VisualStudio.TestTools.UnitTesting.Assert;
 
 namespace SqlServerSimulator;
@@ -138,6 +139,106 @@ public sealed class PlanCacheDmvTests
         const string text = "(@a int)select b from t where a = @a";
         CollectionAssert.AreEqual(new[] { ("Prepared", 2) }, Plans(sim, text));
         CollectionAssert.AreEqual(new[] { (16, 70, 2L, 2L) }, Statements(sim, text));
+    }
+
+    /// <summary>The state a command's parameters are in for each execution of <see cref="RunShapeSequence"/>.</summary>
+    private static readonly (string Text, (string Name, DbType? Type, int Size, ParameterDirection Direction, object? Value)[] Parameters)[] ShapeSequence =
+    [
+        ("select a from t where b = @s", [("@s", DbType.String, 10, ParameterDirection.Input, "x")]),
+        ("select a from t where b = @s", [("@s", DbType.String, 10, ParameterDirection.Input, "y")]),
+        // A parameter's size changes.
+        ("select a from t where b = @s", [("@s", DbType.String, 20, ParameterDirection.Input, "x")]),
+        // Its DbType changes.
+        ("select a from t where b = @s", [("@s", DbType.AnsiString, 20, ParameterDirection.Input, "x")]),
+        // Its direction goes from Input to InputOutput.
+        ("select a from t where b = @s", [("@s", DbType.AnsiString, 20, ParameterDirection.InputOutput, "x")]),
+        ("select b from t where a = @a", [("@a", DbType.Int32, 0, ParameterDirection.Input, 1)]),
+        // A parameter is added, then removed.
+        ("select b from t where a = @a", [("@a", DbType.Int32, 0, ParameterDirection.Input, 1), ("@z", DbType.Int32, 0, ParameterDirection.Input, 5)]),
+        ("select b from t where a = @a", [("@a", DbType.Int32, 0, ParameterDirection.Input, 2)]),
+        // An unset DbType follows the value from int to long and back.
+        ("select b from t where a = @a", [("@a", null, 0, ParameterDirection.Input, 1)]),
+        ("select b from t where a = @a", [("@a", null, 0, ParameterDirection.Input, 2L)]),
+        ("select b from t where a = @a", [("@a", null, 0, ParameterDirection.Input, 1)]),
+        // A parameter the text doesn't use is renamed.
+        ("select b from t where a = @a", [("@a", DbType.Int32, 0, ParameterDirection.Input, 1), ("@u", DbType.Int32, 0, ParameterDirection.Input, 0)]),
+        ("select b from t where a = @a", [("@a", DbType.Int32, 0, ParameterDirection.Input, 1), ("@v", DbType.Int32, 0, ParameterDirection.Input, 0)]),
+        ("select b from t where a = @a", [("@a", DbType.Int32, 0, ParameterDirection.Input, 1), ("@u", DbType.Int32, 0, ParameterDirection.Input, 0)]),
+    ];
+
+    /// <summary>
+    /// The prepared plans of a simulation, each with its use count, after
+    /// <see cref="ShapeSequence"/> ran on it through one command object whose
+    /// parameters were changed in place, or through a new command each time.
+    /// </summary>
+    private static List<(string Text, int UseCount)> RunShapeSequence(bool reuseCommand)
+    {
+        var sim = WithTable();
+        using (var connection = sim.CreateOpenConnection())
+        {
+            using var reused = connection.CreateCommand();
+            foreach (var (text, parameters) in ShapeSequence)
+            {
+                using var fresh = reuseCommand ? null : connection.CreateCommand();
+                var command = fresh ?? reused;
+                command.CommandText = text;
+                while (command.Parameters.Count > parameters.Length)
+                    command.Parameters.RemoveAt(command.Parameters.Count - 1);
+                for (var i = 0; i < parameters.Length; i++)
+                {
+                    var (name, type, size, direction, value) = parameters[i];
+                    if (i >= command.Parameters.Count)
+                    {
+                        _ = command.Parameters.Add(command.CreateParameter());
+                    }
+                    var parameter = command.Parameters[i];
+                    parameter.ParameterName = name;
+                    if (type is { } declared)
+                        parameter.DbType = declared;
+                    else
+                        parameter.ResetDbType();
+                    parameter.Size = size;
+                    parameter.Direction = direction;
+                    parameter.Value = value;
+                }
+                _ = command.ExecuteScalar();
+            }
+        }
+
+        using var listing = sim.CreateOpenConnection();
+        using var plans = listing.CreateCommand("""
+            select st.text, cp.usecounts from sys.dm_exec_cached_plans cp
+            cross apply sys.dm_exec_sql_text(cp.plan_handle) st
+            where cp.objtype = 'Prepared' order by st.text
+            """);
+        using var reader = plans.ExecuteReader();
+        return [.. reader.EnumerateRecords().Select(record => (record.GetString(0), record.GetInt32(1)))];
+    }
+
+    // A command's memo of its parameter shape is checked against the live
+    // parameters on each execution, so changing one between executions files
+    // the plan a new command object would.
+    [TestMethod]
+    public void ReusedCommand_WithChangedParameters_FilesTheSamePlansAsANewCommandEachTime()
+    {
+        var fresh = RunShapeSequence(reuseCommand: false);
+        var reused = RunShapeSequence(reuseCommand: true);
+        CollectionAssert.AreEqual(fresh, reused);
+        // The sequence did reach each of the declarations it changes the shape into.
+        CollectionAssert.IsSubsetOf(
+            new[]
+            {
+                "(@s nvarchar(10))select a from t where b = @s",
+                "(@s nvarchar(20))select a from t where b = @s",
+                "(@s varchar(20))select a from t where b = @s",
+                "(@s varchar(20) output)select a from t where b = @s",
+                "(@a int)select b from t where a = @a",
+                "(@a int,@z int)select b from t where a = @a",
+                "(@a bigint)select b from t where a = @a",
+                "(@a int,@u int)select b from t where a = @a",
+                "(@a int,@v int)select b from t where a = @a",
+            },
+            reused.Select(plan => plan.Text).ToList());
     }
 
     [TestMethod]
