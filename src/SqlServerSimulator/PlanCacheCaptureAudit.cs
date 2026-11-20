@@ -108,9 +108,9 @@ internal static class PlanCacheCaptureAudit
     public static void Verify(IEnumerable<object> plans, string commandText, (string Name, HeapTable Table)[]? boundTemps = null)
     {
         var seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
-        var pending = new Stack<(object Value, string Path)>();
+        var pending = new Stack<(object Value, PathStep Path)>();
         foreach (var plan in plans)
-            pending.Push((plan, plan.GetType().Name));
+            pending.Push((plan, new PathStep(null, plan.GetType().Name)));
         while (pending.TryPop(out var item))
         {
             var (value, path) = item;
@@ -127,7 +127,7 @@ internal static class PlanCacheCaptureAudit
                     foreach (var single in d.GetInvocationList())
                     {
                         if (single.Target is { } target)
-                            pending.Push((target, $"{path}->{single.Method.Name}"));
+                            pending.Push((target, new PathStep(path, $"->{single.Method.Name}")));
                     }
                     continue;
                 case Array array:
@@ -137,7 +137,7 @@ internal static class PlanCacheCaptureAudit
                     foreach (var element in array)
                     {
                         if (element is not null)
-                            pending.Push((element, $"{path}[{index}]"));
+                            pending.Push((element, new PathStep(path, $"[{index}]")));
                         index++;
                     }
                     continue;
@@ -145,8 +145,30 @@ internal static class PlanCacheCaptureAudit
             foreach (var field in fieldsByType.GetOrAdd(type, AllInstanceFields))
             {
                 if (field.GetValue(value) is { } child && !IsLeaf(child.GetType()))
-                    pending.Push((child, $"{path}.{field.Name}"));
+                    pending.Push((child, new PathStep(path, $".{field.Name}")));
             }
+        }
+    }
+
+    /// <summary>
+    /// One step of the path to an object being walked, linked to the step before
+    /// it so a step costs one small node however deep it is: a plan chaining
+    /// thousands of branches is walked thousands of steps deep, and a path built
+    /// as a string at each step would copy the whole path every time, quadratic
+    /// in the chain. The text is only built when a violation is raised.
+    /// </summary>
+    private sealed class PathStep(PathStep? previous, string text)
+    {
+        private readonly PathStep? previous = previous;
+        private readonly string text = text;
+
+        public override string ToString()
+        {
+            List<string> parts = [];
+            for (var step = this; step is not null; step = step.previous)
+                parts.Add(step.text);
+            parts.Reverse();
+            return string.Concat(parts);
         }
     }
 
