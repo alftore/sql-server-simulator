@@ -683,9 +683,9 @@ public sealed class PlanCacheTests
         // A recursive-CTE plan rebinds CteBinding.CurrentIterationRows at
         // execution time, so a cached copy replayed concurrently would
         // cross-feed iteration rowsets between commands. Both anchor shapes
-        // must decline promotion: the FROM-less anchor via
-        // BuildSynthesizedSqlRow's disqualifier, the FROM-ful anchor via the
-        // recursive-CTE builder's own. Depth still resolves per execution.
+        // must decline promotion, both through the recursive-CTE builder's own
+        // disqualifier (a literal FROM-less anchor is no longer disqualified by
+        // BuildSynthesizedSqlRow). Depth still resolves per execution.
         var (sim, connection) = OpenWithTable();
         using (connection)
         {
@@ -736,6 +736,364 @@ public sealed class PlanCacheTests
             AreEqual(3, RunCount(connection, "select id from t"));
             AreEqual(hitsBefore, sim.PlanCacheHits);
             AreEqual(entriesBefore, sim.PlanCacheCount);
+        }
+    }
+
+    // ---- a FROM-less SELECT bakes its row while parsing, so a plan holding
+    // one may be shared only when that row follows from the key alone: one
+    // literal token per item (a minus over a number, parentheses), nothing that
+    // reads the session, the clock or a variable, and nothing that raised. ----
+
+    private static (string[] Types, List<object?[]> Rows) ReadAll(SimulatedDbConnection connection, string sql, params (string Name, object Value)[] parameters)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        foreach (var (name, value) in parameters)
+        {
+            var p = command.CreateParameter();
+            p.ParameterName = name;
+            p.Value = value;
+            _ = command.Parameters.Add(p);
+        }
+
+        using var reader = command.ExecuteReader();
+        var types = new string[reader.FieldCount];
+        for (var i = 0; i < types.Length; i++)
+            types[i] = reader.GetDataTypeName(i) + "/" + reader.GetFieldType(i).Name;
+        var rows = new List<object?[]>();
+        while (reader.Read())
+        {
+            var row = new object?[types.Length];
+            for (var i = 0; i < row.Length; i++)
+                row[i] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+            rows.Add(row);
+        }
+        return (types, rows);
+    }
+
+    private static void ExecuteBatch(SimulatedDbConnection connection, string sql)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        _ = command.ExecuteNonQuery();
+    }
+
+    private static string Show((string[] Types, List<object?[]> Rows) result) =>
+        string.Join(",", result.Types) + "|" + string.Join(";", result.Rows.Select(row => string.Join(",", row.Select(v => v is byte[] b ? Convert.ToHexString(b) : v is DateTime d ? d.ToString("O", System.Globalization.CultureInfo.InvariantCulture) : v?.ToString() ?? "NULL"))));
+
+    [TestMethod]
+    public void LiteralOnlySelect_Hits()
+    {
+        var sim = new Simulation();
+        using var connection = sim.CreateDbConnection();
+        connection.Open();
+        AreEqual(1, RunScalar(connection, "select 1"));
+        var hitsBefore = sim.PlanCacheHits;
+        for (var i = 0; i < 20; i++)
+            AreEqual(1, RunScalar(connection, "select 1"));
+        AreEqual(hitsBefore + 20, sim.PlanCacheHits);
+    }
+
+    [TestMethod]
+    public void LiteralOnlySelect_ManyItems_HitsAndMatchesAFreshParse()
+    {
+        const string sql = "select 1, N'x', NULL, -2.5, 'a', 0x0102, $1, 1e0, (3), -(4), -1.5e0, -$2.5, N'', (NULL), -NULL";
+        var sim = new Simulation();
+        using var connection = sim.CreateDbConnection();
+        connection.Open();
+        var fresh = Show(ReadAll(connection, sql));
+        var hitsBefore = sim.PlanCacheHits;
+        for (var i = 0; i < 5; i++)
+            AreEqual(fresh, Show(ReadAll(connection, sql)));
+        AreEqual(hitsBefore + 5, sim.PlanCacheHits);
+
+        // Another session replays the plan the first one recorded.
+        using var other = sim.CreateDbConnection();
+        other.Open();
+        AreEqual(fresh, Show(ReadAll(other, sql)));
+        AreEqual(hitsBefore + 6, sim.PlanCacheHits);
+
+        // And a simulation that never saw the text parses the same row.
+        using var separate = new Simulation().CreateDbConnection();
+        separate.Open();
+        AreEqual(fresh, Show(ReadAll(separate, sql)));
+    }
+
+    [TestMethod]
+    public void LiteralOnlySelect_ReplayedBatchOfSeveral_Hits()
+    {
+        var sim = new Simulation();
+        using var connection = sim.CreateDbConnection();
+        connection.Open();
+        const string sql = "select 1; select N'two'; select -3";
+        var fresh = Show(ReadAll(connection, sql));
+        var hitsBefore = sim.PlanCacheHits;
+        AreEqual(fresh, Show(ReadAll(connection, sql)));
+        AreEqual(hitsBefore + 1, sim.PlanCacheHits);
+    }
+
+    [TestMethod]
+    public void LiteralOnlySelect_UnderTheSharedPlan_ConcurrentSessionsReadTheirOwnCorrectRow()
+    {
+        var sim = new Simulation();
+        const string sql = "select 1 a, N'x' b, NULL c, -2.5 d";
+        using (var seed = sim.CreateDbConnection())
+        {
+            seed.Open();
+            _ = ReadAll(seed, sql);
+        }
+
+        var wrong = 0;
+        _ = Parallel.For(0, 8, _ =>
+        {
+            using var c = sim.CreateDbConnection();
+            c.Open();
+            for (var i = 0; i < 200; i++)
+            {
+                var (_, rows) = ReadAll(c, sql);
+                if (rows.Count != 1 || !Equals(rows[0][0], 1) || !Equals(rows[0][1], "x") || rows[0][2] is not null || !Equals(rows[0][3], -2.5m))
+                    _ = Interlocked.Increment(ref wrong);
+            }
+        });
+        AreEqual(0, wrong);
+        IsGreaterThan(1000L, sim.PlanCacheHits, $"hits {sim.PlanCacheHits} misses {sim.PlanCacheMisses}");
+    }
+
+    [TestMethod]
+    public void SourceLessSelectReadingTheClockOrASessionValue_NeverCached()
+    {
+        var sim = new Simulation();
+        using var connection = sim.CreateDbConnection();
+        connection.Open();
+        foreach (var sql in new[] { "select getdate()", "select sysdatetime()", "select newid()", "select 1, getutcdate()", "select -(1), newid()", "select {t '10:00:00'}", "select {d '2020-01-02'}", "select 1e-400" })
+        {
+            var hitsBefore = sim.PlanCacheHits;
+            var results = new HashSet<string>();
+            for (var i = 0; i < 3; i++)
+            {
+                System.Threading.Thread.Sleep(20);
+                _ = results.Add(Show(ReadAll(connection, sql)));
+            }
+            AreEqual(hitsBefore, sim.PlanCacheHits, sql);
+            if ((sql.Contains("date", StringComparison.Ordinal) && !sql.Contains('{', StringComparison.Ordinal)) || sql.Contains("newid", StringComparison.Ordinal))
+                HasCount(3, results, sql + " => " + string.Join(" # ", results));
+        }
+    }
+
+    [TestMethod]
+    public void SelectOfAParameter_NeverCached_AndReadsEachValue()
+    {
+        var sim = new Simulation();
+        using var connection = sim.CreateDbConnection();
+        connection.Open();
+        var hitsBefore = sim.PlanCacheHits;
+        foreach (var value in new[] { 5, 6, 7 })
+            AreEqual(value, ReadAll(connection, "select @p", ("@p", value)).Rows[0][0]);
+        AreEqual(hitsBefore, sim.PlanCacheHits);
+    }
+
+    [TestMethod]
+    public void SelectOfRowCount_ReadsThePriorStatementEachTime()
+    {
+        var (_, connection) = OpenWithTable();
+        using (connection)
+        {
+            _ = RunCount(connection, "select val from t");
+            AreEqual(3, RunScalar(connection, "select @@rowcount"));
+            _ = RunCount(connection, "select val from t where id = 1");
+            AreEqual(1, RunScalar(connection, "select @@rowcount"));
+            _ = RunCount(connection, "select val from t where id > 1");
+            AreEqual(2, RunScalar(connection, "select @@rowcount"));
+        }
+    }
+
+    [TestMethod]
+    public void SelectOfScopeIdentity_ReadsEachInsert()
+    {
+        var sim = new Simulation();
+        using var connection = sim.CreateDbConnection();
+        connection.Open();
+        ExecuteBatch(connection, "create table g (id int identity primary key, v int)");
+        const string sql = "insert g (v) values (1); select scope_identity()";
+        var seen = new List<decimal>();
+        for (var i = 0; i < 4; i++)
+            seen.Add(Convert.ToDecimal(ReadAll(connection, sql).Rows[0][0], System.Globalization.CultureInfo.InvariantCulture));
+        CollectionAssert.AreEqual(new[] { 1m, 2m, 3m, 4m }, seen);
+    }
+
+    [TestMethod]
+    public void SelectTopOfAParameter_AndWhereOnAParameter_NeverCached()
+    {
+        var sim = new Simulation();
+        using var connection = sim.CreateDbConnection();
+        connection.Open();
+        var hitsBefore = sim.PlanCacheHits;
+        foreach (var (n, expected) in new[] { (1, 1), (0, 0), (1, 1), (0, 0) })
+        {
+            HasCount(expected, ReadAll(connection, "select top (@n) 1", ("@n", n)).Rows);
+            HasCount(expected, ReadAll(connection, "select 1 where @n = 1", ("@n", n)).Rows);
+        }
+        AreEqual(hitsBefore, sim.PlanCacheHits);
+    }
+
+    [TestMethod]
+    public void SelectOfADivisionByZero_RaisesEveryTime_AndFollowsTheSessionsArithmeticSettings()
+    {
+        var sim = new Simulation();
+        using var connection = sim.CreateDbConnection();
+        connection.Open();
+        var hitsBefore = sim.PlanCacheHits;
+        for (var i = 0; i < 3; i++)
+            _ = ThrowsExactly<SimulatedSqlException>(() => ReadAll(connection, "select 1/0"));
+
+        // Arithmetic overflow settings only turn the error into NULL when
+        // both are off, and only for the session that set them.
+        ExecuteBatch(connection, "set arithabort off");
+        _ = ThrowsExactly<SimulatedSqlException>(() => ReadAll(connection, "select 1/0"));
+        ExecuteBatch(connection, "set ansi_warnings off");
+        for (var i = 0; i < 3; i++)
+            IsNull(ReadAll(connection, "select 1/0").Rows[0][0]);
+
+        using var other = sim.CreateDbConnection();
+        other.Open();
+        _ = ThrowsExactly<SimulatedSqlException>(() => ReadAll(other, "select 1/0"));
+
+        ExecuteBatch(connection, "set ansi_warnings on; set arithabort on");
+        _ = ThrowsExactly<SimulatedSqlException>(() => ReadAll(connection, "select 1/0"));
+        AreEqual(hitsBefore, sim.PlanCacheHits);
+
+        // A negated string, whose conversion could overflow, is not shared either.
+        _ = ThrowsExactly<SimulatedSqlException>(() => ReadAll(other, "select -'99999999999'"));
+        AreEqual(hitsBefore, sim.PlanCacheHits);
+    }
+
+    [TestMethod]
+    public void LiteralOnlySelect_AfterASchemaChange_ParsesAgainAndIsCachedAgain()
+    {
+        var sim = new Simulation();
+        using var connection = sim.CreateDbConnection();
+        connection.Open();
+        _ = RunScalar(connection, "select 1");
+        AreEqual(1, RunScalar(connection, "select 1"));
+        var entries = sim.PlanCacheCount;
+        var hitsBefore = sim.PlanCacheHits;
+
+        ExecuteBatch(connection, "create table s1 (a int)");
+        AreEqual(1, RunScalar(connection, "select 1"));
+        AreEqual(hitsBefore, sim.PlanCacheHits);
+        AreEqual(1, RunScalar(connection, "select 1"));
+        AreEqual(hitsBefore + 1, sim.PlanCacheHits);
+        AreEqual(entries, sim.PlanCacheCount);
+    }
+
+    [TestMethod]
+    public void LiteralOnlySelect_AfterTheDatabaseCollationChanges_ReadsTheNewCollation()
+    {
+        var sim = new Simulation();
+        using var connection = sim.CreateDbConnection();
+        connection.Open();
+        ExecuteBatch(connection, "create database c1");
+        ExecuteBatch(connection, "use c1");
+        const string sql = "select 'ア'";
+        var before = Show(ReadAll(connection, sql));
+        AreEqual(before, Show(ReadAll(connection, sql)));
+        ExecuteBatch(connection, "alter database c1 collate Japanese_CI_AS");
+        var after = Show(ReadAll(connection, sql));
+        AreNotEqual(before, after);
+        AreEqual(after, Show(ReadAll(connection, sql)));
+    }
+
+    [TestMethod]
+    public void LiteralOnlySelect_InTwoDatabases_KeepsAPlanForEach()
+    {
+        var sim = new Simulation();
+        using var connection = sim.CreateDbConnection();
+        connection.Open();
+        var home = (string)RunScalar(connection, "select db_name()");
+        ExecuteBatch(connection, "create database d2");
+        const string sql = "select 7, 'x'";
+        var first = Show(ReadAll(connection, sql));
+        _ = ReadAll(connection, sql);
+        ExecuteBatch(connection, "use d2");
+        var hitsBefore = sim.PlanCacheHits;
+        AreEqual(first, Show(ReadAll(connection, sql)));
+        AreEqual(hitsBefore, sim.PlanCacheHits);
+        AreEqual(first, Show(ReadAll(connection, sql)));
+        AreEqual(hitsBefore + 1, sim.PlanCacheHits);
+        ExecuteBatch(connection, "use " + home);
+        AreEqual(first, Show(ReadAll(connection, sql)));
+        AreEqual(hitsBefore + 2, sim.PlanCacheHits);
+    }
+
+    [TestMethod]
+    public void LiteralOnlySelect_SessionsOfDifferentQuotedIdentifierAndDateFormat_EachGetTheirAnswer()
+    {
+        var sim = new Simulation();
+        using var quoted = sim.CreateDbConnection();
+        using var unquoted = sim.CreateDbConnection();
+        quoted.Open();
+        unquoted.Open();
+        ExecuteBatch(unquoted, "set quoted_identifier off; set dateformat dmy");
+
+        for (var i = 0; i < 3; i++)
+        {
+            // A double-quoted word is a string only with QUOTED_IDENTIFIER OFF.
+            _ = ThrowsExactly<SimulatedSqlException>(() => ReadAll(quoted, "select \"abc\", 1"));
+            AreEqual("abc", ReadAll(unquoted, "select \"abc\", 1").Rows[0][0]);
+            AreEqual(1, ReadAll(quoted, "select 1, 'abc'").Rows[0][0]);
+            AreEqual(1, ReadAll(unquoted, "select 1, 'abc'").Rows[0][0]);
+            AreEqual(new DateTime(2020, 1, 2), ReadAll(quoted, "select cast('01/02/2020' as date)").Rows[0][0]);
+            AreEqual(new DateTime(2020, 2, 1), ReadAll(unquoted, "select cast('01/02/2020' as date)").Rows[0][0]);
+        }
+    }
+
+    [TestMethod]
+    public void LiteralSelectNestedInAQuery_ReplaysWithTheEnclosingPlan()
+    {
+        var (sim, connection) = OpenWithTable();
+        using (connection)
+        {
+            foreach (var sql in new[] { "select id from t where val = (select 20)", "select d.a, t.id from (select 5 as a) d join t on t.id = 1", "select id from t where val in (select 10 union all select 30) order by id" })
+            {
+                var fresh = Show(ReadAll(connection, sql));
+                var hitsBefore = sim.PlanCacheHits;
+                for (var i = 0; i < 3; i++)
+                    AreEqual(fresh, Show(ReadAll(connection, sql)));
+                AreEqual(hitsBefore + 3, sim.PlanCacheHits, sql);
+            }
+        }
+    }
+
+    [TestMethod]
+    public void InsertOfALiteralSelect_AddsItsRowEveryRun()
+    {
+        var sim = new Simulation();
+        using var connection = sim.CreateDbConnection();
+        connection.Open();
+        ExecuteBatch(connection, "create table lit (id int identity, a int, b nvarchar(10))");
+        for (var i = 0; i < 5; i++)
+            ExecuteBatch(connection, "insert lit (a, b) select 7, N'x'");
+        AreEqual(5, RunScalar(connection, "select count(*) from lit where a = 7 and b = N'x'"));
+        AreEqual(5, RunScalar(connection, "select max(id) from lit"));
+    }
+
+    [TestMethod]
+    public void BatchHoldingARecompileStatement_IsNotReplayed()
+    {
+        // A statement under OPTION (RECOMPILE) compiles as it runs, sending
+        // what its compile sends each time (its join-order warning, say), so
+        // a batch holding one stays out of the cache however cacheable its
+        // other statements are.
+        var (sim, connection) = OpenWithTable();
+        using (connection)
+        {
+            foreach (var sql in new[] { "select val from t option (recompile)", "select 1; select val from t option (recompile)", "select val from t; select 2 option (recompile)" })
+            {
+                var hitsBefore = sim.PlanCacheHits;
+                for (var i = 0; i < 3; i++)
+                    _ = ReadAll(connection, sql);
+                AreEqual(hitsBefore, sim.PlanCacheHits, sql);
+            }
         }
     }
 }

@@ -303,7 +303,7 @@ internal abstract class Expression : ExpressionNode
     private static Expression ParseLeadingAtom(ParserContext context) => context.Token switch
     {
         Numeric number => NumericLiteral(context, number),
-        Literal literal => new Value(literal.Value),
+        Literal literal => Value.OfLiteralToken(literal.Value),
         AtPrefixedString atPrefixed when context.RuleVariables is { } ruleVariables => RuleVariable(ruleVariables, atPrefixed),
         AtPrefixedString atPrefixed when context.Batch.InlinesVariableValues => Value.NonLiteral(context.Batch.GetVariableSlot(atPrefixed.Value).Value),
         AtPrefixedString atPrefixed => new VariableReference(atPrefixed, context),
@@ -371,7 +371,7 @@ internal abstract class Expression : ExpressionNode
     {
         if (number.Underflowed && !context.Batch.IsSkipping)
             context.Connection.PendingMessages.Enqueue(SimulatedSqlException.FloatLiteralTooSmallMessage(context.Batch, number.Source.ToString()));
-        return new Value(number.Value, number.IntegerLiteralDigitCount);
+        return Value.OfNumericToken(number.Value, number.IntegerLiteralDigitCount);
     }
 
     /// <summary>

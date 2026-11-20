@@ -4187,6 +4187,30 @@ internal sealed partial class Selection
     };
 
     /// <summary>
+    /// Whether a FROM-less projection item bakes to the same value and type
+    /// whenever its text, database, default schema, parameter signature and the
+    /// key's four SET options are the same: one literal token of the text
+    /// (<see cref="Value.IsFixedByText"/> — not an ODBC escape, whose <c>{t}</c>
+    /// reads today's date and <c>{d}</c> the session's language), in
+    /// parentheses, under at most one unary minus, named or not. A minus is taken over a
+    /// number only: a string or binary operand converts as it negates, and a
+    /// conversion's overflow is NULL under <c>SET ARITHABORT OFF</c> with
+    /// <c>ANSI_WARNINGS OFF</c>, neither of which the key holds. Negating a
+    /// literal token cannot overflow, since a token is never negative and the
+    /// one negative <c>int</c> constant, a folded <c>-2147483648</c>, is not a
+    /// token.
+    /// </summary>
+    private static bool IsFixedByPlanCacheKey(Expression expression, bool negated) => expression switch
+    {
+        Value { IsFixedByText: true } value => !negated || value.Constant.IsNull
+            || value.Constant.Type.Category is SqlTypeCategory.Integer or SqlTypeCategory.Decimal or SqlTypeCategory.Money or SqlTypeCategory.Approximate,
+        NamedExpression named => IsFixedByPlanCacheKey(named.Inner, negated),
+        Parenthesized parenthesized => IsFixedByPlanCacheKey(parenthesized.Wrapped, negated),
+        Negate negate when !negated => IsFixedByPlanCacheKey(negate.Operand, negated: true),
+        _ => false,
+    };
+
+    /// <summary>
     /// Builds the plan for a tableless SELECT (synthesized constant-row
     /// branch). Schema and values are computed at parse time by Running each
     /// projection expression against a throwing column resolver — tableless
@@ -4205,7 +4229,9 @@ internal sealed partial class Selection
         // (see the Run-then-GetSqlType loop below) — replaying that closure
         // across invocations would emit the same stale NEWID / GETDATE /
         // @@TRANCOUNT / NEXT VALUE FOR result every call. Disqualify the
-        // batch from plan-cache promotion.
+        // batch from plan-cache promotion — unless the baked row is fixed by
+        // the plan-cache key, which is settled where the bake is done, below.
+        var sessionScopedBefore = parseBatch.HasSessionScopedReference;
         parseBatch.HasSessionScopedReference = true;
 
         // A star with no FROM clause has nothing to expand: real refuses a
@@ -4364,67 +4390,31 @@ internal sealed partial class Selection
                 _ = written.GetSqlType(parseBatch, TypeResolver);
         }
         var orderColumns = SettleOrderTerms([], orderBy, expressions, columnNames, scope.Position == QueryPosition.Statement);
+
+        // A row that is nothing but the command's own literals is the same row
+        // for every execution the plan-cache key admits, so the plan holding
+        // it replays like any other. It must stay a pure function of the text:
+        // no excluder, row limit or INTO (whose per-execution effects the
+        // closure below runs), no bake that raised (a captured exception is
+        // not shared between executions, and whether an error raises can turn
+        // on SET ARITHABORT / ANSI_WARNINGS, which the key does not hold), no
+        // outer reference, and no message the parse queued (a float literal's
+        // underflow warning, which a replay would not send).
+        if (!referencesOuterColumns && !scope.ProjectionUnread && !isAssignmentOnly
+            && bakeFailure is null
+            && excluders.Count == 0 && orderBy.Count == 0
+            && topCount is null && offsetCount is null && fetchCount is null
+            && intoTarget is null
+            && parseBatch.Connection.PendingMessages.Count == 0
+            && expressions.TrueForAll(static expression => IsFixedByPlanCacheKey(expression, negated: false)))
+        {
+            parseBatch.HasSessionScopedReference = sessionScopedBefore;
+        }
+
         return new Selection(schema, columnNames,
             hasOrderBy: orderBy.Count > 0,
             hasTopOrOffsetOrFetch: topCount.HasValue || offsetCount.HasValue || fetchCount.HasValue,
-            (batch, outerResolver) =>
-        {
-            if (topCount == 0)
-                return [];
-            if (offsetCount is { } offset && offset > 0)
-                return [];
-            if (fetchCount is { } fetch && fetch < 1)
-                return [];
-
-            SqlValue Resolve(MultiPartName name) =>
-                outerResolver is not null
-                    ? outerResolver(name)
-                    : throw SimulatedSqlException.InvalidColumnName(name);
-
-            try
-            {
-                foreach (var excluder in excluders)
-                {
-                    if (excluder.Run(new RuntimeContext(Resolve, batch)) != true)
-                        return [];
-                }
-            }
-            catch (SimulatedSqlException filterError)
-            {
-                filterError.RaisedInRowProjection = false;
-                throw;
-            }
-
-            if (bakeFailure is not null)
-            {
-                // The row's value is computed past an INSERT's identity draw.
-                ((SimulatedSqlException)bakeFailure.SourceException).RaisedInRowProjection = true;
-                batch.FailingRowIdentity?.Read(expressions, new RuntimeContext(Resolve, batch));
-                bakeFailure.Throw();
-            }
-            if (scope.ProjectionUnread || !referencesOuterColumns)
-                return [RowEncoder.EncodeRow(schema, values)];
-
-            // Deferred projection: evaluate against this invocation's outer row.
-            var perCall = new SqlValue[expressions.Count];
-            var runtime = new RuntimeContext(Resolve, batch);
-            try
-            {
-                for (var i = 0; i < expressions.Count; i++)
-                {
-                    var raw = expressions[i].Run(runtime);
-                    perCall[i] = raw.IsNull || raw.Type == schema[i] ? raw : raw.CoerceTo(schema[i]);
-                }
-            }
-            catch (SimulatedSqlException projectionError)
-            {
-                projectionError.RaisedInRowProjection = true;
-                batch.FailingRowIdentity?.Read(expressions, runtime);
-                throw;
-            }
-
-            return [RowEncoder.EncodeRow(schema, perCall)];
-        }, isAssignmentOnly,
+            SynthesizedRowSource(topCount, offsetCount, fetchCount, excluders, bakeFailure, expressions, values, schema, scope.ProjectionUnread, referencesOuterColumns), isAssignmentOnly,
         intoTarget,
         // FROM-less SELECT INTO: no source sources/joins to inspect, so the
         // analyzer routes through the empty-FROM branch and produces
@@ -4464,6 +4454,76 @@ internal sealed partial class Selection
             ColumnDerivedWireFlags = derivedWireFlags,
         }.NotingSynthesizedDemand(expressions, excluders, orderBy, prunable: referencesOuterColumns && !scope.ProjectionUnread,
             yieldsOneRow: excluders.Count == 0 && topCount is null && offsetCount is null && fetchCount is null && !isAssignmentOnly && intoTarget is null);
+    }
+
+    /// <summary>
+    /// The row source of a FROM-less SELECT: the baked row, or the one computed
+    /// per call against the outer row. A method of its own, taking exactly what
+    /// its closure reads, so the closure holds none of the parse (the
+    /// <see cref="BatchContext"/> its builder is given) and a plan holding it can
+    /// be cached: what it holds is read-only while it runs, and each call encodes
+    /// a row of its own, so sessions replaying it share nothing mutable.
+    /// </summary>
+    private static Func<BatchContext, Func<MultiPartName, SqlValue>?, IEnumerable<byte[]>> SynthesizedRowSource(int? topCount, int? offsetCount, int? fetchCount, List<BooleanExpression> excluders, ExceptionDispatchInfo? bakeFailure, List<Expression> expressions, SqlValue[] values, SqlType[] schema, bool projectionUnread, bool referencesOuterColumns)
+    {
+        return (batch, outerResolver) =>
+        {
+            if (topCount == 0)
+                return [];
+            if (offsetCount is { } offset && offset > 0)
+                return [];
+            if (fetchCount is { } fetch && fetch < 1)
+                return [];
+
+            SqlValue Resolve(MultiPartName name) =>
+                outerResolver is not null
+                    ? outerResolver(name)
+                    : throw SimulatedSqlException.InvalidColumnName(name);
+
+            try
+            {
+                foreach (var excluder in excluders)
+                {
+                    if (excluder.Run(new RuntimeContext(Resolve, batch)) != true)
+                        return [];
+                }
+            }
+            catch (SimulatedSqlException filterError)
+            {
+                filterError.RaisedInRowProjection = false;
+                throw;
+            }
+
+            if (bakeFailure is not null)
+            {
+                // The row's value is computed past an INSERT's identity draw.
+                ((SimulatedSqlException)bakeFailure.SourceException).RaisedInRowProjection = true;
+                batch.FailingRowIdentity?.Read(expressions, new RuntimeContext(Resolve, batch));
+                bakeFailure.Throw();
+            }
+            if (projectionUnread || !referencesOuterColumns)
+                return [RowEncoder.EncodeRow(schema, values)];
+
+            // Deferred projection: evaluate against this invocation's outer row.
+            var perCall = new SqlValue[expressions.Count];
+            var runtime = new RuntimeContext(Resolve, batch);
+            try
+            {
+                for (var i = 0; i < expressions.Count; i++)
+                {
+                    var raw = expressions[i].Run(runtime);
+                    perCall[i] = raw.IsNull || raw.Type == schema[i] ? raw : raw.CoerceTo(schema[i]);
+                }
+            }
+            catch (SimulatedSqlException projectionError)
+            {
+                projectionError.RaisedInRowProjection = true;
+                batch.FailingRowIdentity?.Read(expressions, runtime);
+                throw;
+            }
+
+            return [RowEncoder.EncodeRow(schema, perCall)];
+        };
     }
 
     /// <summary>
