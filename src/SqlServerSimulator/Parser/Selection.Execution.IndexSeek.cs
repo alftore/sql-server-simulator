@@ -2384,7 +2384,16 @@ internal sealed partial class Selection
         var io = batch.Connection.StatementIo?.Touch(table);
         _ = io?.ScanCount += 1;
         var lastPage = -1;
-        var seen = new HashSet<(int, int)>();
+        // The set of addresses visited, built only once it can matter: while
+        // each address sorts strictly after the one before it (the order
+        // ascends over the range walked) none can repeat, so no set is kept.
+        // The first address that does not ascend, or a Moved() swap of the
+        // order, builds it from the range already walked.
+        HashSet<(int, int)>? seen = null;
+        var previous = (Page: -1, Slot: -1);
+#if DEBUG
+        var yielded = new HashSet<(int, int)>();
+#endif
         var addresses = batch.CurrentStatement.RowAddresses;
         var heap = table.Heap;
         var ownWrites = new BatchContext.OwnWriteView(batch, table);
@@ -2393,15 +2402,25 @@ internal sealed partial class Selection
         {
             if (rest is not null && rest.Moved())
             {
+                seen ??= VisitedAddresses(order, descending, i);
                 order = rest.After(rest.LastRead, table, batch);
                 i = -1;
                 continue;
             }
             var (page, slot) = order[descending ? order.Count - 1 - i : i];
+            if (seen is null)
+            {
+                var step = (page, slot).CompareTo(previous);
+                var ascends = i == 0 || (descending ? step < 0 : step > 0);
+                if (ascends)
+                    previous = (page, slot);
+                else
+                    seen = VisitedAddresses(order, descending, i);
+            }
             // A row another request of the statement's transaction wrote since
             // the statement began reads as the statement found it.
             var noted = ownWrites.TryRead(batch, table, (page, slot), out var found);
-            if (!seen.Add((page, slot)) || (noted ? found is null : heap.IsSlotTombstoned(page, slot)) || !batch.TouchRowForRead(table, page, slot, plan))
+            if ((seen is not null && !seen.Add((page, slot))) || (noted ? found is null : heap.IsSlotTombstoned(page, slot)) || !batch.TouchRowForRead(table, page, slot, plan))
                 continue;
             io?.Enter(page, ref lastPage);
             if (skip > 0)
@@ -2414,8 +2433,22 @@ internal sealed partial class Selection
                 continue;
             addresses?.Record(bytes, page, slot);
             _ = rest?.LastRead = bytes;
+#if DEBUG
+            if (!yielded.Add((page, slot)))
+                throw new InvalidOperationException($"Ordered scan of {table.Name} yielded ({page}, {slot}) twice");
+#endif
             yield return bytes;
         }
+    }
+
+    // The addresses an ordered scan has walked: the first `visited` it takes
+    // from the order, from its start or, for a descending scan, its end.
+    private static HashSet<(int, int)> VisitedAddresses(ArraySegment<(int Page, int Slot)> order, bool descending, int visited)
+    {
+        var walked = new HashSet<(int, int)>(visited);
+        for (var i = 0; i < visited; i++)
+            _ = walked.Add(order[descending ? order.Count - 1 - i : i]);
+        return walked;
     }
 
     // Whether a snapshot's ordered walk may read the order just taken:
