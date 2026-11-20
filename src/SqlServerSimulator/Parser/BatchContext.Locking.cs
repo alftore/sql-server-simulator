@@ -3053,6 +3053,15 @@ internal sealed partial class BatchContext
         // conflict, so reading it through costs no allocation and no gate.
         if (!table.RowLocks.TryGetValue((pageIndex, slotIndex), out var resource))
             return true;
+        return this.AwaitLockedRowForRead(table, resource, plan.SkipBlockedRows);
+    }
+
+    // The tail of ProbeRowForRead, for a row some session holds a lock on.
+    // Kept apart because its lambda captures the table: in the caller, the
+    // capture object would be allocated on entry, for every row probed.
+    private bool AwaitLockedRowForRead(HeapTable table, LockResource resource, bool skipBlockedRows)
+    {
+        var connection = this.Connection;
         var manager = connection.Simulation.LockManager;
         if (!manager.HasIncompatibleHolderOtherThan(resource, LockMode.Shared, connection.LockOwner))
             return true;
@@ -3062,7 +3071,7 @@ internal sealed partial class BatchContext
         // 2026-10-25 against SQL Server 2025).
         if (!manager.HasIncompatibleHolderOtherThan(resource, LockMode.Shared, connection.LockOwner, holder => ChangedWhileOpen(table, holder)))
             return true;
-        if (plan.SkipBlockedRows)
+        if (skipBlockedRows)
             return false;
         // Wait for the row's writers to drain. Transient acquire-release
         // matches real SQL Server's RC pattern: "block until committed,
