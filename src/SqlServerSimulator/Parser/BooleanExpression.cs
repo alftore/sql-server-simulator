@@ -3194,6 +3194,7 @@ internal abstract class BooleanExpression : ExpressionNode
 
         protected readonly Expression left, right;
         private readonly StringCoercionMemo leftPromotion = new(), rightPromotion = new();
+        private readonly ConstantConversionMemo constantConversion = new();
         private readonly TypePairMemo comparisonType = new();
 
         private protected CompareExpression(Expression left, Expression right)
@@ -3230,7 +3231,8 @@ internal abstract class BooleanExpression : ExpressionNode
                 this.rightPromotion,
                 this.leftIsConstant ??= IsRuntimeConstant(this.left),
                 this.rightIsConstant ??= IsRuntimeConstant(this.right),
-                this.comparisonType);
+                this.comparisonType,
+                this.constantConversion);
 
         private bool? leftIsConstant, rightIsConstant;
 
@@ -3298,7 +3300,8 @@ internal abstract class BooleanExpression : ExpressionNode
         StringCoercionMemo? rightMemo = null,
         bool leftIsConstant = false,
         bool rightIsConstant = false,
-        TypePairMemo? typeMemo = null)
+        TypePairMemo? typeMemo = null,
+        ConstantConversionMemo? constantMemo = null)
     {
         // Either operand sql_variant: real converts a base-typed side UP to
         // sql_variant (probe-confirmed as CONVERT_IMPLICIT(sql_variant, …) in
@@ -3356,9 +3359,21 @@ internal abstract class BooleanExpression : ExpressionNode
             typeMemo?.Keep(l.Type, r.Type, common);
         }
         return compare(
-            leftMemo is null ? l.CoerceTo(common) : leftMemo.Coerce(l, common),
-            rightMemo is null ? r.CoerceTo(common) : rightMemo.Coerce(r, common));
+            PromoteOperand(l, common, leftMemo, leftIsConstant ? constantMemo : null, left: true),
+            PromoteOperand(r, common, rightMemo, rightIsConstant ? constantMemo : null, left: false));
     }
+
+    /// <summary>
+    /// One operand converted to the comparison type. A string goes through its
+    /// <see cref="StringCoercionMemo"/>; a numeric constant through its
+    /// <see cref="ConstantConversionMemo"/>, keyed by its payload's identity.
+    /// A column side never reaches the numeric memo, which would only allocate
+    /// an entry per row.
+    /// </summary>
+    private static SqlValue PromoteOperand(SqlValue value, SqlType common, StringCoercionMemo? stringMemo, ConstantConversionMemo? constantMemo, bool left) =>
+        constantMemo is not null && value.Type.Category != SqlTypeCategory.String
+            ? left ? constantMemo.CoerceLeft(value, common) : constantMemo.CoerceRight(value, common)
+            : stringMemo is null ? value.CoerceTo(common) : stringMemo.Coerce(value, common);
 
     /// <summary>
     /// A <c>datetime</c> compared with a <c>datetime2</c> or

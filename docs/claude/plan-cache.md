@@ -312,6 +312,10 @@ The original single-owner assumption ("Expression instances aren't shared across
   Debug builds re-resolve a bound reference on every power-of-two hit (`RowFrame.Audit`) and throw if the answer moved.
 - **Derived structure kept on a node** — an operator chain's head keeps the array of its left spine (`TwoSidedExpression.spine`), which is a function of the node's immutable operand links, built on first use and published with `Volatile.Write`; two threads that both miss build equal arrays.
   Anything kept on a node this way must be derivable from the immutable tree alone and written once, whole, as a reference; a value that depends on a batch, a row or a parameter is per execution however cheap it would be to keep.
+- **A constant's numeric conversion** — `ConstantConversionMemo` on a `CompareExpression` keeps the last conversion of a constant operand, which may be a parameter's value, so it is the one derived value on a node that depends on a parameter.
+  It is sound as a function of its key and nothing else: the entry holds the source value's type, target and payload identity beside the converted value, is immutable, and is published whole with `Volatile.Write`; a replay reads it only when its own operand is the same payload, so two replays with different `` never read each other's conversion (`ConcurrentReplays_MixedTypeConstant_StaysIsolated`).
+  A failed conversion is never stored.
+  Debug builds re-convert on every power-of-two hit and throw if the answer moved.
 
 When adding any executor or expression feature that computes per-row / per-group / per-execution values, bind them through `BatchContext` / `StatementContext` — never through fields on parse-time objects.
 

@@ -842,6 +842,55 @@ public sealed class PlanCacheTests
     }
 
     [TestMethod]
+    public void ConcurrentReplays_MixedTypeConstant_StaysIsolated()
+    {
+        // One cached plan, many concurrent executions, each with its own value of a
+        // parameter whose type differs from the column's: the numeric conversion of
+        // the constant is memoized on the shared comparison node, keyed by the
+        // value it was made from, so a worker never reads another worker's entry.
+        var sim = new Simulation();
+        using var setup = sim.CreateDbConnection();
+        setup.Open();
+        using (var ddl = setup.CreateCommand())
+        {
+            ddl.CommandText = """
+                create table t (a int not null, d decimal(18,2) not null);
+                insert t select value, value from generate_series(1, 1000)
+                """;
+            _ = ddl.ExecuteNonQuery();
+        }
+
+        var wrong = 0;
+        _ = Parallel.For(0, 8, worker =>
+        {
+            using var c = sim.CreateDbConnection();
+            c.Open();
+            for (var i = 0; i < 2000; i++)
+            {
+                // Each worker holds its own bound for all its runs, so a leaked entry
+                // from another worker's bound changes its count.
+                var bound = (worker * 100) + 50;
+                AssertCount(c, "select count(*) from t where a > @p", bound, 1000 - bound);
+                AssertCount(c, "select count(*) from t where d > @p", bound, 1000 - bound);
+            }
+        });
+        AreEqual(0, wrong);
+
+        void AssertCount(System.Data.Common.DbConnection c, string sql, long bound, int expected)
+        {
+            using var cmd = c.CreateCommand();
+            cmd.CommandText = sql;
+            var parameter = cmd.CreateParameter();
+            parameter.ParameterName = "@p";
+            parameter.DbType = System.Data.DbType.Int64;
+            parameter.Value = bound;
+            _ = cmd.Parameters.Add(parameter);
+            if ((int)cmd.ExecuteScalar()! != expected)
+                _ = Interlocked.Increment(ref wrong);
+        }
+    }
+
+    [TestMethod]
     public void ConcurrentReplays_WindowResults_StayIsolated()
     {
         // Same isolation contract for window functions (SUM OVER running
