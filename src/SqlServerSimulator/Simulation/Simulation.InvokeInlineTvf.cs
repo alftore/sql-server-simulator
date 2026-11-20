@@ -58,7 +58,7 @@ partial class Simulation
 
         // The body binds and runs in the function's own database, one row at a
         // time, since the referencing statement consumes it lazily.
-        var rows = InvokeInlineTvfCore(outerBatch, function, argValues, isDefault, tableArguments, writtenName, readerDemand, browseFlatten);
+        var rows = InvokeInlineTvfCore(outerBatch, function, arguments, argValues, isDefault, tableArguments, writtenName, readerDemand, browseFlatten);
         return ReferenceEquals(function.Schema.Database, connection.CurrentDatabase)
             ? rows
             : ModuleDatabaseScope.Enumerate(connection, function.Schema.Database, rows);
@@ -103,6 +103,7 @@ partial class Simulation
     private IEnumerable<byte[]> InvokeInlineTvfCore(
         BatchContext outerBatch,
         InlineTableValuedFunction function,
+        Expression?[] callSite,
         SqlValue[] argValues,
         bool[] isDefault,
         HeapTable?[]? tableArguments,
@@ -160,16 +161,67 @@ partial class Simulation
         connection.InlinedBodyDepth++;
         try
         {
-            var parser = innerBatch.Parser;
-            parser.MoveNextRequired();
-            parser.BrowseFlatten = browseFlatten;
-            var bodySelection = ParseInlineTvfBody(parser, function, writtenName);
+            // A call the referencing statement makes once per outer row binds
+            // its body once per statement: later calls replay what the first
+            // parsed (its locks and checks retaken as a cached statement's
+            // are, its frame flags set again) against this call's own batch
+            // and parameter values, which the body reads as it runs. A body
+            // of a shape no replay reproduces parses every call, as before.
+            var outerStatement = outerBatch.CurrentStatement;
+            var records = tableArguments is null && !browseFlatten;
+            Selection? bodySelection = null;
+            if (records && outerStatement.InlineTvfBodies is { } bound && bound.TryGetValue(callSite, out var plan))
+            {
+                if (ReferenceEquals(plan.Demand, readerDemand)
+                    && innerBatch.TakeReplayedLocks(plan.Locks, plan.SchemaVersion)
+                    && Volatile.Read(ref this.SchemaVersion) == plan.SchemaVersion)
+                {
+                    plan.ReplayFrame(innerBatch.CurrentStatement);
+                    bodySelection = plan.Body;
+                }
+                else
+                {
+                    innerBatch.ReleaseStatementSchemaLocks();
+                    _ = bound.Remove(callSite);
+                }
+            }
+            if (bodySelection is null)
+            {
+                var schemaVersion = Volatile.Read(ref this.SchemaVersion);
+                var messagesAtStart = connection.PendingMessages.Count;
+                if (records)
+                    innerBatch.ReplayLockLog = [];
+                try
+                {
+                    var parser = innerBatch.Parser;
+                    parser.MoveNextRequired();
+                    parser.BrowseFlatten = browseFlatten;
+                    bodySelection = ParseInlineTvfBody(parser, function, writtenName);
+                    var bodyStatement = innerBatch.CurrentStatement;
+                    if (innerBatch.ReplayLockLog is { } taken
+                        && !innerBatch.HasSessionScopedReference
+                        && connection.PendingMessages.Count == messagesAtStart
+                        && bodyStatement.RemoteWrite is null
+                        && bodyStatement.TransactionMark is null
+                        && !bodyStatement.BindsDeferredSource
+                        && !bodyStatement.Recompiles
+                        && bodySelection.IntoTarget is null)
+                    {
+                        (outerStatement.InlineTvfBodies ??= new Dictionary<object, InlineTvfBodyPlan>(ReferenceEqualityComparer.Instance))[callSite] =
+                            new InlineTvfBodyPlan(bodySelection, [.. taken], schemaVersion, readerDemand, bodyStatement);
+                    }
+                }
+                finally
+                {
+                    innerBatch.ReplayLockLog = null;
+                }
+                // The columns the reference's query never reads go uncomputed.
+                _ = bodySelection.AcceptDemand(readerDemand);
+            }
             // Inlined like a view body, so the same chain-breaks apply: reads
             // into another database, or of an object with another owner,
             // answer to the caller's rights.
             PermissionEnforcement.CheckModuleBodyReads(outerBatch, function, function.Schema.Database, bodySelection);
-            // The columns the reference's query never reads go uncomputed.
-            _ = bodySelection.AcceptDemand(readerDemand);
             var resultSet = bodySelection.Execute(innerBatch, outerResolver: null);
             foreach (var rowBytes in resultSet.RowBytes)
                 yield return rowBytes;
@@ -404,5 +456,34 @@ partial class Simulation
         {
             throw SimulatedSqlException.FollowedByViewBindingFailure(error, writtenName, function.Name);
         }
+    }
+}
+
+/// <summary>
+/// An inline function's body as one call site's first call in a statement
+/// bound it, which that statement's later calls there replay (see
+/// <c>Simulation.InvokeInlineTvfCore</c>): the plan, what its parse did
+/// besides building it (the locks and checks it took, the statement-frame
+/// flags it set) and the schema version and reader demand it was bound under.
+/// </summary>
+internal sealed class InlineTvfBodyPlan(Selection body, ReplayedLock[] locks, long schemaVersion, bool[]? demand, StatementContext parsed)
+{
+    public readonly Selection Body = body;
+    public readonly ReplayedLock[] Locks = locks;
+    public readonly long SchemaVersion = schemaVersion;
+    public readonly bool[]? Demand = demand;
+    private readonly bool opensTransaction = parsed.OpensTransaction, callsUserFunction = parsed.CallsUserFunction;
+    private readonly bool readsPermanentObject = parsed.ReadsPermanentObject, readsTemporaryObject = parsed.ReadsTemporaryObject;
+    private readonly bool readsTableVariable = parsed.ReadsTableVariable;
+
+    /// <summary>Sets on <paramref name="statement"/> the flags the body's parse set on its own frame.</summary>
+    public void ReplayFrame(StatementContext statement)
+    {
+        if (this.opensTransaction)
+            statement.MarkOpensTransaction();
+        statement.CallsUserFunction |= this.callsUserFunction;
+        statement.ReadsPermanentObject |= this.readsPermanentObject;
+        statement.ReadsTemporaryObject |= this.readsTemporaryObject;
+        statement.ReadsTableVariable |= this.readsTableVariable;
     }
 }
