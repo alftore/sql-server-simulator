@@ -136,6 +136,83 @@ public sealed class QueryStoreCaptureTests
         Contains("(@d decimal(5,2))select a from t where @d > 0", texts);
     }
 
+    /// <summary>Each parameterized execution of <see cref="ChangingParameterTypes"/>: its text, then its parameter's DbType and size (null for either leaves the value to settle it), and its value.</summary>
+    private static readonly (string Text, System.Data.DbType? Type, int Size, object Value)[] ChangingParameterTypes =
+    [
+        ("select a from t where b = @p", System.Data.DbType.Int32, 0, 1),
+        ("select a from t where b = @p", System.Data.DbType.Int64, 0, 2L),
+        ("select a from t where b = @p", System.Data.DbType.Int32, 0, 1),
+        ("select a from t where c = @s", System.Data.DbType.String, 10, "x"),
+        ("select a from t where c = @s", System.Data.DbType.String, 20, "x"),
+        ("select a from t where c = @s", System.Data.DbType.String, 10, "y"),
+        ("select a from t where c = @s", System.Data.DbType.AnsiString, 10, "y"),
+        ("select a from t where b = @d", null, 0, 1.5m),
+        ("select a from t where b = @d", null, 0, 123456.789m),
+        ("select a from t where b = @d", null, 0, 1.5m),
+    ];
+
+    private static void ExecuteWithParameter(SimulatedDbCommand command, (string Text, System.Data.DbType? Type, int Size, object Value) step)
+    {
+        command.CommandText = step.Text;
+        if (command.Parameters.Count == 0)
+            _ = command.Parameters.Add(command.CreateParameter());
+        var parameter = command.Parameters[0];
+        parameter.ParameterName = step.Text[^2..];
+        if (step.Type is { } type)
+            parameter.DbType = type;
+        else
+            parameter.ResetDbType();
+        parameter.Size = step.Size;
+        parameter.Value = step.Value;
+        _ = command.ExecuteScalar();
+    }
+
+    private static List<(string Text, long Executions)> ParameterizedCaptures(Simulation sim) =>
+        [.. Captured(sim).Where(c => c.Text.StartsWith("(@", StringComparison.Ordinal) && c.Text.Contains("select a from t where", StringComparison.Ordinal)).OrderBy(c => c.Text, StringComparer.Ordinal)];
+
+    // The declaration a statement is stored under is memoized on its shape
+    // and checked against the types the variables hold at each execution.
+    [TestMethod]
+    public void ReusedCommand_WithChangingParameterTypes_CapturesWhatEachExecutionAloneWould()
+    {
+        List<(string Text, long Executions)> expected = [];
+        foreach (var step in ChangingParameterTypes)
+        {
+            var alone = CapturingAll();
+            using var connection = alone.CreateDbConnection();
+            connection.Open();
+            using var command = connection.CreateCommand();
+            ExecuteWithParameter(command, step);
+            expected.AddRange(ParameterizedCaptures(alone));
+        }
+        expected = [.. expected.GroupBy(c => c.Text).Select(g => (g.Key, g.Sum(c => c.Executions))).OrderBy(c => c.Key, StringComparer.Ordinal)];
+
+        var sim = CapturingAll();
+        using (var connection = sim.CreateDbConnection())
+        {
+            connection.Open();
+            using var command = connection.CreateCommand();
+            foreach (var step in ChangingParameterTypes)
+                ExecuteWithParameter(command, step);
+        }
+        CollectionAssert.AreEqual(expected, ParameterizedCaptures(sim));
+        // The sequence did change what is stored, so the comparison isn't of one text.
+        IsGreaterThan(5, expected.Count);
+    }
+
+    [TestMethod]
+    public void VariablesDeclaredInADifferentCase_StoreEachSpelling_UnderTheSameStatementText()
+    {
+        var sim = CapturingAll();
+        for (var i = 0; i < 2; i++)
+        {
+            _ = sim.ExecuteNonQuery("declare @X int = 1; select a from t where b = @x");
+            _ = sim.ExecuteNonQuery("declare @x int = 1; select a from t where b = @x");
+        }
+        AreEqual(2L, Executions(sim, "(@X int)select a from t where b = @x"));
+        AreEqual(2L, Executions(sim, "(@x int)select a from t where b = @x"));
+    }
+
     [TestMethod]
     public void ParameterizedCommand_IsUserParameterized_ReferencedParametersOnly()
     {
