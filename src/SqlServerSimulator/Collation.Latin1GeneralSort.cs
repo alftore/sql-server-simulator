@@ -1321,6 +1321,10 @@ internal abstract partial class Collation
         // expansion leaves behind (e.g. 'ß' vs 'ss') is ignored.
         private int MinimalWeightTiebreak(ReadOnlySpan<char> x, ReadOnlySpan<char> y)
         {
+            // Neither key can hold an entry without a minimal-weight character
+            // or one past the table, whose spelling might be one.
+            if (!this.MayWeighMinimal(x) && !this.MayWeighMinimal(y))
+                return 0;
             var keyX = this.MinimalWeightKey(x);
             var keyY = this.MinimalWeightKey(y);
             var shared = Math.Min(keyX.Count, keyY.Count);
@@ -1335,6 +1339,16 @@ internal abstract partial class Collation
             }
 
             return keyX.Count.CompareTo(keyY.Count);
+        }
+
+        private bool MayWeighMinimal(ReadOnlySpan<char> s)
+        {
+            foreach (var ch in s)
+            {
+                if (this.table.Lookup(ch).Kind is WeightKind.MinimalWeight or WeightKind.Absent)
+                    return true;
+            }
+            return false;
         }
 
         private List<(int Preceding, int Rank)> MinimalWeightKey(ReadOnlySpan<char> s)
