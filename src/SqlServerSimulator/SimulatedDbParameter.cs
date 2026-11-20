@@ -111,8 +111,18 @@ public sealed class SimulatedDbParameter : DbParameter
     public override string ParameterName
     {
         get => field ?? string.Empty;
-        set => field = value ?? string.Empty;
+        set
+        {
+            field = value ?? string.Empty;
+            this.variableName = null;
+        }
     }
+
+    // The name without its leading @, the key the parameter binds under in a
+    // batch's variables; kept so a command run again does not slice it again.
+    private string? variableName;
+
+    internal string GetVariableName() => this.variableName ??= this.ParameterName.StartsWith('@') ? this.ParameterName[1..] : this.ParameterName;
 
     /// <summary>
     /// EF Core's SQL Server type mappings set this on string parameters with

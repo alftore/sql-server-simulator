@@ -2242,9 +2242,7 @@ internal sealed partial class BatchContext
             // is the signal.
             if (IsTableValuedParameterValue(parameter))
                 continue;
-            var name = parameter.ParameterName;
-            if (name.StartsWith('@'))
-                name = name[1..];
+            var name = parameter.GetVariableName();
             // A parameter carrying a pre-built SqlValue binds it verbatim — the
             // path the TDS listener's CLR-UDT (hierarchyid / geography /
             // geometry) and sql_variant RPC parameters take, whose wire form
@@ -2333,9 +2331,7 @@ internal sealed partial class BatchContext
             if (!batch.TryResolveTableType(parsedTypeName, out var tableType))
                 throw SimulatedSqlException.CannotFindDataType(parameterIndex: 1, typeName, parameter.ParameterName);
 
-            var paramName = parameter.ParameterName;
-            if (paramName.StartsWith('@'))
-                paramName = paramName[1..];
+            var paramName = parameter.GetVariableName();
             var clone = tableType.Clone("@" + paramName, batch, isTableValuedParameter: true);
             MaterializeTvpRows(parameter.Value!, tableType, clone, batch);
             batch.SetTableVariable(paramName, clone);
