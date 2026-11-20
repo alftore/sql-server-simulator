@@ -17,11 +17,38 @@ namespace SqlServerSimulator.Parser;
 /// column default's <c>getutcdate()</c> parsed at CREATE TABLE and run on
 /// every later INSERT).
 /// </summary>
-internal readonly struct RuntimeContext(Func<MultiPartName, SqlValue> resolveColumn, BatchContext batch)
+/// <remarks>
+/// The struct is two words: one reference field holding either the by-name
+/// resolver or a <see cref="RowFrame"/>, and the batch. A site that enumerates
+/// rows builds a frame instead of a closure, and a
+/// <see cref="Expressions.Reference"/> reads its column through it by
+/// reference rather than by name; everything else asks for
+/// <see cref="ResolveColumn"/> and gets the frame's by-name resolver.
+/// </remarks>
+internal readonly struct RuntimeContext
 {
-    /// <summary>Maps a (possibly qualified) column name to its value for the current row.</summary>
-    public readonly Func<MultiPartName, SqlValue> ResolveColumn = resolveColumn;
+    /// <summary>The by-name resolver, or the <see cref="RowFrame"/> that owns one.</summary>
+    private readonly object? columns;
 
     /// <summary>The batch this expression is executing in.</summary>
-    public readonly BatchContext Batch = batch;
+    public readonly BatchContext Batch;
+
+    public RuntimeContext(Func<MultiPartName, SqlValue> resolveColumn, BatchContext batch)
+    {
+        this.columns = resolveColumn;
+        this.Batch = batch;
+    }
+
+    public RuntimeContext(RowFrame frame, BatchContext batch)
+    {
+        this.columns = frame;
+        this.Batch = batch;
+    }
+
+    /// <summary>Maps a (possibly qualified) column name to its value for the current row.</summary>
+    public Func<MultiPartName, SqlValue> ResolveColumn =>
+        this.columns as Func<MultiPartName, SqlValue> ?? (this.columns as RowFrame)?.Resolver!;
+
+    /// <summary>The frame a <see cref="Expressions.Reference"/> reads through, if this runtime has one.</summary>
+    public RowFrame? Frame => this.columns as RowFrame;
 }

@@ -25,7 +25,7 @@ internal sealed partial class Selection
     /// reference reads as a typed NULL.
     /// Falls through to the outer-scope resolver when no local source matches.
     /// </summary>
-    private static SqlValue ResolveAcrossTuple(
+    internal static SqlValue ResolveAcrossTuple(
         FromSource[] sources,
         byte[]?[] tuple,
         MultiPartName name,

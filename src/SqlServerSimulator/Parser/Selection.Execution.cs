@@ -901,7 +901,7 @@ internal sealed partial class Selection
     /// SQL Server 2025, in the select list, WHERE, ON, GROUP BY, ORDER BY and
     /// an UPDATE's WHERE; <c>dbo.t..a</c> and <c>x..a</c> stay Msg 4104).
     /// </remarks>
-    private static SimulatedSqlException UnresolvedNameError(FromSource[] sources, MultiPartName name) =>
+    internal static SimulatedSqlException UnresolvedNameError(FromSource[] sources, MultiPartName name) =>
         IsSourceThenEmptyColumn(sources, name) ? SimulatedSqlException.InvalidColumnName("")
             : name.ImmediateQualifier is not null && !QualifiesAnySource(sources, name)
             ? SimulatedSqlException.MultiPartIdentifierCouldNotBeBound(name.ToString())
@@ -3657,18 +3657,15 @@ internal sealed partial class Selection
             // would raise on a skipped row doesn't (probed 2026-09-30 against
             // SQL Server 2025), and a deep page skips the projection's cost.
             var skip = offsetCount ?? 0;
-            // Hoisted per-row resolution scaffolding: one mutable-capture
-            // tuple slot, one cached self-referencing resolver lambda, one
-            // RuntimeContext — instead of a fresh closure + several delegates
-            // per row (the allocation profile's dominant entry).
-            var memo = new SourceColumnMemo();
-            var currentTuple = default(byte[]?[])!;
-            Func<MultiPartName, SqlValue> resolveColumn = null!;
-            resolveColumn = name => ResolveAcrossTuple(sources, currentTuple, name, batch, outerResolver, memo);
-            var rowRuntime = new RuntimeContext(resolveColumn, batch);
+            // Hoisted per-row resolution scaffolding: one frame holding the
+            // tuple slot and the column bindings, one RuntimeContext — instead
+            // of a fresh closure + several delegates per row (the allocation
+            // profile's dominant entry).
+            var frame = new RowFrame(sources, batch, outerResolver);
+            var rowRuntime = new RuntimeContext(frame, batch);
             foreach (var tuple in EnumerateJoinedRows(sources, joins, batch, outerResolver))
             {
-                currentTuple = tuple;
+                frame.Tuple = tuple;
                 var include = true;
                 try
                 {

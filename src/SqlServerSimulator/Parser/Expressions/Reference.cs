@@ -123,7 +123,18 @@ internal sealed class Reference : Expression
 
     internal override bool ParallelSafe => true;
 
-    public override SqlValue Run(RuntimeContext runtime) => runtime.ResolveColumn(this.ReferencedName);
+    private static int lastSlot;
+
+    /// <summary>
+    /// Where a <see cref="RowFrame"/> looks first for this reference's binding: a number from a
+    /// process-wide counter, so a plan-cached node carries one immutable <see langword="int"/> and
+    /// nothing about any execution. It is only a hint, since a frame confirms a hit by identity and
+    /// correctness never depends on the slots being unique or dense.
+    /// </summary>
+    internal readonly int Slot = Interlocked.Increment(ref lastSlot);
+
+    public override SqlValue Run(RuntimeContext runtime) =>
+        runtime.Frame is { } frame ? frame.Read(this) : runtime.ResolveColumn(this.ReferencedName);
 
     public override SqlType GetSqlType(BatchContext batch, Func<MultiPartName, SqlType> resolveColumnType)
     {

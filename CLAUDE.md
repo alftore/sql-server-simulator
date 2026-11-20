@@ -119,8 +119,9 @@ A deferred source whose rows can't change across one enumeration — any **non-l
 
 ### Multi-source rows
 `FromSource[]`; enumeration rows are `byte[]?[]`, one slot per source, null = NULL-filled outer-join side.
-Column resolution is qualifier-aware via `FindSourceColumn` / `ResolveAcrossTuple` (ambiguous unqualified name → Msg 209), memoized per enumeration in `SourceColumnMemo`, which is execution-scoped per the plan-cache shared-plan contract.
-**Per-row resolver loops use the hoisted-scaffolding pattern**: one mutable-capture tuple slot + one cached _self-referencing lambda_ + one `RuntimeContext` per loop.
+Column resolution is qualifier-aware via `FindSourceColumn` / `ResolveAcrossTuple` (ambiguous unqualified name → Msg 209).
+A site that enumerates rows binds each `Reference` once per enumeration in a `RowFrame` (the current tuple plus a table of bindings found by `Reference.Slot`), and everything that reaches a column by name, or sits at a site not yet converted, goes through `ResolveAcrossTuple` and a `SourceColumnMemo`; the frame and the memo are execution-scoped per the plan-cache shared-plan contract, and a binding never lives on the `Reference`.
+**Per-row resolver loops use the hoisted-scaffolding pattern**: one mutable-capture tuple slot + one cached _self-referencing lambda_ + one `RuntimeContext` per loop, or, at the sites that read through a `RowFrame`, one frame (its `Tuple` is the slot, its `Resolver` the lambda) + one `RuntimeContext`; construct the frame after the last assignment to the `sources` array it reads.
 Never pass a local function as its own `selfRecursive` argument; that allocates a delegate per resolution per row, which once measured as 41% of profile bytes.
 The same rule reaches the _arrays_ a per-row loop fills (grouping keys, hash-join bucket keys, bounded-`TOP` projections): write into reused scratch and copy out only where something retains them.
 The aggregate executor accumulates straight off the enumeration for a single grouping set, which is observable in _which_ error a row raises → [`query.md`](docs/claude/query.md#streaming-accumulation-and-where-an-error-surfaces).

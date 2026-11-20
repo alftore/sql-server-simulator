@@ -642,6 +642,54 @@ public sealed class PlanCacheTests
     }
 
     [TestMethod]
+    public void ConcurrentReplays_ColumnReads_StayIsolated()
+    {
+        // One cached plan, many concurrent executions: each execution binds the
+        // plan's column references in a frame of its own, so the shared
+        // expression nodes carry no binding and no row — a binding or a tuple
+        // kept on a node would hand one worker another's rows.
+        var sim = new Simulation();
+        using var setup = sim.CreateDbConnection();
+        setup.Open();
+        using (var ddl = setup.CreateCommand())
+        {
+            ddl.CommandText = """
+                create table t (k int not null primary key, a int not null, s nvarchar(20) not null);
+                insert t select value, value * 3, concat(N'row', value) from generate_series(1, 400)
+                """;
+            _ = ddl.ExecuteNonQuery();
+        }
+
+        var wrong = 0;
+        _ = Parallel.For(0, 8, worker =>
+        {
+            using var c = sim.CreateDbConnection();
+            c.Open();
+            for (var i = 0; i < 200; i++)
+            {
+                var key = (((worker * 37) + (i * 11)) % 400) + 1;
+                using var cmd = c.CreateCommand();
+                cmd.CommandText = "select a, s from t where k = @p";
+                var parameter = cmd.CreateParameter();
+                parameter.ParameterName = "@p";
+                parameter.Value = key;
+                _ = cmd.Parameters.Add(parameter);
+                using var r = cmd.ExecuteReader();
+                var rows = 0;
+                while (r.Read())
+                {
+                    rows++;
+                    if (r.GetInt32(0) != key * 3 || r.GetString(1) != $"row{key}")
+                        _ = Interlocked.Increment(ref wrong);
+                }
+                if (rows != 1)
+                    _ = Interlocked.Increment(ref wrong);
+            }
+        });
+        AreEqual(0, wrong);
+    }
+
+    [TestMethod]
     public void ConcurrentReplays_WindowResults_StayIsolated()
     {
         // Same isolation contract for window functions (SUM OVER running
