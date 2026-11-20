@@ -1,3 +1,6 @@
+#if DEBUG
+using System.Numerics;
+#endif
 using SqlServerSimulator.Storage;
 
 namespace SqlServerSimulator.Parser.Expressions;
@@ -17,7 +20,32 @@ internal sealed class Add : TwoSidedExpression
     internal Add(Expression left, Expression right, bool concatNullYieldsNull) : base(left, right) =>
         this.concatNullYieldsNull = concatNullYieldsNull;
 
-    protected override SqlValue Run(SqlValue left, SqlValue right) =>
+    protected override SqlValue Run(SqlValue left, SqlValue right)
+    {
+        // int + int, the dominant pair: added as long and narrowed, with the
+        // overflow Msg 8115 PureIntegerArithmetic raises for the same pair.
+        if (ReferenceEquals(left.Type, SqlType.Int32) && ReferenceEquals(right.Type, SqlType.Int32) && !left.IsNull && !right.IsNull)
+        {
+            var sum = (long)left.AsInt32 + right.AsInt32;
+            var fast = sum is >= int.MinValue and <= int.MaxValue ? SqlValue.FromInt32((int)sum) : throw SimulatedSqlException.ArithmeticOverflow("int");
+#if DEBUG
+            if (BitOperations.IsPow2(Interlocked.Increment(ref fastPathHits)))
+            {
+                var general = this.RunGeneral(left, right);
+                if (general.Type != fast.Type || general.IsNull || general.AsInt32 != fast.AsInt32)
+                    throw new InvalidOperationException($"The int + int fast path answered {fast.AsInt32} where the general path answered {(general.IsNull ? "NULL" : general.AsInt32.ToString(System.Globalization.CultureInfo.InvariantCulture))}.");
+            }
+#endif
+            return fast;
+        }
+        return this.RunGeneral(left, right);
+    }
+
+#if DEBUG
+    private static long fastPathHits;
+#endif
+
+    private SqlValue RunGeneral(SqlValue left, SqlValue right) =>
         IsStringConcatPair(left, right)
             ? StringConcatenation(left, right, this.concatNullYieldsNull, this.stringPairType)
             : left.Type.PairClass is TypePairClass.Binary or TypePairClass.Timestamp && right.Type.PairClass is TypePairClass.Binary or TypePairClass.Timestamp

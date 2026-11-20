@@ -147,25 +147,43 @@ internal abstract class TwoSidedExpression : Expression
         // parentheses — capped by Msg 191 — so this can't run away. Evaluation
         // order (leftmost leaf, then each right in source order) is identical to
         // the former recursive form.
-        var spine = new List<TwoSidedExpression>();
-        Expression node = this;
-        while (node is TwoSidedExpression twoSided)
+        var chain = Volatile.Read(ref this.spine) ?? this.PublishSpine();
+        var leaf = chain[^1].left;
+        var accumulated = leaf.Run(runtime);
+        for (var i = chain.Length - 1; i >= 0; i--)
         {
-            spine.Add(twoSided);
-            node = twoSided.left;
-        }
-        var accumulated = node.Run(runtime);
-        for (var i = spine.Count - 1; i >= 0; i--)
-        {
-            var current = spine[i];
+            var current = chain[i];
             // Only the leftmost leaf (first fold step) can be an integer
             // literal; once folded, the accumulator is an arithmetic result, so
             // later steps pass a null left expression to the literal adjuster.
-            var leftExpr = i == spine.Count - 1 ? node : null;
+            var leftExpr = i == chain.Length - 1 ? leaf : null;
             var (adjustedLeft, adjustedRight) = AdjustLiteralOperands(leftExpr, current.right, accumulated, current.right.Run(runtime));
             accumulated = current.RunAbsorbing(adjustedLeft, adjustedRight, runtime.Batch);
         }
         return accumulated;
+    }
+
+    /// <summary>
+    /// The nodes of this node's left spine, this one first and the one over the
+    /// leftmost leaf last, kept for the next evaluation of a chain. It is a
+    /// function of the immutable <see cref="left"/> links alone, so it holds
+    /// nothing of an execution (the shared-plan contract); two threads that
+    /// both miss build equal arrays and either may win.
+    /// </summary>
+    private TwoSidedExpression[]? spine;
+
+    private TwoSidedExpression[] PublishSpine()
+    {
+        var nodes = new List<TwoSidedExpression>();
+        Expression node = this;
+        while (node is TwoSidedExpression twoSided)
+        {
+            nodes.Add(twoSided);
+            node = twoSided.left;
+        }
+        var built = nodes.ToArray();
+        Volatile.Write(ref this.spine, built);
+        return built;
     }
 
     /// <summary>

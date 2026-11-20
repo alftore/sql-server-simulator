@@ -309,6 +309,8 @@ The original single-owner assumption ("Expression instances aren't shared across
   Each parallel aggregate worker builds a frame of its own over the shared sources and expression tree.
   A frame is used by one thread and never outlives its enumeration, so a stale cache entry that re-parses gets new nodes and nothing is re-bound in place.
   Debug builds re-resolve a bound reference on every power-of-two hit (`RowFrame.Audit`) and throw if the answer moved.
+- **Derived structure kept on a node** — an operator chain's head keeps the array of its left spine (`TwoSidedExpression.spine`), which is a function of the node's immutable operand links, built on first use and published with `Volatile.Write`; two threads that both miss build equal arrays.
+  Anything kept on a node this way must be derivable from the immutable tree alone and written once, whole, as a reference; a value that depends on a batch, a row or a parameter is per execution however cheap it would be to keep.
 
 When adding any executor or expression feature that computes per-row / per-group / per-execution values, bind them through `BatchContext` / `StatementContext` — never through fields on parse-time objects.
 

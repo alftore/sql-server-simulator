@@ -396,6 +396,10 @@ Thresholds probed against SQL Server 2025.
 
 `Expression.Parse` parses binary-operator chains (`+ - * / % & | ^`) by **iterative precedence-climbing** (`ParseBinaryContinuation`) rather than constructor recursion, so `1 + 1 + … + 1` of any length builds a left-leaning tree with parse recursion bounded by the number of precedence levels (2), not the term count.
 Evaluation is iterative too: `TwoSidedExpression.Run` / `GetSqlType` walk the left spine in a loop (recursing only into right operands, whose depth is paren-bounded), and boolean `AND` / `OR` chains collapse to **n-ary** `AndExpression` / `OrExpression` nodes evaluated in a loop.
+The chain's head keeps its spine (`TwoSidedExpression.spine`, the left-link walk as an array, built on the first evaluation and published with `Volatile.Write`), so evaluating a flat chain allocates nothing per row.
+The array is a function of the immutable `left` links, holds nothing of an execution and may be built twice by racing threads, which keeps it inside the shared-plan contract ([`plan-cache.md`](plan-cache.md#the-shared-plan-contract-per-execution-state-lives-per-execution)).
+`int + int` (both operand types the `SqlType.Int32` instance, neither NULL) adds as `long` in `Add.Run` and raises the same Msg 8115 naming `int` as the general path for a result outside the type; every other pair, a string concatenation and the `NUMERIC_ROUNDABORT` and `ARITHABORT` handling in `RunAbsorbing` included, takes the general path.
+Debug builds re-run the general path on every power-of-two fast-path hit and throw when the answers differ (`Add.Run`); `ArithmeticChainTests` pins the order, the overflow row and the concurrent replay.
 A run of `NOT` prefixes collapses at parse (three-valued `NOT` is an involution).
 So flat `+` / concat / `AND` / `OR` chains of tens of thousands of terms parse and run without recursion.
 
