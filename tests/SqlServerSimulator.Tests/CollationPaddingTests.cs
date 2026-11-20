@@ -43,4 +43,34 @@ public class CollationPaddingTests
         AreEqual(11, selfJoin);
         AreEqual(order, ordered);
     }
+
+    /// <summary>
+    /// A binary collation keeps case and weighs the control as a character of
+    /// its own, so <c>'a'</c>, <c>'A'</c> and <c>'a' + CHAR(31)</c> stay apart
+    /// and only <c>'a  '</c> pads into <c>'a'</c>. <c>_BIN2</c> and every
+    /// <c>varchar</c> compare as if the shorter operand were padded, which puts
+    /// the control below the space; the pre-BIN2 <c>nvarchar</c> form does not
+    /// pad, so there the shorter <c>'a'</c> sorts first.
+    /// </summary>
+    [TestMethod]
+    [DataRow("char", "Latin1_General_BIN", "54123")]
+    [DataRow("varchar", "Latin1_General_BIN", "54123")]
+    [DataRow("nchar", "Latin1_General_BIN", "51243")]
+    [DataRow("nvarchar", "Latin1_General_BIN", "51243")]
+    [DataRow("char", "Latin1_General_BIN2", "54123")]
+    [DataRow("varchar", "Latin1_General_BIN2", "54123")]
+    [DataRow("nchar", "Latin1_General_BIN2", "54123")]
+    [DataRow("nvarchar", "Latin1_General_BIN2", "54123")]
+    [DataRow("char", "Latin1_General_100_BIN2_UTF8", "54123")]
+    [DataRow("varchar", "Latin1_General_100_BIN2_UTF8", "54123")]
+    [DataRow("nchar", "Latin1_General_100_BIN2_UTF8", "54123")]
+    [DataRow("nvarchar", "Latin1_General_100_BIN2_UTF8", "54123")]
+    public void BinaryCollation_TrailingSpacesPad_CaseAndControlDoNot(string type, string collation, string order)
+    {
+        var (distinct, groups, selfJoin, ordered) = Probe(type, collation);
+        AreEqual(4, distinct);
+        AreEqual(4, groups);
+        AreEqual(7, selfJoin);
+        AreEqual(order, ordered);
+    }
 }
