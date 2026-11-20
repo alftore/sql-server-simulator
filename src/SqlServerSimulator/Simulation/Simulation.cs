@@ -4453,7 +4453,10 @@ public sealed partial class Simulation
         // after its dispatch returns, hence the +1.
         if (batch.BlockDepth == 0
             && !selection.IsAssignmentOnly
-            && !batch.HasSessionScopedReference)
+            && !batch.HasSessionScopedReference
+            // A statement compiling as it runs sends what its compile sends
+            // (its join-order warning, say) on every run, which a replay wouldn't.
+            && !batch.CurrentStatement.Recompiles)
         {
             (batch.PlanCacheSequence ??= []).Add(selection);
             (batch.PlanCacheSequenceLocks ??= []).Add(replayLocks ?? []);

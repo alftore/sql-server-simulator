@@ -96,14 +96,20 @@ It's set in these places, all at parse time:
    A local `#temp` table or a table variable a statement recording its plan binds is named by the plan instead (`BatchContext.StatementTempTables`), and folds into the flag once the statement has parsed, so only the batch's SELECT sequence stays out.
 2. **`BuildSynthesizedSqlRow` (the FROM-less SELECT path)**: that path types, then evaluates, projection expressions at parse time and bakes the resulting `SqlValue`s into the row source.
    Caching would emit those stale values forever; `NEWID()` / `GETDATE()` / `@@TRANCOUNT` / `NEXT VALUE FOR seq` need a fresh parse per call.
+   The one row the key does settle stays cacheable, so `SELECT 1` replays: every item a single literal token of the text (`Value.IsFixedByText` — a number, a string, `N''`, `0x…`, `$1`, `NULL`; an ODBC escape is not one, since `{t '10:00'}` is today's date and `{d '…'}` reads the session's language), in parentheses, with an alias, under at most one unary minus over a number (`IsFixedByPlanCacheKey`).
+   Such a token's value and type follow from the text and the database's collation, which the key and the schema version (`ALTER DATABASE … COLLATE` bumps it) hold.
+   Nothing else may be in play: no `WHERE`, `TOP` / `OFFSET` / `FETCH`, `ORDER BY`, `INTO` or assignment, no outer reference or subquery, no unread `EXISTS` projection, no message queued by the parse (a float literal's underflow warning, which a replay wouldn't send), and no bake that raised — its captured exception would be shared between executions, and whether `1/0` or a conversion overflow raises turns on `SET ARITHABORT` / `ANSI_WARNINGS`, which the key doesn't hold.
+   A minus over a string or binary literal stays out for that reason.
+   The row source is built by `SynthesizedRowSource`, a method taking only what the closure reads, so the cached plan holds none of the parse (the capture audit refuses a closure that does), and each run encodes a row of its own.
 3. **The recursive-CTE builder** (`Simulation.With.cs`): a recursive-CTE plan rebinds `CteBinding.CurrentIterationRows` at execution time, so a cached copy replayed by two commands concurrently would cross-feed iteration rowsets.
-   A FROM-less anchor (`SELECT 1 … UNION ALL …`) was already disqualified by rule 2; the builder's own flag covers FROM-ful anchors.
+   Every recursive CTE takes the builder's own flag, a FROM-less literal anchor (`SELECT 1 … UNION ALL …`) included, since rule 2 no longer disqualifies that one.
    Non-recursive CTEs stay cacheable (their bindings are read-only after parse).
 4. **A trigger body's `inserted` / `deleted` of its firing's own** (`TryResolveTable`): a firing finding its parent's kept pair taken — by another session, or by a firing it is nested in — materializes a pair for itself, which no later firing reads, so a plan binding one couldn't serve again; the statement also records nothing at all (`StatementBindsFiringPseudoTables`), leaving the kept pair's plans in place.
    The kept pair itself is no session-scoped reference: a plan over it replays for whichever firing holds it ([`triggers.md`](triggers.md#statement-plans-over-the-pseudo-tables)).
 
 All conditions disqualify identically at the promotion site.
 The flag name is intentionally general — what matters is "this plan can't be safely replayed", not the cause.
+The whole-batch promotion also skips a statement carrying `OPTION (RECOMPILE)` (`Statement.Recompiles`), whose compile sends its messages every run: a batch holding one never replays, as the per-statement plans already declined it.
 
 ## Statement-kind eligibility: what can be replayed
 
@@ -179,7 +185,7 @@ Checked per statement, since an earlier statement in the batch can change what t
 
 And per shape, at the split point (`NoteDmlPlan` plus each parser's `admitted`, `TakeParse` for both kinds):
 
-- No session-scoped reference — a global `##temp` table, a TVP, a trigger's `inserted` / `deleted` materialized for its firing alone, a FROM-less `SELECT`'s values settled while parsing — and no informational message queued by the parse (a join-order warning, say), which a replay wouldn't send; no `OPTION (RECOMPILE)`, no `SELECT … INTO`.
+- No session-scoped reference — a global `##temp` table, a TVP, a trigger's `inserted` / `deleted` materialized for its firing alone, a FROM-less `SELECT`'s values settled while parsing, unless every item is a literal token ([above](#disqualifying-state-hassessionscopedreference)) — and no informational message queued by the parse (a join-order warning, say), which a replay wouldn't send; no `OPTION (RECOMPILE)`, no `SELECT … INTO`.
   A local `#temp` table or a table variable binds the plan to the table it read, which only a run finding that table under its name replays: a loop's next iteration and the calls that see a caller's table replay, while another session's table, or one created or declared again, parses — a `SELECT` over a `#temp` table in a 20,000-iteration loop went from 1.16 s to 0.58 s, what the same loop over a permanent table costs (measured 2026-10-26, Release), against real's 82 ms.
 
 - A table in the session's own database, a `#temp` table or table variable bound as a query's is, or a stored view writing through to its one base table (`AdmitsDmlPlan`): not a TVP (any session-scoped reference in the statement), a linked server's table, or a table whose writes check the session's SET options (an indexed view, a filtered index, a persisted computed column — `RequiresCorrectSetOptions`).

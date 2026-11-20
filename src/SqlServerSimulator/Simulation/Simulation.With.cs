@@ -442,9 +442,9 @@ partial class Simulation
         // (CurrentIterationRows rebinds between iterations), so a plan-cached
         // copy replayed by two commands concurrently would cross-feed
         // iteration rowsets. Disqualify the batch from plan-cache promotion —
-        // each execution re-parses and owns a fresh binding. (A FROM-less
-        // anchor already disqualified via BuildSynthesizedSqlRow; this covers
-        // the FROM-ful-anchor shape.)
+        // each execution re-parses and owns a fresh binding. Every recursive CTE
+        // takes this, a FROM-less literal anchor included, since
+        // BuildSynthesizedSqlRow no longer disqualifies on its own.
         context.Batch.HasSessionScopedReference = true;
 
         return Selection.FromRecursiveCte([.. anchors], [.. recursives], binding);

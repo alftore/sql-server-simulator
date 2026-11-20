@@ -40,12 +40,32 @@ internal sealed class Value : Expression
     /// </summary>
     internal readonly bool IsLiteral;
 
+    /// <summary>
+    /// True when the constant is exactly what one literal token of the command
+    /// text (<c>1</c>, <c>N'x'</c>, <c>0x01</c>, <c>$1</c>, <c>1.5e0</c>) or
+    /// the bare <c>NULL</c> keyword reads as: its value and type follow from
+    /// the text and the database's collation alone, which the plan-cache key
+    /// and the schema version hold. Narrower than <see cref="IsLiteral"/>,
+    /// which an ODBC escape also sets — <c>{t '10:00'}</c> is today's date and
+    /// <c>{d '…'}</c> reads the session's language — so a FROM-less
+    /// <c>SELECT</c> may share its parse-time row between executions only over
+    /// these.
+    /// </summary>
+    internal bool IsFixedByText;
+
+    /// <summary>The expression for one string, binary or money literal token.</summary>
+    internal static Value OfLiteralToken(SqlValue value) => new(value) { IsFixedByText = true };
+
+    /// <summary>The expression for one numeric literal token, carrying its significant-digit count.</summary>
+    internal static Value OfNumericToken(SqlValue value, int integerLiteralDigitCount) => new(value, integerLiteralDigitCount) { IsFixedByText = true };
+
     /// <summary>Bare <c>NULL</c> literal — typed as <see cref="SqlType.Int32"/>; SQL Server has no truly untyped NULL, so we pick a default type that yields to any typed sibling in promotion.</summary>
     public Value()
     {
         this.Constant = SqlValue.Null(SqlType.Int32);
         this.IsUntypedNull = true;
         this.IsLiteral = true;
+        this.IsFixedByText = true;
     }
 
     public Value(SqlValue value)
