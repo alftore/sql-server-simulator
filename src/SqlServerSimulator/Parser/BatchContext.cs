@@ -2230,8 +2230,9 @@ internal sealed partial class BatchContext
     private static Dictionary<string, VariableSlot> SeedVariables(SimulatedDbCommand command)
     {
         var dict = new Dictionary<string, VariableSlot>(command.Parameters.Count, BatchContext.VariableNameComparer);
-        foreach (SimulatedDbParameter parameter in command.Parameters)
+        for (var i = 0; i < command.Parameters.Count; i++)
         {
+            var parameter = command.Parameters[i];
             // Skip structured / table-valued parameters here — they land in
             // TableVariables via SeedTableVariablesFromStructuredParameters.
             // Detection: a DataTable or IDataReader value combined with a
@@ -2319,8 +2320,9 @@ internal sealed partial class BatchContext
     /// </summary>
     private static void SeedTableVariablesFromStructuredParameters(BatchContext batch, SimulatedDbCommand command)
     {
-        foreach (SimulatedDbParameter parameter in command.Parameters)
+        for (var i = 0; i < command.Parameters.Count; i++)
         {
+            var parameter = command.Parameters[i];
             if (!IsTableValuedParameterValue(parameter))
                 continue;
             var typeName = parameter.TypeName;

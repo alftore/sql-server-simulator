@@ -44,10 +44,8 @@ partial class Simulation
     /// non-aborting error, the last of which <c>@@ERROR</c> reads until the
     /// first statement ends.
     /// </summary>
-    private static IEnumerable<SimulatedErrorOutcome> CompileFailuresSent(BatchContext batch, List<SimulatedSqlException>? failures)
+    private static IEnumerable<SimulatedErrorOutcome> CompileFailuresSent(BatchContext batch, List<SimulatedSqlException> failures)
     {
-        if (failures is null)
-            yield break;
         foreach (var failure in failures)
         {
             batch.Connection.LastErrorNumber = failure.Number;

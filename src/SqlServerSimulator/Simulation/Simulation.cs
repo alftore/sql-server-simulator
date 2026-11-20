@@ -1958,8 +1958,13 @@ public sealed partial class Simulation
                 batch.StatementsCompiledOnRun = compileContext.StatementsCompiledOnRun;
                 batch.JoinOrderWarnedStatements = compileContext.JoinOrderWarnedStatements;
             }
-            foreach (var failure in CompileFailuresSent(batch, inliningFailures))
-                yield return failure;
+            if (inliningFailures is not null)
+            {
+                foreach (var failure in CompileFailuresSent(batch, inliningFailures))
+                {
+                    yield return failure;
+                }
+            }
             if (compileClock is not null)
                 yield return new SimulatedInfoOutcome(CompileTime(batch, compileClock, compileContext?.LastTopLevelStatementLine ?? 0, BatchCreatedModuleName(command) ?? batch.ErrorProcedureName));
 
@@ -4996,7 +5001,7 @@ public sealed partial class Simulation
     /// </summary>
     private static void WriteBackOutputParameters(BatchContext batch)
     {
-        foreach (var slot in batch.Variables.Values)
+        foreach (var (_, slot) in batch.Variables)
         {
             if (slot.Parameter is SimulatedDbParameter parameter
                 && parameter.Direction is ParameterDirection.InputOutput or ParameterDirection.Output)
