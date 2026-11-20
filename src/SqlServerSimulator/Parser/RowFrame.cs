@@ -50,6 +50,24 @@ internal sealed class RowFrame(FromSource[] sources, BatchContext batch, Func<Mu
     private SourceColumnMemo? memo;
     private Binding[] bindings = NoBindings;
 
+    /// <summary>
+    /// A frame over one source's own row, which a computed column's expression
+    /// reads through: its names bind by <see cref="Selection.FindWithinSource"/>
+    /// and a read decodes the column as <see cref="Selection.DecodeOrCompute"/>
+    /// does. It has no outer frame or resolver and never computes through
+    /// another frame (Msg 1759 keeps a computed column off a computed one).
+    /// </summary>
+    private readonly bool withinSource;
+
+    /// <summary>One within-source child frame per source, made on the first read of a computed column of it.</summary>
+    private RowFrame?[]? computeFrames;
+
+    private RowFrame(FromSource source, BatchContext batch) : this([source], batch, null)
+    {
+        this.withinSource = true;
+        this.Tuple = new byte[1][];
+    }
+
     /// <summary>The row tuple the frame reads; the site that owns the frame sets it per row.</summary>
     public byte[]?[] Tuple = null!;
 
@@ -73,13 +91,18 @@ internal sealed class RowFrame(FromSource[] sources, BatchContext batch, Func<Mu
         public Reference? Owner;
         public int Source;
         public int Column;
+
+        /// <summary>The column is a non-persisted computed column the frame reads through a child frame.</summary>
+        public bool Computed;
 #if DEBUG
         public int Hits;
 #endif
     }
 
     private SqlValue ResolveByName(MultiPartName name) =>
-        Selection.ResolveAcrossTuple(sources, this.Tuple, name, batch, outerResolver, this.memo ??= new());
+        this.withinSource
+            ? Selection.ResolveWithinSource(sources[0], this.Tuple[0]!, batch, name)
+            : Selection.ResolveAcrossTuple(sources, this.Tuple, name, batch, outerResolver, this.memo ??= new());
 
     /// <summary>The value of <paramref name="reference"/> in the current tuple.</summary>
     [MethodImpl(Tiering.OptimizeFirstCall)]
@@ -90,13 +113,17 @@ internal sealed class RowFrame(FromSource[] sources, BatchContext batch, Func<Mu
         if (!ReferenceEquals(binding.Owner, reference))
             return this.BindAndRead(reference);
 #if DEBUG
-        Audit(sources, reference, ref binding);
+        this.Audit(reference, ref binding);
 #endif
-        return this.ReadBound(reference, binding.Source, binding.Column);
+        return this.ReadBound(reference, binding.Source, binding.Column, binding.Computed);
     }
 
-    private SqlValue ReadBound(Reference reference, int source, int column)
+    private SqlValue ReadBound(Reference reference, int source, int column, bool computed)
     {
+        if (computed)
+            return this.ComputeThroughFrame(source, column);
+        if (this.withinSource)
+            return Selection.DecodeOrCompute(sources[0], column, this.Tuple[0]!, batch);
         if (source >= 0)
             return Selection.ReadSourceColumn(sources, this.Tuple, source, column, batch, outerResolver, this.memo);
         if (source != -1)
@@ -108,12 +135,43 @@ internal sealed class RowFrame(FromSource[] sources, BatchContext batch, Func<Mu
             : throw Selection.UnresolvedNameError(sources, reference.ReferencedName);
     }
 
+    /// <summary>
+    /// A non-persisted computed column's value in the current row: its
+    /// expression run over a within-source child frame whose bindings last
+    /// the enumeration. Nothing but those bindings is kept, so a
+    /// non-deterministic expression draws afresh on every read, and an error
+    /// surfaces on the row and read that raises it today. The column's database
+    /// is entered per read, as <c>Selection.Compute</c> does.
+    /// </summary>
+    private SqlValue ComputeThroughFrame(int source, int column)
+    {
+        var bytes = this.Tuple[source];
+        var from = sources[source];
+        if (bytes is null)
+            return SqlValue.Null(from.Columns[column].Type);
+
+        this.computeFrames ??= new RowFrame?[sources.Length];
+        var child = this.computeFrames[source] ??= new RowFrame(from, batch);
+        child.Tuple[0] = bytes;
+
+        var scope = from.BackingTable?.OwningDatabase is { } owner ? ModuleDatabaseScope.Enter(batch.Connection, owner, bindsIdentity: false) : default;
+        try
+        {
+            return from.Columns[column].Computed!.Run(new RuntimeContext(child, batch));
+        }
+        finally
+        {
+            scope.Exit();
+        }
+    }
+
     private SqlValue BindAndRead(Reference reference)
     {
         // Raises exactly what the by-name path raises (Msg 209, a graph
         // column's refusal) and stores nothing when it does.
         var name = reference.ReferencedName;
-        var (source, column) = Resolve(sources, name);
+        var (source, column) = this.Resolve(name);
+        var computed = !this.withinSource && source >= 0 && Selection.ReadsComputedExpression(sources[source], column);
 
         var bindings = this.bindings;
         if (ReferenceEquals(bindings, NoBindings))
@@ -135,18 +193,26 @@ internal sealed class RowFrame(FromSource[] sources, BatchContext batch, Func<Mu
             index = reference.Slot & (bindings.Length - 1);
         }
 
-        bindings[index] = new Binding { Owner = reference, Source = source, Column = column };
+        bindings[index] = new Binding { Owner = reference, Source = source, Column = column, Computed = computed };
 
         // A deferred column evaluates through the memo, which it shares with
         // the by-name path so the two resolve one name once.
         if (source >= 0 && sources[source].DeferredColumns is { } deferred && deferred[column] is not null)
             this.memo ??= new();
 
-        return this.ReadBound(reference, source, column);
+        return this.ReadBound(reference, source, column, computed);
     }
 
-    private static (int Source, int Column) Resolve(FromSource[] sources, MultiPartName name) =>
-        RowLocator.IsLocatorName(name) ? RowLocator.Find(sources, name) : Selection.FindSourceColumn(sources, name);
+    private (int Source, int Column) Resolve(MultiPartName name)
+    {
+        if (!this.withinSource)
+            return RowLocator.IsLocatorName(name) ? RowLocator.Find(sources, name) : Selection.FindSourceColumn(sources, name);
+
+        // Inside a computed column's expression the name is matched on its
+        // leaf against the source alone, and a miss is Msg 207.
+        var index = Selection.FindWithinSource(sources[0], name.Leaf, batch.CurrentDatabase.Collation);
+        return index >= 0 ? (0, index) : throw SimulatedSqlException.InvalidColumnName(name);
+    }
 
 #if DEBUG
     /// <summary>
@@ -156,12 +222,12 @@ internal sealed class RowFrame(FromSource[] sources, BatchContext batch, Func<Mu
     /// logarithmic number of extra resolutions, as <c>PlanCacheCaptureAudit</c>
     /// does for the shared-plan contract. Release builds carry none of it.
     /// </summary>
-    private static void Audit(FromSource[] sources, Reference reference, ref Binding binding)
+    private void Audit(Reference reference, ref Binding binding)
     {
         var hits = ++binding.Hits;
         if ((hits & (hits - 1)) != 0)
             return;
-        var (source, column) = Resolve(sources, reference.ReferencedName);
+        var (source, column) = this.Resolve(reference.ReferencedName);
         if (source != binding.Source || column != binding.Column)
             throw new InvalidOperationException($"Column reference '{reference.ReferencedName}' is bound to ({binding.Source}, {binding.Column}) in its frame, but resolves to ({source}, {column}) after {hits} reads.");
     }
