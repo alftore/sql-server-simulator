@@ -257,7 +257,7 @@ partial class Simulation
             // TOP (0) reads no row at all, so nothing per row can raise either.
             rowSource = [];
         }
-        else if (where is not null && Selection.MutationPlanStarts(table, where))
+        else if (where is not null && Selection.MutationPlanStarts(table, where, context.Batch))
         {
             // Real evaluates the WHERE's runtime constants as its plan starts,
             // so `DELETE t WHERE id = 1/0` raises over an empty table.
@@ -270,8 +270,8 @@ partial class Simulation
         // shared reader is waited out by the X the row is then written under.
         var contended = positionedCursor is null && sourceView is null && where is not null && !readsNoRow
             && (Volatile.Read(ref table.ActiveDataWriters) != 0 || Volatile.Read(ref table.ActiveUpdateLocks) != 0 || !table.SupersededKeyImages.IsEmptyLockFree());
-        var targetWait = contended && Selection.WhereIsClusteredKeySeek(table, where!) ? LockMode.Exclusive : LockMode.Update;
-        var throughIndex = contended && targetWait == LockMode.Update ? Selection.MutationSeekIndex(table, where!) : null;
+        var targetWait = contended && Selection.WhereIsClusteredKeySeek(table, where!, context.Batch) ? LockMode.Exclusive : LockMode.Update;
+        var throughIndex = contended && targetWait == LockMode.Update ? Selection.MutationSeekIndex(table, where!, context.Batch) : null;
         // A statement whose client reads its OUTPUT rows as they come deletes
         // each as it sends it, in the order real's plan for its shape does.
         var writeOrder = positionedCursor is null && sourceView is null && viewRows is null && !readsNoRow && WritesAsItSends(context.Batch, output)

@@ -3721,8 +3721,8 @@ internal sealed partial class Selection
     /// 2025, where <c>UPDATE t SET v = 1/0 WHERE pk = 99</c> affects nothing
     /// and <c>… WHERE id = 99</c> over a heap raises.
     /// </summary>
-    internal static bool MutationPlanStarts(HeapTable table, BooleanExpression? where) =>
-        where is null || (!where.IsNeverTrue && !PinsUniqueKey(table, BuildBaseTableSeekSource(table, table.Name), [where]));
+    internal static bool MutationPlanStarts(HeapTable table, BooleanExpression? where, BatchContext batch) =>
+        where is null || (!where.IsNeverTrue && !PinsUniqueKey(table, BuildBaseTableSeekSource(table, table.Name, batch), [where]));
 
     private static bool KeyColumnsCovered(int[] keyOrdinals, HashSet<int> available)
     {
@@ -4807,7 +4807,7 @@ internal sealed partial class Selection
     private static bool TryFenceWriterInterval(
         HeapTable table, BooleanExpression predicate, string qualifier, Func<MultiPartName, SqlValue>? outerResolver, LockMode mode, BatchContext batch)
     {
-        var source = BuildBaseTableSeekSource(table, qualifier);
+        var source = BuildBaseTableSeekSource(table, qualifier, batch);
         var conjuncts = new List<BooleanExpression>();
         predicate.CollectConjuncts(conjuncts);
         var correlated = outerResolver is not null;
@@ -4851,7 +4851,7 @@ internal sealed partial class Selection
     internal static IEnumerable<(int Page, int Slot, byte[] Bytes)>? SeekMutationTarget(
         HeapTable table, BooleanExpression where, BatchContext batch)
     {
-        var source = BuildBaseTableSeekSource(table, table.Name);
+        var source = BuildBaseTableSeekSource(table, table.Name, batch);
 
         var conjuncts = new List<BooleanExpression>();
         where.CollectConjuncts(conjuncts);
@@ -4909,9 +4909,9 @@ internal sealed partial class Selection
     /// wait <c>LCK_M_X</c>; a residual predicate, a range ahead of another
     /// column, <c>k IN (1, 5)</c> and a scan wait <c>LCK_M_U</c>).
     /// </summary>
-    internal static bool WhereIsClusteredKeySeek(HeapTable table, BooleanExpression where)
+    internal static bool WhereIsClusteredKeySeek(HeapTable table, BooleanExpression where, BatchContext batch)
     {
-        var source = BuildBaseTableSeekSource(table, table.Name);
+        var source = BuildBaseTableSeekSource(table, table.Name, batch);
         var conjuncts = new List<BooleanExpression>();
         where.CollectConjuncts(conjuncts);
         return IsClusteredKeySeek(table, source, conjuncts, value => IsStableValueSide(value, source, allowCorrelatedColumnValue: false, planSources: null));
@@ -5049,9 +5049,9 @@ internal sealed partial class Selection
     /// seeks or scans. Real reads such a row's index key under U before it
     /// waits on the row (probed 2026-10-07 against SQL Server 2025).
     /// </summary>
-    internal static KeyLockGroup? MutationSeekIndex(HeapTable table, BooleanExpression where)
+    internal static KeyLockGroup? MutationSeekIndex(HeapTable table, BooleanExpression where, BatchContext batch)
     {
-        var source = BuildBaseTableSeekSource(table, table.Name);
+        var source = BuildBaseTableSeekSource(table, table.Name, batch);
         var conjuncts = new List<BooleanExpression>();
         where.CollectConjuncts(conjuncts);
         var equalities = new Dictionary<int, Expression[]>();
@@ -5120,7 +5120,7 @@ internal sealed partial class Selection
     internal static Func<Func<MultiPartName, SqlValue>, IEnumerable<(int Page, int Slot, byte[] Bytes)>>? TryPrepareMergeTargetSeek(
         HeapTable table, string? targetQualifier, BooleanExpression on, BatchContext batch)
     {
-        var source = BuildBaseTableSeekSource(table, targetQualifier);
+        var source = BuildBaseTableSeekSource(table, targetQualifier, batch);
 
         var conjuncts = new List<BooleanExpression>();
         on.CollectConjuncts(conjuncts);
@@ -5170,7 +5170,71 @@ internal sealed partial class Selection
     // column references, under the given qualifier (the table's own name for a
     // single-table UPDATE / DELETE, the target alias for a MERGE). The Rows stream
     // is unused — the seek reads addresses straight from the heap's cache.
-    private static FromSource BuildBaseTableSeekSource(HeapTable table, string? qualifier)
+    //
+    // Memoized on the statement (StatementContext.SeekSource): one write asks for
+    // it at its plan start, its lock fence, its seek and its wait mode, and a MERGE
+    // once per source row, all over the same table. The memo lives and dies with
+    // the statement's run, so it is not checked against the column names the source
+    // copies: sp_rename ... 'COLUMN' writes the new name into the existing
+    // HeapColumn in place, which would leave a source memoized on the table stale,
+    // but no rename can run between two lookups of one statement's run. The
+    // returned source is shared by those callers and must stay unwritten (they
+    // read it; the seek's own copy is SeekedSource's).
+    private static FromSource BuildBaseTableSeekSource(HeapTable table, string? qualifier, BatchContext batch)
+    {
+        var statement = batch.CurrentStatement;
+        if (statement.SeekSource is { } memo && ReferenceEquals(statement.SeekSourceTable, table)
+            && string.Equals(statement.SeekSourceQualifier, qualifier, StringComparison.Ordinal))
+        {
+#if DEBUG
+            if (long.IsPow2(Interlocked.Increment(ref StatementContext.SeekSourceHits)))
+                AuditSeekSource(memo, BuildSeekSource(table, qualifier), table);
+#endif
+            return memo;
+        }
+        var built = BuildSeekSource(table, qualifier);
+        statement.SeekSource = built;
+        statement.SeekSourceTable = table;
+        statement.SeekSourceQualifier = qualifier;
+        return built;
+    }
+
+#if DEBUG
+    // The slow way: a source built now must equal the memoized one, which must
+    // still hold the defaults it was built with. A stale name or a later change
+    // that writes the shared source throws here, naming the table, on a
+    // power-of-two count of hits.
+    private static void AuditSeekSource(FromSource memo, FromSource fresh, HeapTable table)
+    {
+        static InvalidOperationException Differs(HeapTable table, string what) =>
+            new($"The memoized seek source of table '{table.Name}' differs from a fresh one: {what}.");
+
+        if (!memo.ColumnNames.AsSpan().SequenceEqual(fresh.ColumnNames))
+            throw Differs(table, "ColumnNames");
+        if (!string.Equals(memo.Qualifier, fresh.Qualifier, StringComparison.Ordinal))
+            throw Differs(table, "Qualifier");
+        if (!ReferenceEquals(memo.Columns, fresh.Columns) || !ReferenceEquals(memo.StoredSchema, fresh.StoredSchema)
+            || !ReferenceEquals(memo.StorageOrdinals, fresh.StorageOrdinals) || !ReferenceEquals(memo.LobStore, fresh.LobStore))
+        {
+            throw Differs(table, "a table reference");
+        }
+        if (memo.Seeks || memo.SeekOrdinals is not null || memo.SeekIsEquality)
+        {
+            throw Differs(table, "Seeks / SeekOrdinals / SeekIsEquality written");
+        }
+        if (memo.ReadColumns is not null || memo.DeferredColumns is not null || memo.UncomputedColumns is not null)
+        {
+            throw Differs(table, "ReadColumns / DeferredColumns / UncomputedColumns written");
+        }
+        if (memo.MaterializedRows is not null || memo.ForcedAccessPath is not null || memo.WrittenHints is not null
+            || memo.ForcedSeekThrough is not null || memo.BodySeekShape is not null)
+        {
+            throw Differs(table, "MaterializedRows / hints / BodySeekShape written");
+        }
+    }
+#endif
+
+    private static FromSource BuildSeekSource(HeapTable table, string? qualifier)
     {
         var columnNames = new string[table.Columns.Length];
         for (var i = 0; i < columnNames.Length; i++)
