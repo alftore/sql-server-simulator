@@ -155,6 +155,34 @@ public sealed class SimulatedDbParameter : DbParameter
     [AllowNull]
     public string TypeName { get; set; } = "";
 
+    /// <summary>
+    /// The most digits a <see cref="DbType.Decimal"/> parameter holds, as
+    /// <c>SqlParameter.Precision</c> declares it. Zero, the default, leaves
+    /// the declaration to the value: its significant digits (at least its
+    /// scale, at least one), or 29 for a null value.
+    /// </summary>
+    /// <remarks>
+    /// Set, the declaration is <c>decimal(Precision, Scale)</c> whatever the
+    /// value. A value that does not fit raises <see cref="ArgumentException"/>
+    /// when the command runs, before anything executes, as SqlClient refuses
+    /// it before sending.
+    /// </remarks>
+    public override byte Precision { get; set; }
+
+    /// <summary>
+    /// The digits right of the decimal point of a <see cref="DbType.Decimal"/>
+    /// parameter, or the fractional-second digits of a
+    /// <see cref="DbType.DateTime2"/>, <see cref="DbType.Time"/> or
+    /// <see cref="DbType.DateTimeOffset"/> parameter, as
+    /// <c>SqlParameter.Scale</c> declares them. Zero, the default, is unset.
+    /// </summary>
+    /// <remarks>
+    /// An unset decimal scale is the value's own; a set one rounds the value
+    /// half away from zero to it. An unset temporal scale is 7, and a set one
+    /// truncates the value to that many digits.
+    /// </remarks>
+    public override byte Scale { get; set; }
+
     /// <inheritdoc/>
     public override void ResetDbType() => this.dbType = null;
 }

@@ -51,7 +51,7 @@ public sealed class RpcOutputParameterTests
     public async Task DecimalOutput_Assigned_DualRead()
     {
         var simulation = new Simulation();
-        var oracle = Wire.OutputInProc(simulation, "set @out = 123.45", "@out", DbType.Decimal, ParameterDirection.Output, null);
+        var oracle = Wire.OutputInProc(simulation, "set @out = 123.45", "@out", DbType.Decimal, 10, 2, ParameterDirection.Output, null);
 
         await using var listener = await simulation.ListenLocalAsync(0, TestContext.CancellationToken);
         await using var connection = await Wire.OpenAsync(listener, TestContext.CancellationToken);

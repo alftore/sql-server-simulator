@@ -49,8 +49,8 @@ public class ParameterTests
         AreEqual(DBNull.Value, command.ExecuteScalar());
     }
 
-    private static SimulatedDbParameter Unsupplied(string name, DbType dbType, int size = 0, ParameterDirection direction = ParameterDirection.Input) =>
-        new() { ParameterName = name, DbType = dbType, Size = size, Direction = direction, Value = null };
+    private static SimulatedDbParameter Unsupplied(string name, DbType dbType, int size = 0, ParameterDirection direction = ParameterDirection.Input, byte precision = 0, byte scale = 0) =>
+        new() { ParameterName = name, DbType = dbType, Size = size, Direction = direction, Precision = precision, Scale = scale, Value = null };
 
     [TestMethod]
     [DataRow(DbType.Int32, 0, "(@a int)select @a")]
@@ -62,14 +62,17 @@ public class ParameterTests
     [DataRow(DbType.AnsiStringFixedLength, 0, "(@a char(8000))select @a")]
     [DataRow(DbType.Binary, -1, "(@a varbinary(max) )select @a")]
     [DataRow(DbType.Decimal, 0, "(@a decimal(29,0))select @a")]
+    [DataRow(DbType.Decimal, 0, "(@a decimal(18,2))select @a", (byte)18, (byte)2)]
+    [DataRow(DbType.Decimal, 0, "(@a decimal(10,0))select @a", (byte)10, (byte)0)]
+    [DataRow(DbType.DateTime2, 0, "(@a datetime2(3))select @a", (byte)0, (byte)3)]
     [DataRow(DbType.DateTime2, 0, "(@a datetime2(7))select @a")]
     [DataRow(DbType.Currency, 0, "(@a money)select @a")]
     [DataRow(DbType.Object, 0, "(@a sql_variant)select @a")]
-    public void CSharpNullValue_IsNotSupplied(DbType dbType, int size, string query)
+    public void CSharpNullValue_IsNotSupplied(DbType dbType, int size, string query, byte precision = 0, byte scale = 0)
     {
         using var command = new Simulation().CreateOpenConnection().CreateCommand();
         command.CommandText = "select @a";
-        _ = command.Parameters.Add(Unsupplied("a", dbType, size));
+        _ = command.Parameters.Add(Unsupplied("a", dbType, size, precision: precision, scale: scale));
 
         var error = Throws<SimulatedSqlException>(() => _ = command.ExecuteScalar());
         AreEqual(8178, error.Number);

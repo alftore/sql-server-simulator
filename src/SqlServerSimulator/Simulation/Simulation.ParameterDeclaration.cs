@@ -1,6 +1,7 @@
 using System.Data;
 using System.Globalization;
 using System.Text;
+using SqlServerSimulator.Storage;
 
 namespace SqlServerSimulator;
 
@@ -86,7 +87,12 @@ partial class Simulation
             var parameter = parameters[i];
             if (parameter.Direction is ParameterDirection.ReturnValue)
                 continue;
-            AppendDeclaredParameter(declaration, parameter.ParameterName, parameter.DbType, parameter.Size, parameter.Precision, parameter.Scale, parameter.Direction);
+            var dbType = parameter.DbType;
+            var precision = parameter.Precision;
+            var scale = parameter.Scale;
+            if (dbType is DbType.Decimal)
+                EffectiveDecimal(parameter, out precision, out scale);
+            AppendDeclaredParameter(declaration, parameter.ParameterName, dbType, parameter.Size, precision, scale, parameter.Direction);
         }
         return declaration.ToString();
     }
@@ -138,6 +144,217 @@ partial class Simulation
     }
 
     /// <summary>
+    /// A decimal parameter as SqlClient 7.1.1 declares and sends it (probed
+    /// 2026-11-20 through the simulator's listener, which quotes the
+    /// declaration in Msg 8178): the precision is the set one, else the
+    /// value's own digits (its scale at least, one at least), else 29 for a
+    /// null; the scale is the set one, else the value's; the value is rounded
+    /// half away from zero to that scale. <see cref="Fits"/> is false when the
+    /// rounded value has more integer digits than the precision leaves, or the
+    /// scale passes the precision, which SqlClient refuses before sending.
+    /// </summary>
+    internal struct ResolvedDecimal
+    {
+        public byte Precision;
+
+        public byte Scale;
+
+        /// <summary>The value rounded to <see cref="Scale"/>, when it is a .NET decimal.</summary>
+        public decimal Rounded;
+
+        /// <summary>The value, when it arrived at full width instead of as a .NET decimal.</summary>
+        public Decimal38? Wide;
+
+        /// <summary>False for a null value and for one that does not convert to a decimal.</summary>
+        public bool HasValue;
+
+        public bool Fits;
+
+        /// <summary>Whether the value is non-null yet cannot be read as a decimal; the engine's own conversion raises its error.</summary>
+        public bool Unconvertible;
+    }
+
+    /// <summary>The precision SqlClient declares for a null decimal parameter with none set.</summary>
+    private const byte NullDecimalPrecision = 29;
+
+    private static readonly decimal[] DecimalPowersOfTen =
+    [
+        1m, 10m, 100m, 1000m, 10000m, 100000m, 1000000m, 10000000m, 100000000m, 1000000000m,
+        10000000000m, 100000000000m, 1000000000000m, 10000000000000m, 100000000000000m,
+        1000000000000000m, 10000000000000000m, 100000000000000000m, 1000000000000000000m,
+        10000000000000000000m, 100000000000000000000m, 1000000000000000000000m,
+        10000000000000000000000m, 100000000000000000000000m, 1000000000000000000000000m,
+        10000000000000000000000000m, 100000000000000000000000000m, 1000000000000000000000000000m,
+        10000000000000000000000000000m,
+    ];
+
+    internal static ResolvedDecimal ResolveDecimal(SimulatedDbParameter parameter)
+    {
+        var raw = parameter.Value;
+        if (raw is Decimal38 wide)
+        {
+            return new ResolvedDecimal
+            {
+                Precision = parameter.Precision != 0 ? parameter.Precision : (byte)Math.Max(wide.SignificantDigits(), wide.Scale),
+                Scale = parameter.Scale != 0 ? parameter.Scale : wide.Scale,
+                Wide = wide,
+                HasValue = true,
+                Fits = true,
+            };
+        }
+
+        var value = 0m;
+        var unconvertible = false;
+        if (raw is not (null or DBNull or SqlValue))
+        {
+            try
+            {
+                value = BinaryFloatToDecimal.FromParameter(raw);
+            }
+            catch (Exception e) when (e is FormatException or InvalidCastException or OverflowException)
+            {
+                unconvertible = true;
+            }
+        }
+
+        if (raw is null or DBNull or SqlValue || unconvertible)
+        {
+            return new ResolvedDecimal
+            {
+                Precision = parameter.Precision != 0 ? parameter.Precision : NullDecimalPrecision,
+                Scale = parameter.Scale,
+                Fits = true,
+                Unconvertible = unconvertible,
+            };
+        }
+
+        var valueScale = value.Scale;
+        var precision = parameter.Precision != 0 ? parameter.Precision : new System.Data.SqlTypes.SqlDecimal(value).Precision;
+        var scale = parameter.Scale != 0 ? parameter.Scale : valueScale;
+        var rounded = scale >= valueScale ? value : decimal.Round(value, scale, MidpointRounding.AwayFromZero);
+        var fits = scale <= precision && (precision - scale > 28 || Math.Abs(rounded) < DecimalPowersOfTen[precision - scale]);
+        return new ResolvedDecimal
+        {
+            Precision = precision,
+            Scale = scale,
+            Rounded = rounded,
+            HasValue = true,
+            Fits = fits,
+        };
+    }
+
+    /// <summary>
+    /// The precision and scale <paramref name="parameter"/> is declared with,
+    /// as SqlClient resolves them from <see cref="SimulatedDbParameter.Precision"/> /
+    /// <see cref="SimulatedDbParameter.Scale"/> and the value.
+    /// </summary>
+    internal static void EffectiveDecimal(SimulatedDbParameter parameter, out byte precision, out byte scale)
+    {
+        var resolved = ResolveDecimal(parameter);
+        precision = resolved.Precision;
+        scale = resolved.Scale;
+    }
+
+    /// <summary>
+    /// The decimal <paramref name="parameter"/> binds as: its declared type
+    /// and its value rounded to it, a typed NULL for a null. False for a value
+    /// that does not convert, which the caller's own conversion then raises.
+    /// </summary>
+    internal static bool TryBindDecimal(SimulatedDbParameter parameter, out SqlType type, out SqlValue seed)
+    {
+        var resolved = ResolveDecimal(parameter);
+        if (resolved.Unconvertible)
+        {
+            type = SqlType.GetByDbType(DbType.Decimal);
+            seed = default;
+            return false;
+        }
+
+        var declared = DecimalSqlType.Get(resolved.Precision, resolved.Scale);
+        type = declared;
+        seed = !resolved.HasValue ? SqlValue.Null(declared)
+            : resolved.Wide is { } wide ? declared.ConvertParameter(wide)
+            : declared.ConvertParameter(resolved.Rounded);
+        return true;
+    }
+
+    /// <summary>
+    /// The decimal or temporal <paramref name="parameter"/> whose
+    /// <see cref="SimulatedDbParameter.Precision"/> /
+    /// <see cref="SimulatedDbParameter.Scale"/> decide its type, bound as
+    /// SqlClient sends it; false for any other parameter, and for one whose
+    /// value does not convert, which the caller's own conversion then raises.
+    /// </summary>
+    internal static bool TryBindPrecisionScale(SimulatedDbParameter parameter, out SqlType type, out SqlValue seed)
+    {
+        switch (parameter.DbType)
+        {
+            case DbType.Decimal:
+                return TryBindDecimal(parameter, out type, out seed);
+            case DbType.DateTime2 or DbType.Time or DbType.DateTimeOffset when parameter.Scale is > 0 and < 7:
+                type = parameter.DbType switch
+                {
+                    DbType.DateTime2 => SqlType.GetDateTime2(parameter.Scale),
+                    DbType.Time => SqlType.GetTime(parameter.Scale),
+                    _ => SqlType.GetDateTimeOffset(parameter.Scale),
+                };
+                seed = parameter.Value is null or DBNull or SqlValue
+                    ? SqlValue.Null(type)
+                    : type.ConvertParameter(TruncateToScale(parameter.Value, TimeSpan.TicksPerSecond / (long)Math.Pow(10, parameter.Scale)));
+                return true;
+            default:
+                type = SqlType.Int32;
+                seed = default;
+                return false;
+        }
+    }
+
+    /// <summary>
+    /// <paramref name="value"/> with its time of day cut, not rounded, to a
+    /// multiple of <paramref name="unit"/> ticks, as SqlClient cuts a
+    /// temporal value to its parameter's scale before sending it.
+    /// </summary>
+    private static object TruncateToScale(object value, long unit) => value switch
+    {
+        DateTime dateTime => new DateTime(dateTime.Ticks - (dateTime.Ticks % unit), dateTime.Kind),
+        DateTimeOffset dateTimeOffset => new DateTimeOffset(dateTimeOffset.Ticks - (dateTimeOffset.Ticks % unit), dateTimeOffset.Offset),
+        TimeSpan timeSpan => TimeSpan.FromTicks(timeSpan.Ticks - (timeSpan.Ticks % unit)),
+        TimeOnly timeOnly => new TimeOnly(timeOnly.Ticks - (timeOnly.Ticks % unit)),
+        _ => value,
+    };
+
+    /// <summary>
+    /// The text of the <see cref="ArgumentException"/> SqlClient raises, before
+    /// sending, for a decimal parameter whose value does not fit its precision
+    /// and scale, or null when every parameter fits. The message quotes the
+    /// value rounded to its scale.
+    /// </summary>
+    private static string? DecimalParameterOutOfRange(SimulatedDbParameterCollection parameters)
+    {
+        for (var i = 0; i < parameters.Count; i++)
+        {
+            var parameter = parameters[i];
+            if (parameter.Value is null or DBNull or SqlValue)
+                continue;
+            DbType dbType;
+            try
+            {
+                dbType = parameter.DbType;
+            }
+            catch (ArgumentException)
+            {
+                continue;
+            }
+            if (dbType != DbType.Decimal)
+                continue;
+            var resolved = ResolveDecimal(parameter);
+            if (!resolved.Fits)
+                return string.Create(CultureInfo.InvariantCulture, $"Parameter value '{resolved.Rounded.ToString("F" + resolved.Scale.ToString(CultureInfo.InvariantCulture), CultureInfo.InvariantCulture)}' is out of range.");
+        }
+        return null;
+    }
+
+    /// <summary>
     /// <paramref name="command"/>'s parameters as the plan-cache key and the
     /// cached-plan declaration read them: the command's memo when every
     /// parameter still matches it, else a fresh snapshot, which replaces the
@@ -166,10 +383,14 @@ partial class Simulation
             {
                 return null;
             }
+            var precision = p.Precision;
+            var scale = p.Scale;
+            if (dbType is DbType.Decimal)
+                EffectiveDecimal(p, out precision, out scale);
             if (matches)
             {
                 ref readonly var known = ref entries[i];
-                if (known.DbType == dbType && known.Size == p.Size && known.Precision == p.Precision && known.Scale == p.Scale
+                if (known.DbType == dbType && known.Size == p.Size && known.Precision == precision && known.Scale == scale
                     && known.Direction == p.Direction && string.Equals(known.Name, p.ParameterName, StringComparison.Ordinal))
                 {
                     continue;
@@ -178,7 +399,7 @@ partial class Simulation
                 entries = new ParameterShapeEntry[count];
                 Array.Copy(memo!.Entries, entries, i);
             }
-            entries[i] = new ParameterShapeEntry(p.ParameterName, dbType, p.Size, p.Precision, p.Scale, p.Direction);
+            entries[i] = new ParameterShapeEntry(p.ParameterName, dbType, p.Size, precision, scale, p.Direction);
         }
         return matches ? memo : command.ParameterShape = new CommandParameterShape(entries);
     }

@@ -408,6 +408,11 @@ internal sealed partial class TdsSession
         }
 
         parameter.DbType = wire.DbType;
+        if (wire.DbType is DbType.Decimal or DbType.DateTime2 or DbType.Time or DbType.DateTimeOffset)
+        {
+            parameter.Precision = wire.Precision;
+            parameter.Scale = wire.Scale;
+        }
         // A parameter left to its default carries C# null, which the engine
         // reads as not supplied, as SqlClient's own null Value means.
         parameter.Value = wire.IsDefault ? null : wire.Value ?? DBNull.Value;

@@ -55,15 +55,18 @@ public class EFCoreDateTime
     }
 
     [TestMethod]
-    public void Insert_LowerPrecisionColumn_RoundsHalfUp()
+    public void Insert_LowerPrecisionColumn_TruncatesToTheParameterScale()
     {
-        // Updated is datetime2(3); 0.5ms above ms boundary rounds to next ms.
+        // Updated is datetime2(3), so EF Core sets the parameter's Scale to 3,
+        // and SqlClient truncates the value to it before sending: 0.5 ms above
+        // the boundary stores .100, not .101. Through vanilla UseSqlServer over
+        // the TDS listener it stores .100 too (Insert_ScaledDateTime_StoresAsOverTheWire).
         using var context = new TestDbContext(TestDbContext.CreateEventsSimulation());
         var updated = new DateTime(2026, 5, 4, 13, 45, 30, 100).AddTicks(5_000);
         _ = context.Events.Add(new Event { Id = 1, CreatedAt = new DateTime(2026, 5, 4), Updated = updated });
         _ = context.SaveChanges();
 
-        Assert.AreEqual(new DateTime(2026, 5, 4, 13, 45, 30, 101), context.Events.Select(e => e.Updated).First());
+        Assert.AreEqual(new DateTime(2026, 5, 4, 13, 45, 30, 100), context.Events.Select(e => e.Updated).First());
     }
 
     [TestMethod]
@@ -131,15 +134,16 @@ public class EFCoreDateTime
     }
 
     [TestMethod]
-    public void Insert_DateTimeOffset_LowerPrecisionColumn_RoundsHalfUp()
+    public void Insert_DateTimeOffset_LowerPrecisionColumn_TruncatesToTheParameterScale()
     {
-        // Cancelled is datetimeoffset(3); 0.5ms above ms boundary rounds to next ms.
+        // Cancelled is datetimeoffset(3): the parameter's Scale is 3 and
+        // SqlClient truncates to it, as for datetime2(3) above.
         using var context = new TestDbContext(TestDbContext.CreateEventsSimulation());
         var cancelled = new DateTimeOffset(2026, 5, 4, 13, 45, 30, 100, TimeSpan.FromHours(-7)).AddTicks(5_000);
         _ = context.Events.Add(new Event { Id = 1, CreatedAt = new DateTime(2026, 5, 4), OccurredAt = DateTimeOffset.UnixEpoch, Cancelled = cancelled });
         _ = context.SaveChanges();
 
-        var expected = new DateTimeOffset(2026, 5, 4, 13, 45, 30, 101, TimeSpan.FromHours(-7));
+        var expected = new DateTimeOffset(2026, 5, 4, 13, 45, 30, 100, TimeSpan.FromHours(-7));
         Assert.AreEqual(expected, context.Events.Select(e => e.Cancelled).First());
     }
 

@@ -2329,9 +2329,21 @@ internal sealed partial class BatchContext
             var maxDeclared = parameter.Size == SqlType.MaxLengthSentinel ? AsMaxVariant(dbType) : null;
             if (maxDeclared is not null)
                 dbType = maxDeclared;
-            var seed = parameter.Value is null or DBNull
-                ? SqlValue.Null(dbType)
-                : dbType.ConvertParameter(parameter.Value);
+            // A decimal or temporal parameter binds as SqlClient declares it: a decimal
+            // at the set precision and scale, else the value's own, rounded to them,
+            // a temporal at the set scale, its value cut to it.
+            SqlValue seed;
+            if (Simulation.TryBindPrecisionScale(parameter, out var decimalType, out var decimalSeed))
+            {
+                dbType = decimalType;
+                seed = decimalSeed;
+            }
+            else
+            {
+                seed = parameter.Value is null or DBNull
+                    ? SqlValue.Null(dbType)
+                    : dbType.ConvertParameter(parameter.Value);
+            }
             // For decimal / numeric parameters, ConvertParameter widens the
             // declared type to fit the value's natural scale (e.g. caller sends
             // 123.45m without an explicit scale → widens to decimal(28, 2)).
