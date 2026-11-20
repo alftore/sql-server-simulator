@@ -444,6 +444,10 @@ A loop stepping through a table by `SELECT @x = MIN(id) FROM t WHERE id > @x` ov
 
 A single-table `UPDATE t SET … WHERE …` / `DELETE FROM t WHERE …` narrows its target scan through the same seek cache rather than walking the whole heap.
 `Selection.SeekMutationTarget(table, where, batch)` builds a minimal single-source view of the base table, runs the **equality** (longest-prefix, IN-list / OR-family, composite), **cross-column `OR`** (the [union of seeks](#union-of-seeks-a-cross-column-or), in the same order the query path tries it) and **single-column range** analysis the `SELECT` path uses, and returns the seek-narrowed `(page, slot, bytes)` candidates — or `null` when the WHERE carries nothing seekable, so the caller keeps its `Heap.EnumerateRowsWithAddress()` full scan.
+The view's `FromSource` (`BuildBaseTableSeekSource`) is memoized on the statement (`StatementContext.SeekSource`, one entry keyed by table and qualifier): a write asks for it at its plan start, lock fence, seek and wait mode, and a `MERGE` once per source row.
+Per statement and not per table on purpose: `sp_rename … 'COLUMN'` rewrites `HeapColumn.Name` in place, so a source memoized on the table, or shared across sessions, keeps stale copied names and a keyed write binds the wrong column (the research prototype returned 0 rows each from `UPDATE … WHERE c0 = 10` and `DELETE t WHERE c0 = 20` after two names were swapped).
+The shared source is read-only; a Debug build rebuilds it on a power-of-two count of hits and throws if the copy differs or a field that should be at its default was written (`AuditSeekSource`).
+`MutationSeekSourceTests` pins the rename, rollback, table-rename, add / drop column and truncate shapes.
 The candidate cores (`TryComputeEqualityCandidates` / `TryComputeRangeCandidates`) are factored out of the query path's `TrySeekByLongestPrefix` / `TrySeekByRange`, which wrap them with the read-path lock / snapshot materializer; the mutation path wraps the same cores with `MaterializeMutationCandidates` (dedup + tombstone-skip, yielding heap addresses to rewrite).
 
 Two properties make this a pure narrowing with no fidelity cost:

@@ -773,6 +773,28 @@ internal sealed class StatementContext
     /// <summary>The indexes the statement's last write maintains, settled once for its rows; null before its first write.</summary>
     public Storage.IndexWritePlan? IndexWrites;
 
+    /// <summary>
+    /// The seek source this statement's last <c>Selection.BuildBaseTableSeekSource</c>
+    /// built, with the table and qualifier it was built for: a single-table write
+    /// asks for it once per decision (plan start, lock fence, seek, wait mode),
+    /// and a <c>MERGE</c> once per source row. One entry, not a map, so the memo
+    /// itself allocates nothing. Cleared with the statement's other per-run state,
+    /// so no write to the table's shape (an in-place column rename) can reach a
+    /// later statement's source; the source is only ever read.
+    /// </summary>
+    public FromSource? SeekSource;
+
+    /// <summary>The table <see cref="SeekSource"/> was built over.</summary>
+    public Storage.HeapTable? SeekSourceTable;
+
+    /// <summary>The qualifier <see cref="SeekSource"/> was built under.</summary>
+    public string? SeekSourceQualifier;
+
+#if DEBUG
+    /// <summary>Hits of the seek-source memo over the process, so the audit recomputes on a power-of-two count whatever the statement.</summary>
+    public static long SeekSourceHits;
+#endif
+
     /// <summary>Whether the statement is an <c>INSERT … VALUES</c>, whose rows reach an empty table's pages as real's insert of a row set does rather than its bulk path (<see cref="Storage.InsertGroup"/>).</summary>
     public bool InsertsTuples;
 
@@ -814,6 +836,9 @@ internal sealed class StatementContext
         this.RemoteWriteAlias = null;
         this.CountedIndexUses = null;
         this.IndexWrites = null;
+        this.SeekSource = null;
+        this.SeekSourceTable = null;
+        this.SeekSourceQualifier = null;
         this.InsertsTuples = false;
     }
 }

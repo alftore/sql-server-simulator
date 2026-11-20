@@ -811,7 +811,7 @@ partial class Simulation
         var readsNoRow = context.Batch.IsSkipping || DmlTopIsZero(top, context.Batch);
         if (readsNoRow)
             rowSource = [];
-        else if (positionedCursor is null && Selection.MutationPlanStarts(table, where))
+        else if (positionedCursor is null && Selection.MutationPlanStarts(table, where, context.Batch))
             RunUpdateStartupConstants(context, table, where is null ? [] : [where], assignments);
         var viewRows = MaterializeRowSelectiveViewRows(context, sourceView, positionedCursor is not null);
         // A write wholly through a seek of the clustered key waits in X, as
@@ -820,8 +820,8 @@ partial class Simulation
         // shared reader is waited out by the X the row is then written under.
         var contended = positionedCursor is null && sourceView is null && where is not null && !readsNoRow
             && (Volatile.Read(ref table.ActiveDataWriters) != 0 || Volatile.Read(ref table.ActiveUpdateLocks) != 0 || !table.SupersededKeyImages.IsEmptyLockFree());
-        var targetWait = contended && Selection.WhereIsClusteredKeySeek(table, where!) ? LockMode.Exclusive : LockMode.Update;
-        var throughIndex = contended && targetWait == LockMode.Update ? Selection.MutationSeekIndex(table, where!) : null;
+        var targetWait = contended && Selection.WhereIsClusteredKeySeek(table, where!, context.Batch) ? LockMode.Exclusive : LockMode.Update;
+        var throughIndex = contended && targetWait == LockMode.Update ? Selection.MutationSeekIndex(table, where!, context.Batch) : null;
         int[] setOrdinals = [.. SetColumnOrdinals(assignments)];
         // A statement whose client reads its OUTPUT rows as they come writes
         // each as it sends it, in the order real's plan for its shape does.
