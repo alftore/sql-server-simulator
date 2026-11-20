@@ -221,6 +221,14 @@ internal sealed class StatementPlanSet
 {
     private readonly ConcurrentDictionary<int, StatementPlanEntry> entries = new(concurrencyLevel: 1, capacity: 4);
 
+    /// <summary>
+    /// The <c>sys.dm_exec_cached_plans</c> plan the batch of this set's text
+    /// last recorded under, which spares the next run of it the lookup and the
+    /// declaration its key needs (<see cref="BatchContext.CachedPlanMemo"/>),
+    /// as a replayed <c>SELECT</c>'s plan-cache entry does.
+    /// </summary>
+    public readonly System.Runtime.CompilerServices.StrongBox<CachedPlan?> DmvPlan = new();
+
     /// <summary>The plan cached for the statement starting at token ordinal <paramref name="start"/>, if any.</summary>
     public StatementPlanEntry? Find(int start) => this.entries.TryGetValue(start, out var entry) ? entry : null;
 
