@@ -808,6 +808,44 @@ internal abstract partial class Collation : IComparer<string>, IEqualityComparer
                 hash.Add(this.compareInfo.GetHashCode(obj.AsSpan()[range], this.equalityOptions));
             return hash.ToHashCode();
         }
+
+        // A pair holding no NUL (under a name that weighs it) and no character
+        // needing special weighing is the plain path of Compare / Equals /
+        // GetHashCode, so the trailing spaces are cut off as spans and
+        // CompareInfo reads them; any other pair takes the trimming base. An
+        // East Asian family's primary table re-orders a non-zero ICU result,
+        // so ComparePadded leaves a pair that table reaches to the base too.
+        private bool ComparesDirectly(ReadOnlySpan<char> x, ReadOnlySpan<char> y) =>
+            (!this.weightsNul || (!x.Contains('\0') && !y.Contains('\0')))
+            && !this.Weightless.IsSpecial(x) && !this.Weightless.IsSpecial(y);
+
+        internal override int ComparePadded(string x, string y)
+        {
+            var xs = x.AsSpan().TrimEnd(' ');
+            var ys = y.AsSpan().TrimEnd(' ');
+            return this.ComparesDirectly(xs, ys) && (this.primaryFamily is null || !(CjkPrimaryOrder.Reaches(xs) || CjkPrimaryOrder.Reaches(ys)))
+                ? this.compareInfo.Compare(xs, ys, this.equalityOptions)
+                : base.ComparePadded(x, y);
+        }
+
+        internal override bool EqualsPadded(string x, string y)
+        {
+            var xs = x.AsSpan().TrimEnd(' ');
+            var ys = y.AsSpan().TrimEnd(' ');
+            if (xs.SequenceEqual(ys))
+                return true;
+            return this.ComparesDirectly(xs, ys)
+                ? this.compareInfo.Compare(xs, ys, this.equalityOptions) == 0
+                : base.EqualsPadded(x, y);
+        }
+
+        internal override int GetPaddedHashCode(string s)
+        {
+            var trimmed = s.AsSpan().TrimEnd(' ');
+            return !this.Weightless.HasDropped(trimmed) && (!this.weightsNul || !trimmed.Contains('\0'))
+                ? this.compareInfo.GetHashCode(trimmed, this.equalityOptions)
+                : base.GetPaddedHashCode(s);
+        }
     }
 
     /// <summary>

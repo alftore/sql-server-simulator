@@ -73,4 +73,27 @@ public class CollationPaddingTests
         AreEqual(7, selfJoin);
         AreEqual(order, ordered);
     }
+
+    /// <summary>
+    /// Windows names weigh a trailing space away the same way: <c>'a'</c>,
+    /// <c>'a  '</c> and <c>'A'</c> are one group, <c>'b'</c> another. The
+    /// control row is left out, since how these names weigh it is unprobed.
+    /// </summary>
+    [TestMethod]
+    [DataRow("char", "French_CI_AS")]
+    [DataRow("varchar", "French_CI_AS")]
+    [DataRow("nchar", "French_CI_AS")]
+    [DataRow("nvarchar", "French_CI_AS")]
+    [DataRow("char", "Japanese_CI_AS")]
+    [DataRow("varchar", "Japanese_CI_AS")]
+    [DataRow("nchar", "Japanese_CI_AS")]
+    [DataRow("nvarchar", "Japanese_CI_AS")]
+    public void WindowsCollation_TrailingSpacesPad(string type, string collation)
+    {
+        var (distinct, groups, selfJoin, ordered) = Probe(type, collation, "(1,'a'),(2,'a  '),(3,'b'),(5,'A')");
+        AreEqual(2, distinct);
+        AreEqual(2, groups);
+        AreEqual(10, selfJoin);
+        AreEqual("1253", ordered);
+    }
 }
