@@ -171,6 +171,27 @@ public sealed class PlanCacheDmvTests
         CollectionAssert.AreEqual(new[] { ("Prepared", 2) }, Plans(sim, text));
         AreEqual(2L, Statements(sim, text)[0].Executions);
     }
+    // The declaration a decimal parameter's plan is cached under is the one
+    // SqlClient sends: a set precision and scale make one plan whatever the
+    // value, an unset pair follows the value, so two widths are two plans.
+    [TestMethod]
+    public void DecimalParameter_IsCachedUnderItsEffectiveDeclaration()
+    {
+        var sim = WithTable();
+        _ = sim.ExecuteNonQuery("create table d (x decimal(18, 2))");
+        using var connection = sim.CreateOpenConnection();
+        foreach (var (precision, scale, value) in new (byte, byte, decimal)[] { (18, 2, 1.5m), (18, 2, 2.5m), (0, 0, 1.5m), (0, 0, 50000.00m), (0, 0, 2.5m) })
+        {
+            using var command = connection.CreateCommand("insert d values (@d)");
+            _ = command.Parameters.Add(new SimulatedDbParameter { ParameterName = "@d", DbType = DbType.Decimal, Precision = precision, Scale = scale, Value = value });
+            _ = command.ExecuteNonQuery();
+        }
+
+        CollectionAssert.AreEqual(new[] { ("Prepared", 2) }, Plans(sim, "(@d decimal(18,2))insert d values (@d)"));
+        CollectionAssert.AreEqual(new[] { ("Prepared", 2) }, Plans(sim, "(@d decimal(2,1))insert d values (@d)"));
+        CollectionAssert.AreEqual(new[] { ("Prepared", 1) }, Plans(sim, "(@d decimal(7,2))insert d values (@d)"));
+    }
+
 
     /// <summary>The state a command's parameters are in for each execution of <see cref="RunShapeSequence"/>.</summary>
     private static readonly (string Text, (string Name, DbType? Type, int Size, ParameterDirection Direction, object? Value)[] Parameters)[] ShapeSequence =

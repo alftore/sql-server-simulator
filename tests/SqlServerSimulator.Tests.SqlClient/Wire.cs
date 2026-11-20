@@ -159,6 +159,8 @@ internal static class Wire
             parameter.Value = probe.Value;
             if (probe.Size != 0)
                 parameter.Size = probe.Size;
+            parameter.Precision = probe.Precision;
+            parameter.Scale = probe.Scale;
             _ = command.Parameters.Add(parameter);
             oracle = command.ExecuteScalar();
         }
@@ -187,6 +189,21 @@ internal static class Wire
         ParameterDirection direction,
         object? outputSeed,
         params (string Name, DbType Type, object Value)[] inputs)
+        => OutputInProc(simulation, sql, outputName, outputType, 0, 0, direction, outputSeed, inputs);
+
+    /// <summary>
+    /// <see cref="OutputInProc(Simulation, string, string, DbType, ParameterDirection, object, ValueTuple{string, DbType, object}[])"/> for an output parameter with its Precision and Scale set, as SqlClient's own is.
+    /// </summary>
+    public static object? OutputInProc(
+        Simulation simulation,
+        string sql,
+        string outputName,
+        DbType outputType,
+        byte outputPrecision,
+        byte outputScale,
+        ParameterDirection direction,
+        object? outputSeed,
+        params (string Name, DbType Type, object Value)[] inputs)
     {
         using var connection = simulation.CreateDbConnection();
         connection.Open();
@@ -205,6 +222,8 @@ internal static class Wire
         output.ParameterName = outputName;
         output.DbType = outputType;
         output.Direction = direction;
+        output.Precision = outputPrecision;
+        output.Scale = outputScale;
         output.Value = outputSeed ?? DBNull.Value;
         _ = command.Parameters.Add(output);
         _ = command.ExecuteNonQuery();

@@ -125,6 +125,37 @@ public sealed class PlanCacheTests
         Contains(delta => delta.Hits > 0, fresh);
     }
 
+    // A decimal parameter with no precision or scale set is declared at its
+    // value's own, as SqlClient does, so a wider value is a plan of its own; a
+    // set pair is one declaration whatever the value.
+    [TestMethod]
+    [DataRow(0, 0, "miss,hit,miss")]
+    [DataRow(18, 2, "miss,hit,hit")]
+    public void DecimalParameter_KeysThePlanOnItsEffectiveDeclaration(int precision, int scale, string expected)
+    {
+        var (sim, connection) = OpenWithTable();
+        var outcomes = new List<string>();
+        using (connection)
+        {
+            foreach (var value in new[] { 1.5m, 2.5m, 50000.00m })
+            {
+                using var command = connection.CreateCommand();
+                command.CommandText = "select val from t where id = @d";
+                var parameter = command.CreateParameter();
+                parameter.ParameterName = "@d";
+                parameter.DbType = System.Data.DbType.Decimal;
+                parameter.Precision = (byte)precision;
+                parameter.Scale = (byte)scale;
+                parameter.Value = value;
+                _ = command.Parameters.Add(parameter);
+                var hits = sim.PlanCacheHits;
+                _ = command.ExecuteScalar();
+                outcomes.Add(sim.PlanCacheHits > hits ? "hit" : "miss");
+            }
+        }
+        AreEqual(expected, string.Join(',', outcomes));
+    }
+
     [TestMethod]
     public void RepeatedQuery_SecondCallHits()
     {

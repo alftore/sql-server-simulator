@@ -170,6 +170,8 @@ public partial class QualityTests
                 nameof(SimulatedDbParameter.IsNullable),
                 nameof(SimulatedDbParameter.ParameterName),
                 nameof(SimulatedDbParameter.Size),
+                nameof(SimulatedDbParameter.Precision),
+                nameof(SimulatedDbParameter.Scale),
                 nameof(SimulatedDbParameter.SourceColumn),
                 nameof(SimulatedDbParameter.SourceColumnNullMapping),
                 nameof(SimulatedDbParameter.Value),

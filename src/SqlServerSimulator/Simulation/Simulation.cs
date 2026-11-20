@@ -1831,6 +1831,11 @@ public sealed partial class Simulation
             requestConnection.TwoDigitYearCutoffThisRequest = this.TwoDigitYearCutoffInUse;
         }
 
+        // A decimal parameter whose value does not fit its declared precision and
+        // scale is refused as SqlClient refuses it, before anything is sent.
+        if (command.Parameters.Count != 0 && DecimalParameterOutOfRange(command.Parameters) is { } outOfRange)
+            throw new ArgumentException(outOfRange);
+
         // CommandType.StoredProcedure: CommandText is the procedure name and
         // Parameters maps by name to the proc's declared parameters. Bypass
         // the SQL-text parser and route directly to InvokeProcedure with the
@@ -2269,13 +2274,19 @@ public sealed partial class Simulation
             else
             {
                 dbType = SqlType.GetByDbType(parameter.DbType);
+                SqlValue? decimalValue = null;
+                if (parameter.DbType is DbType.Decimal && TryBindDecimal(parameter, out var decimalType, out var bound))
+                {
+                    dbType = decimalType;
+                    decimalValue = bound;
+                }
                 // Size = -1 is SqlClient's MAX-typed declaration; without the
                 // promotion the slot's declared type is the bounded variant,
                 // which (among other things) exempts it from the TEXTSIZE
                 // output-parameter clip keyed off MAX-declared types.
                 if (parameter.Size == SqlType.MaxLengthSentinel && BatchContext.AsMaxVariant(dbType) is { } maxVariant)
                     dbType = maxVariant;
-                value = parameter.Value is null or DBNull ? SqlValue.Null(dbType) : dbType.ConvertParameter(parameter.Value);
+                value = decimalValue ?? (parameter.Value is null or DBNull ? SqlValue.Null(dbType) : dbType.ConvertParameter(parameter.Value));
             }
 
             // For OUTPUT-direction parameters we need a live VariableSlot in
