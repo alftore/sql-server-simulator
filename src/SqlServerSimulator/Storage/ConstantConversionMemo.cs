@@ -43,13 +43,15 @@ internal sealed class ConstantConversionMemo
     private Entry? leftEntry, rightEntry;
 
 #if DEBUG
-    private int leftHits, rightHits;
+    // Process-wide, not per node: a counter on a node would be execution state
+    // on a cached plan, which the shared-plan contract keeps off it.
+    private static int leftHits, rightHits;
 #endif
 
     /// <summary>Converts the left operand of the comparison.</summary>
     public SqlValue CoerceLeft(SqlValue value, SqlType target) =>
 #if DEBUG
-        Coerce(ref this.leftEntry, ref this.leftHits, value, target);
+        Coerce(ref this.leftEntry, ref leftHits, value, target);
 #else
         Coerce(ref this.leftEntry, value, target);
 #endif
@@ -57,7 +59,7 @@ internal sealed class ConstantConversionMemo
     /// <summary>Converts the right operand of the comparison.</summary>
     public SqlValue CoerceRight(SqlValue value, SqlType target) =>
 #if DEBUG
-        Coerce(ref this.rightEntry, ref this.rightHits, value, target);
+        Coerce(ref this.rightEntry, ref rightHits, value, target);
 #else
         Coerce(ref this.rightEntry, value, target);
 #endif
