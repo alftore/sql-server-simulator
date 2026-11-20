@@ -92,14 +92,22 @@ internal sealed class ParseFunction : Expression
         // so it reads as Windows synthesizes it without asking.
         if (name.Length > 1 && name[1] is '-' or '_')
             return FormatCulture.Resolve(name).Culture;
+        // A name the runtime doesn't ship either fails the lookup or comes back
+        // as a culture the runtime made up, flagged UserCustomCulture; on
+        // Windows over ICU the made-up one carries the host user's own number
+        // and date formats (`xx-YY` parsed `12.5` with a comma decimal under an
+        // nb-NO user, seen 2026-11-20), so both read as Windows synthesizes the
+        // name instead, whatever machine the simulation runs on.
+        CultureInfo shipped;
         try
         {
-            return CultureInfo.GetCultureInfo(name.Replace('_', '-'));
+            shipped = CultureInfo.GetCultureInfo(name.Replace('_', '-'));
         }
         catch (CultureNotFoundException)
         {
             return FormatCulture.Resolve(name).Culture;
         }
+        return (shipped.CultureTypes & CultureTypes.UserCustomCulture) != 0 ? FormatCulture.Resolve(name).Culture : shipped;
     }
 
     public override SqlType GetSqlType(BatchContext batch, Func<MultiPartName, SqlType> resolveColumnType) => this.targetType;
