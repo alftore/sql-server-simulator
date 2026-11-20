@@ -376,7 +376,7 @@ internal sealed class HeapSeekCache
             if (entry.Generation != heap.MutationGeneration)
             {
                 var events = heap.SnapshotSeekJournalSince(entry.Generation, out var currentGen);
-                if (events is not null)
+                if (events is not null && entry.CanReplay(events, schema))
                 {
                     if (traced)
                         IndexSeekDiagnostics.Sink?.Add("CacheReplay");
@@ -766,12 +766,38 @@ internal sealed class HeapSeekCache
             return group.Rids = rids;
         }
 
+        // Whether Apply can take these events: not when a Delete or an
+        // Update's old image stores a key column off-row. That image's chain
+        // is given up once the write commits and may hold another row's value
+        // by the time the event replays, so its key would be decoded wrong and
+        // the address left in the bucket of the key it really had, beside the
+        // one it moves to — an ordered walk then lists it twice. The entry
+        // rebuilds from a scan instead.
+        public bool CanReplay(Heap.SeekJournalEvent[] events, HeapColumn[] schema)
+        {
+            var variableKey = false;
+            foreach (var ordinal in this.Ordinals)
+                variableKey |= schema[ordinal].Type != SqlType.Bit && !schema[ordinal].Type.IsFixedLength;
+            if (!variableKey)
+                return true;
+            foreach (var e in events)
+            {
+                if (e.Kind is Heap.SeekJournalKind.Delete or Heap.SeekJournalKind.Update
+                    && RowDecoder.StoresOffRow(schema, e.OldImage!, this.Ordinals))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         // Applies the journal delta to this entry's buckets. Insert adds the
         // new key's address; Delete removes the old key's; Update does both.
         // A key recomputed from a superseded (Delete / Update-old) image whose
-        // off-row chain was already reclaimed may be wrong, which can only
-        // leave a stale address in a bucket — a false-positive the residual
-        // WHERE and the materializer's tombstone-skip discard. The add side
+        // off-row chain was already reclaimed may be wrong: the address then
+        // stays in the bucket of the key it had, and an Update adds it to the
+        // new one too, so an ordered walk would list it twice. CanReplay keeps
+        // such events away, and the entry rebuilds instead. The add side
         // (Insert / Update-new) decodes a live image, so it never goes wrong.
         public void Apply(Heap.SeekJournalEvent[] events, HeapColumn[] schema, Heap? lobStore, long currentGen)
         {

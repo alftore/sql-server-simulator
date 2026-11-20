@@ -290,6 +290,36 @@ internal static class RowDecoder
     }
 
     /// <summary>
+    /// Whether the row stores any of the columns <paramref name="ordinals"/>
+    /// off-row, as a <see cref="RowEncoder.VarPointerMarker"/> pointer to a
+    /// chain: a superseded image's chain can be reclaimed and reused, so a
+    /// value decoded from it later may not be the one the row held.
+    /// </summary>
+    public static bool StoresOffRow(ReadOnlySpan<HeapColumn> schema, ReadOnlySpan<byte> bytes, ReadOnlySpan<int> ordinals)
+    {
+        var header = ValidateHeader(schema, bytes);
+        var varIndex = 0;
+        var prevVarEnd = header.VarDataStart;
+        for (var i = 0; i < schema.Length; i++)
+        {
+            var type = schema[i].Type;
+            if (type == SqlType.Bit || type.IsFixedLength)
+                continue;
+
+            var end = ReadVarOffset(header, bytes, varIndex);
+            if (ordinals.Contains(i) && !IsNullColumn(bytes, header.BitmapStart, i))
+            {
+                var payload = bytes[prevVarEnd..end];
+                if (payload.Length > 0 && payload[0] == RowEncoder.VarPointerMarker)
+                    return true;
+            }
+            prevVarEnd = end;
+            varIndex++;
+        }
+        return false;
+    }
+
+    /// <summary>
     /// Whether the row holds a value real keeps in the LOB allocation unit
     /// rather than in the row: any <c>text</c>, <c>ntext</c> or <c>image</c>
     /// value, or a <c>(max)</c> or <c>xml</c> one longer than 8,000 bytes. The
