@@ -157,7 +157,8 @@ internal sealed class HeapSeekCache
     // always come back ascending — a descending caller reads them from the
     // end — and an unbounded walk is the entry's memoized key order, shared
     // with every reader until the next write, so the caller must not change
-    // it.
+    // it. A write may append to the array past the run a reader holds but never
+    // changes a slot inside it.
     public ArraySegment<(int Page, int Slot)> OrderedSeek(
         Heap heap, HeapColumn[] schema, Heap? lobStore, int[] ordinals, SqlType[] commons,
         SqlValueKey? lower, bool lowerInclusive, SqlValueKey? upper, bool upperInclusive)
@@ -589,8 +590,20 @@ internal sealed class HeapSeekCache
         // rather than walking every key to build the list again. A paged
         // ordered read — the same ORDER BY over an unchanged table, page after
         // page — likewise indexes straight to its OFFSET.
+        //
+        // An insert whose key sorts above every key the entry holds appends its
+        // address to the run rather than dropping it. The array may therefore
+        // grow past a segment a reader holds, but no slot inside any segment
+        // ever handed out is written again: keyOrderHighWater is the end of the
+        // furthest segment handed out of the current array, an append writes in
+        // place only at or past it, and otherwise copies the live run into a
+        // new array. A removal of the last address lowers keyOrderEnd below the
+        // high water, so the next append copies too.
         private (int Page, int Slot)[]? keyOrder;
-        private int keyOrderStart, keyOrderEnd;
+        private int keyOrderStart, keyOrderEnd, keyOrderHighWater;
+#if DEBUG
+        private int appendsSinceBuild;
+#endif
 
         public ArraySegment<(int Page, int Slot)> KeyOrder()
         {
@@ -598,10 +611,38 @@ internal sealed class HeapSeekCache
             {
                 IndexSeekDiagnostics.Sink?.Add("KeyOrderBuild");
                 this.keyOrder = [.. this.OrderedCandidates(null, false, null, false)];
-                (this.keyOrderStart, this.keyOrderEnd) = (0, this.keyOrder.Length);
+                (this.keyOrderStart, this.keyOrderEnd, this.keyOrderHighWater) = (0, this.keyOrder.Length, 0);
+#if DEBUG
+                this.appendsSinceBuild = 0;
+#endif
             }
+#if DEBUG
+            this.AuditAppends();
+#endif
+            this.keyOrderHighWater = Math.Max(this.keyOrderHighWater, this.keyOrderEnd);
             return new(this.keyOrder, this.keyOrderStart, this.keyOrderEnd - this.keyOrderStart);
         }
+
+#if DEBUG
+        // On a read whose count of appends since the build is a power of two,
+        // walks the keys again and raises if the live run differs, so the whole
+        // suite tests the append on every ordered read it makes after one.
+        private void AuditAppends()
+        {
+            var appends = this.appendsSinceBuild;
+            if (appends == 0 || (appends & (appends - 1)) != 0)
+                return;
+            var walked = this.OrderedCandidates(null, false, null, false);
+            var live = this.keyOrderEnd - this.keyOrderStart;
+            if (walked.Count != live)
+                throw new InvalidOperationException($"Key order of entry (ordinals {string.Join(',', this.Ordinals)}) holds {live} addresses but its walk lists {walked.Count} after {appends} appends.");
+            for (var i = 0; i < live; i++)
+            {
+                if (walked[i] != this.keyOrder![this.keyOrderStart + i])
+                    throw new InvalidOperationException($"Key order of entry (ordinals {string.Join(',', this.Ordinals)}) differs from its walk after {appends} appends at index {i}.");
+            }
+        }
+#endif
 
         // The keyed order's addresses as an array, which a slice of it reads.
         private (int Page, int Slot)[]? keyedAddresses;
@@ -741,7 +782,7 @@ internal sealed class HeapSeekCache
                     case Heap.SeekJournalKind.Insert:
                         if (TryComputeEntryKey(e.NewImage, this.Ordinals, this.Commons, schema, lobStore, out var insertKey))
                         {
-                            this.AddRid(insertKey, (e.Page, e.Slot));
+                            this.AddRid(insertKey, (e.Page, e.Slot), keepOrder: true);
                             this.NoteInsert(insertKey, (e.Page, e.Slot));
                         }
                         else
@@ -830,8 +871,9 @@ internal sealed class HeapSeekCache
         // place rather than at the end, in a fresh list so a reader still
         // enumerating the old one keeps an intact one. An address already
         // listed (a write the building scan saw, replayed) is left alone.
-        private void AddRid(SqlValueKey key, (int Page, int Slot) rid)
+        private void AddRid(SqlValueKey key, (int Page, int Slot) rid, bool keepOrder = false)
         {
+            var order = this.keyOrder;
             this.keyOrder = null;
             this.keyedOrder = null;
             this.keyedAddresses = null;
@@ -839,6 +881,29 @@ internal sealed class HeapSeekCache
             var added = false;
             if (!this.Buckets.TryGetValue(key, out var bucket))
             {
+                // A new key above every key the entry holds, from an insert,
+                // goes at the end of the memoized order.
+                if (keepOrder && order is not null && this.sortedKeys is { } sortedNow
+                    && (sortedNow.Count == 0 || KeyTupleComparer.Instance.Compare(key, sortedNow.Max) > 0))
+                {
+                    if (this.keyOrderEnd >= this.keyOrderHighWater && this.keyOrderEnd < order.Length)
+                    {
+                        order[this.keyOrderEnd] = rid;
+                    }
+                    else
+                    {
+                        var live = this.keyOrderEnd - this.keyOrderStart;
+                        var grown = new (int Page, int Slot)[Math.Max(16, (live + 1) * 2)];
+                        Array.Copy(order, this.keyOrderStart, grown, 0, live);
+                        grown[live] = rid;
+                        (order, this.keyOrderStart, this.keyOrderEnd, this.keyOrderHighWater) = (grown, 0, live, 0);
+                    }
+                    this.keyOrderEnd++;
+                    this.keyOrder = order;
+#if DEBUG
+                    this.appendsSinceBuild++;
+#endif
+                }
                 this.Buckets[key] = bucket = [];
                 _ = this.sortedKeys?.Add(key);
                 added = true;
