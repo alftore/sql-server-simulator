@@ -2443,9 +2443,18 @@ internal sealed partial class Selection
         var reader = batch.Connection.LockOwner;
         var addresses = batch.CurrentStatement.RowAddresses;
         var ownWrites = new BatchContext.OwnWriteView(batch, table);
+#if DEBUG
+        // The order lists each address once (HeapSeekCache keeps an address
+        // in one bucket), so the walk keeps no set; Debug checks it.
+        var walked = new HashSet<(int, int)>();
+#endif
         for (var i = 0; i < order.Count; i++)
         {
             var (page, slot) = order[descending ? order.Count - 1 - i : i];
+#if DEBUG
+            if (!walked.Add((page, slot)))
+                throw new InvalidOperationException($"Snapshot ordered scan of {table.Name} lists ({page}, {slot}) twice");
+#endif
             _ = table.Heap.TryReadSlot(page, slot, out var current, out var sequence);
             if ((ownWrites.TryRead(batch, table, (page, slot), out var found) ? found : Storage.VersionStore.ReadSnapshotSlot(table, (page, slot), current, sequence, snapshotXid, reader)) is not { } bytes)
                 continue;
