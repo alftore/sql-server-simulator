@@ -408,7 +408,7 @@ public sealed partial class Simulation
     /// </remarks>
     private static IEnumerable<SimulatedStatementOutcome> ReplayCachedSelections(SimulatedDbCommand command, PlanCacheEntry entry, System.Runtime.CompilerServices.StrongBox<bool> stale)
     {
-        var batch = new BatchContext(command)
+        var batch = new BatchContext(command, deferParser: true)
         {
             CachedPlanOrigin = CachedPlanOrigin.ClientBatch,
             CachedPlanDatabase = command.Connection?.CurrentDatabase,

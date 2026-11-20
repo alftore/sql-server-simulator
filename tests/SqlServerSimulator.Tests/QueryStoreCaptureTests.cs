@@ -1,3 +1,4 @@
+using System.Data.Common;
 using System.Security.Cryptography;
 using System.Text;
 using static Microsoft.VisualStudio.TestTools.UnitTesting.Assert;
@@ -405,6 +406,90 @@ public sealed class QueryStoreCaptureTests
         IsTrue(reader.Read());
         CollectionAssert.AreEqual(new byte[] { 0, 0, 0x10, 0xFB }, (byte[])reader.GetValue(0));
         AreEqual((short)2, reader.GetInt16(1));
+    }
+
+    private const string TwoSelects = "select count(*) from t; select max(b) from t";
+
+    /// <summary>What the store and the plan cache hold about <see cref="TwoSelects"/> after warming it, running it as <paramref name="run"/> says and running it once more.</summary>
+    private static List<string> RecordsAfter(Action<DbCommand> run)
+    {
+        var sim = CapturingAll();
+        using var connection = sim.CreateOpenConnection();
+        // The first run parses and caches the batch; the later ones replay it.
+        for (var i = 0; i < 2; i++)
+            run(connection.CreateCommand(TwoSelects));
+        run(connection.CreateCommand(TwoSelects));
+        var records = new List<string>();
+        using var reader = sim.ExecuteReader("""
+            select qt.query_sql_text, q.query_parameterization_type, c.set_options, rs.count_executions, p.query_id
+            from sys.query_store_query q
+            join sys.query_store_query_text qt on qt.query_text_id = q.query_text_id
+            join sys.query_context_settings c on c.context_settings_id = q.context_settings_id
+            left join sys.query_store_plan p on p.query_id = q.query_id
+            left join sys.query_store_runtime_stats rs on rs.plan_id = p.plan_id
+            order by qt.query_sql_text, c.set_options
+            """);
+        while (reader.Read())
+            records.Add($"{reader.GetString(0)}|{reader.GetValue(1)}|{Convert.ToHexString((byte[])reader.GetValue(2))}|{reader.GetValue(3)}");
+        using var plans = sim.ExecuteReader("select st.text, cp.usecounts from sys.dm_exec_cached_plans cp cross apply sys.dm_exec_sql_text(cp.plan_handle) st where st.text like 'select count(*) from t; select max(b) from t' order by st.text");
+        while (plans.Read())
+            records.Add($"plan|{plans.GetString(0)}|{plans.GetValue(1)}");
+        return records;
+    }
+
+    // The replay builds no parser, so it can create one only after the caller
+    // changed the command; it must still read the text the batch began with.
+    [TestMethod]
+    public void ReplayedBatch_RecordsItsOwnTextWhenTheCommandTextChangesMidRead()
+    {
+        var control = RecordsAfter(command => { using var reader = command.ExecuteReader(); do { while (reader.Read()) { } } while (reader.NextResult()); });
+        var changed = RecordsAfter(command =>
+        {
+            using var reader = command.ExecuteReader();
+            while (reader.Read()) { }
+            command.CommandText = "select 'changed mid-read' as altered";
+            IsTrue(reader.NextResult());
+            while (reader.Read()) { }
+        });
+        IsGreaterThan(0, control.Count(record => record.Contains("select max(b) from t", StringComparison.Ordinal)), string.Join(Environment.NewLine, control));
+        CollectionAssert.AreEqual(control, changed, string.Join(Environment.NewLine, changed));
+    }
+
+    // A replay takes QUOTED_IDENTIFIER from the session as the batch starts, so
+    // the same text under each setting is two entries, each filed under its own.
+    [TestMethod]
+    public void ReplayedSelect_FilesUnderTheQuotedIdentifierSettingItRanUnder()
+    {
+        var sim = CapturingAll();
+        using var connection = sim.CreateOpenConnection();
+        void Run(string setting)
+        {
+            using (var set = connection.CreateCommand($"set quoted_identifier {setting}"))
+                _ = set.ExecuteNonQuery();
+            for (var i = 0; i < 3; i++)
+            {
+                using var command = connection.CreateCommand("select count(*) from t");
+                AreEqual(2, command.ExecuteScalar());
+            }
+        }
+        Run("off");
+        Run("on");
+        Run("off");
+        var options = new List<string>();
+        using var reader = sim.ExecuteReader("""
+            select c.set_options, isnull(sum(rs.count_executions), 0)
+            from sys.query_store_query q
+            join sys.query_store_query_text qt on qt.query_text_id = q.query_text_id
+            join sys.query_context_settings c on c.context_settings_id = q.context_settings_id
+            left join sys.query_store_plan p on p.query_id = q.query_id
+            left join sys.query_store_runtime_stats rs on rs.plan_id = p.plan_id
+            where qt.query_sql_text like 'select count(*) from t'
+            group by c.set_options order by c.set_options
+            """);
+        while (reader.Read())
+            options.Add($"{Convert.ToHexString((byte[])reader.GetValue(0))}:{reader.GetValue(1)}");
+        AreEqual("000000BB:6 000000FB:3", string.Join(" ", options));
+        AreEqual(2, sim.ExecuteScalar("select count(*) from sys.dm_exec_cached_plans cp cross apply sys.dm_exec_sql_text(cp.plan_handle) st where st.text = 'select count(*) from t'"));
     }
 
     [TestMethod]

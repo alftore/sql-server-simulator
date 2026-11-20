@@ -41,9 +41,7 @@ internal sealed class ParserContext(SimulatedDbCommand command, BatchContext bat
     /// </summary>
     public readonly BatchContext Batch = batch;
 
-    private readonly string commandText = string.IsNullOrEmpty(command.CommandText) ?
-        throw new InvalidOperationException("ExecuteReader: CommandText property has not been initialized") :
-        command.CommandText;
+    private readonly string commandText = batch.BatchText;
 
     /// <summary>
     /// The tokenizer position within <see cref="commandText"/>: the next
@@ -108,7 +106,7 @@ internal sealed class ParserContext(SimulatedDbCommand command, BatchContext bat
     /// option at parse time, so a SET inside a never-taken IF branch still
     /// affects everything after it in the batch (probe-confirmed).
     /// </summary>
-    public bool QuotedIdentifiers = command.Connection!.QuotedIdentifiers;
+    public bool QuotedIdentifiers = batch.QuotedIdentifiersAtStart;
 
     /// <summary>
     /// <c>QUOTED_IDENTIFIER</c> as the batch began, before any <c>SET</c> it
@@ -116,7 +114,7 @@ internal sealed class ParserContext(SimulatedDbCommand command, BatchContext bat
     /// reports for the session running it (probed 2026-10-06 against SQL
     /// Server 2025).
     /// </summary>
-    public readonly bool QuotedIdentifiersAtBatchStart = command.Connection.QuotedIdentifiers;
+    public readonly bool QuotedIdentifiersAtBatchStart = batch.QuotedIdentifiersAtStart;
 
     /// <summary>
     /// Live weighted nesting budget shared by grouped-expression parens,
@@ -244,7 +242,7 @@ internal sealed class ParserContext(SimulatedDbCommand command, BatchContext bat
     /// body a reference in such a batch parses, so no other batch's bodies
     /// carry the columns.
     /// </summary>
-    public bool GraphIdentityPassthrough = command.CommandText?.Contains("MATCH", StringComparison.OrdinalIgnoreCase) == true;
+    public bool GraphIdentityPassthrough = batch.BatchText.Contains("MATCH", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Whether the derived table or view body parsing carries, behind its own

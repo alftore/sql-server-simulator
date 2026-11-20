@@ -16,8 +16,53 @@ namespace SqlServerSimulator.Parser;
 /// </summary>
 internal sealed partial class BatchContext
 {
-    /// <summary>The parser-side cursor / scratch state for this batch.</summary>
-    public readonly ParserContext Parser;
+    private ParserContext? parser;
+
+    /// <summary>The command this batch runs.</summary>
+    public readonly SimulatedDbCommand Command;
+
+    /// <summary>
+    /// The command's text as this batch was constructed, which is what the
+    /// <see cref="ParserContext"/> parses however late it is created: a
+    /// <c>CommandText</c> set while a reader is open must not change it.
+    /// </summary>
+    public readonly string BatchText;
+
+    /// <summary>
+    /// <c>QUOTED_IDENTIFIER</c> as this batch was constructed, before the
+    /// compile walk applies a <c>SET</c> the batch holds to the session.
+    /// </summary>
+    public readonly bool QuotedIdentifiersAtStart;
+
+    /// <summary>
+    /// The parser-side cursor / scratch state for this batch. Every batch
+    /// builds it as it is constructed except a whole-batch SELECT replay's,
+    /// which creates it here on first use, and few replays ever do.
+    /// </summary>
+    public ParserContext Parser => this.parser ?? this.CreateParser();
+
+    /// <summary>
+    /// <c>QUOTED_IDENTIFIER</c> as the batch parses: the parser's live value
+    /// once it exists (a <c>SET</c> mid-batch flips it), the start value until.
+    /// </summary>
+    public bool QuotedIdentifiers => this.parser?.QuotedIdentifiers ?? this.QuotedIdentifiersAtStart;
+
+    /// <summary>
+    /// Publishes with a compare-exchange because a statement can produce on a
+    /// background thread while its reader reads; the loser's instance is
+    /// dropped before anything wrote to it.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private ParserContext CreateParser()
+    {
+        var created = new ParserContext(this.Command, this);
+        return Interlocked.CompareExchange(ref this.parser, created, null) ?? created;
+    }
+
+    private static string TextOf(SimulatedDbCommand command) =>
+        string.IsNullOrEmpty(command.CommandText) ?
+            throw new InvalidOperationException("ExecuteReader: CommandText property has not been initialized") :
+            command.CommandText;
 
     /// <summary>
     /// Heap-mutation undo log scoped to the current top-level statement. Set
@@ -1843,7 +1888,7 @@ internal sealed partial class BatchContext
     public bool FramesUnderNoExec => this.NoExecActive && this.Connection.FramesEveryStatement && !this.CompilingForRun;
 
     /// <summary>The connection executing this batch.</summary>
-    public SimulatedDbConnection Connection => this.Parser.Connection;
+    public SimulatedDbConnection Connection => this.Command.Connection!;
 
     /// <summary>
     /// <see cref="Simulation.XmlSchemaCollectionAlterations"/> as this batch
@@ -1880,7 +1925,7 @@ internal sealed partial class BatchContext
     }
 
     /// <summary>The database this batch is executing against.</summary>
-    public Database CurrentDatabase => this.Parser.CurrentDatabase;
+    public Database CurrentDatabase => this.Connection.CurrentDatabase;
 
     /// <summary>
     /// The database <paramref name="target"/> lives in — the one a write
@@ -2080,14 +2125,18 @@ internal sealed partial class BatchContext
     /// </summary>
     public void BumpRowStamp() => this.CurrentRowStamp++;
 
-    public BatchContext(SimulatedDbCommand command)
+    public BatchContext(SimulatedDbCommand command, bool deferParser = false)
     {
+        this.Command = command;
+        this.BatchText = TextOf(command);
+        this.QuotedIdentifiersAtStart = command.Connection!.QuotedIdentifiers;
         this.CallerStreams = true;
         this.StreamsResultRows = command.StreamsResultRows;
         this.DiscardsResultRows = command.DiscardsResultRows;
         this.NoExecActive = command.Connection!.NoExec || command.Connection.Showplan != ShowplanMode.None;
         this.Variables = SeedVariables(command);
-        this.Parser = new ParserContext(command, this);
+        if (!deferParser)
+            this.parser = new ParserContext(command, this);
         this.XmlSchemaAlterationsAtStart = Volatile.Read(ref this.Connection.Simulation.XmlSchemaCollectionAlterations);
         SeedTableVariablesFromStructuredParameters(this, command);
     }
@@ -2106,9 +2155,12 @@ internal sealed partial class BatchContext
     /// </summary>
     public BatchContext(SimulatedDbCommand udfBodyCommand, Dictionary<string, VariableSlot> variables, UdfFrame udfFrame)
     {
+        this.Command = udfBodyCommand;
+        this.BatchText = TextOf(udfBodyCommand);
+        this.QuotedIdentifiersAtStart = udfBodyCommand.Connection!.QuotedIdentifiers;
         this.Variables = variables;
         this.UdfFrame = udfFrame;
-        this.Parser = new ParserContext(udfBodyCommand, this);
+        this.parser = new ParserContext(udfBodyCommand, this);
         this.XmlSchemaAlterationsAtStart = Volatile.Read(ref this.Connection.Simulation.XmlSchemaCollectionAlterations);
     }
 
@@ -2124,9 +2176,12 @@ internal sealed partial class BatchContext
     /// </summary>
     public BatchContext(SimulatedDbCommand procBodyCommand, Dictionary<string, VariableSlot> variables, ProcFrame procFrame, Dictionary<string, HeapTable>? tableVariables = null)
     {
+        this.Command = procBodyCommand;
+        this.BatchText = TextOf(procBodyCommand);
+        this.QuotedIdentifiersAtStart = procBodyCommand.Connection!.QuotedIdentifiers;
         this.Variables = variables;
         this.ProcFrame = procFrame;
-        this.Parser = new ParserContext(procBodyCommand, this);
+        this.parser = new ParserContext(procBodyCommand, this);
         this.XmlSchemaAlterationsAtStart = Volatile.Read(ref this.Connection.Simulation.XmlSchemaCollectionAlterations);
         if (tableVariables is not null)
         {
@@ -2153,8 +2208,11 @@ internal sealed partial class BatchContext
     /// </summary>
     public BatchContext(SimulatedDbCommand multiStatementTvfBodyCommand, Dictionary<string, VariableSlot> variables)
     {
+        this.Command = multiStatementTvfBodyCommand;
+        this.BatchText = TextOf(multiStatementTvfBodyCommand);
+        this.QuotedIdentifiersAtStart = multiStatementTvfBodyCommand.Connection!.QuotedIdentifiers;
         this.Variables = variables;
-        this.Parser = new ParserContext(multiStatementTvfBodyCommand, this);
+        this.parser = new ParserContext(multiStatementTvfBodyCommand, this);
         this.XmlSchemaAlterationsAtStart = Volatile.Read(ref this.Connection.Simulation.XmlSchemaCollectionAlterations);
     }
 
@@ -2173,9 +2231,12 @@ internal sealed partial class BatchContext
     /// </summary>
     public BatchContext(SimulatedDbCommand triggerBodyCommand, TriggerFrame triggerFrame)
     {
+        this.Command = triggerBodyCommand;
+        this.BatchText = TextOf(triggerBodyCommand);
+        this.QuotedIdentifiersAtStart = triggerBodyCommand.Connection!.QuotedIdentifiers;
         this.Variables = new Dictionary<string, VariableSlot>(BatchContext.VariableNameComparer);
         this.TriggerFrame = triggerFrame;
-        this.Parser = new ParserContext(triggerBodyCommand, this);
+        this.parser = new ParserContext(triggerBodyCommand, this);
         this.XmlSchemaAlterationsAtStart = Volatile.Read(ref this.Connection.Simulation.XmlSchemaCollectionAlterations);
     }
 
@@ -2191,11 +2252,14 @@ internal sealed partial class BatchContext
     /// </summary>
     public BatchContext(SimulatedDbCommand contextCommand, Dictionary<string, VariableSlot> variables, TriggerFrame? triggerFrame)
     {
+        this.Command = contextCommand;
+        this.BatchText = TextOf(contextCommand);
+        this.QuotedIdentifiersAtStart = contextCommand.Connection!.QuotedIdentifiers;
         this.Variables = variables;
         this.TriggerFrame = triggerFrame;
         this.IsContextConnectionCommand = true;
         this.ForceTempTableScope = true;
-        this.Parser = new ParserContext(contextCommand, this);
+        this.parser = new ParserContext(contextCommand, this);
         this.XmlSchemaAlterationsAtStart = Volatile.Read(ref this.Connection.Simulation.XmlSchemaCollectionAlterations);
     }
 

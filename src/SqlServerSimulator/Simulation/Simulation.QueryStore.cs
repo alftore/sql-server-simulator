@@ -94,7 +94,7 @@ partial class Simulation
     private static void EndQueryStoreCapture(
         BatchContext batch, QueryStoreCapture capture, IoStatistics? io, int start, int end, byte executionType, long rowCount, ParserContext.Checkpoint? tokensFrom = null)
     {
-        var commandText = batch.Parser.Command.CommandText;
+        var commandText = batch.Command.CommandText;
         if (start < 0 || end <= start || end > commandText.Length)
             return;
         var connection = batch.Connection;
@@ -108,7 +108,7 @@ partial class Simulation
         {
             // The plan cache alone records the statement, and reads the text
             // Query Store would store for it only as the statement first runs.
-            var shape = connection.Simulation.QueryStoreShapeOf(commandText.AsSpan(start, end - start), capture.Database, batch.Parser, tokensFrom);
+            var shape = connection.Simulation.QueryStoreShapeOf(commandText.AsSpan(start, end - start), capture.Database, tokensFrom is null ? null : batch.Parser, tokensFrom);
             if (IsCapturedShape(batch, shape))
                 RecordCachedPlanStatement(batch, capture.Database, shape, storeKey: null, start, end, tokensFrom, now, elapsed / 10, cpu / 10, reads, rowCount);
             return;
@@ -172,9 +172,9 @@ partial class Simulation
     /// </summary>
     private static QueryStoreQueryKey? QueryStoreKeyOf(BatchContext batch, Database database, int start, int end, ParserContext.Checkpoint? tokensFrom, out QueryStoreShape shape, out long offsetStart, out long offsetEnd)
     {
-        var commandText = batch.Parser.Command.CommandText;
+        var commandText = batch.Command.CommandText;
         var connection = batch.Connection;
-        shape = connection.Simulation.QueryStoreShapeOf(commandText.AsSpan(start, end - start), database, batch.Parser, tokensFrom);
+        shape = connection.Simulation.QueryStoreShapeOf(commandText.AsSpan(start, end - start), database, tokensFrom is null ? null : batch.Parser, tokensFrom);
         offsetStart = offsetEnd = 0;
         if (!IsCapturedShape(batch, shape))
             return null;
@@ -209,7 +209,7 @@ partial class Simulation
                 prefix = VariablePrefix(batch, shape);
             }
             text = prefix is null ? shape.Text : shape.Declared(prefix);
-            parameterizationType = prefix is not null && (batch.ProcFrame is { IsDynamicSql: true } || (connection.NestingLevel == 0 && batch.Parser.Command.Parameters.Count > 0))
+            parameterizationType = prefix is not null && (batch.ProcFrame is { IsDynamicSql: true } || (connection.NestingLevel == 0 && batch.Command.Parameters.Count > 0))
                 ? (byte)1
                 : (byte)0;
             // A module's statements are placed in its CREATE text.
@@ -219,7 +219,7 @@ partial class Simulation
         }
 
         var context = new QueryStoreContextKey(
-            SetOptionsOf(connection, batch.Parser.QuotedIdentifiers),
+            SetOptionsOf(connection, batch.QuotedIdentifiers),
             connection.Language.LangId,
             DateFormatCode(connection.DateFormat),
             connection.DateFirst,
@@ -594,7 +594,7 @@ partial class Simulation
             return null;
         var connection = batch.Connection;
         var key = new QueryStoreContextKey(
-            SetOptionsOf(connection, batch.Parser.QuotedIdentifiers),
+            SetOptionsOf(connection, batch.QuotedIdentifiers),
             connection.Language.LangId,
             DateFormatCode(connection.DateFormat),
             connection.DateFirst,

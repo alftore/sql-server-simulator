@@ -315,6 +315,46 @@ public sealed class PlanCacheTests
         }
     }
 
+    // A replay's batch builds its parser on first use, which can be after the
+    // command's text or the session's QUOTED_IDENTIFIER changed, so the parser
+    // must read what the batch captured as it was constructed. The public API
+    // can't reach this: no replayed shape asks for the parser.
+    [TestMethod]
+    public void DeferredParser_ReadsTheTextAndQuotedIdentifierTheBatchBegan()
+    {
+        var sim = new Simulation();
+        using var connection = sim.CreateDbConnection();
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "select 1\nselect 2\nmatch";
+        var batch = new Parser.BatchContext(command, deferParser: true);
+        command.CommandText = "select 1";
+        connection.QuotedIdentifiers = false;
+
+        AreEqual(3, batch.Parser.LastLine);
+        IsTrue(batch.Parser.GraphIdentityPassthrough);
+        IsTrue(batch.Parser.QuotedIdentifiersAtBatchStart);
+        IsTrue(batch.Parser.QuotedIdentifiers);
+        IsTrue(batch.QuotedIdentifiers);
+    }
+
+    [TestMethod]
+    public void DeferredParser_IsNotBuiltUntilAskedFor()
+    {
+        var sim = new Simulation();
+        using var connection = sim.CreateDbConnection();
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "select 1";
+        var batch = new Parser.BatchContext(command, deferParser: true);
+        connection.QuotedIdentifiers = false;
+        AreSame(command, batch.Command);
+        AreSame(connection, batch.Connection);
+        IsTrue(batch.QuotedIdentifiers);
+        batch.Parser.QuotedIdentifiers = false;
+        IsFalse(batch.QuotedIdentifiers);
+    }
+
     /// <summary>
     /// Runs a batch, returning each statement's rows as a list of
     /// first-column values — enough to compare a cached replay against an
