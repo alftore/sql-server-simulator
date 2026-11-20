@@ -39,6 +39,14 @@ internal sealed class RowFrame(FromSource[] sources, BatchContext batch, Func<Mu
     /// <summary>Shared by every frame until its first bind; never written.</summary>
     private static readonly Binding[] NoBindings = new Binding[1];
 
+    /// <summary>
+    /// The frame the enclosing query's by-name resolver belongs to, when the
+    /// resolver handed in is one: a subquery's references to its enclosing row
+    /// are then read from that frame by reference, in place of a delegate call
+    /// that looks the name up again.
+    /// </summary>
+    private readonly RowFrame? outerFrame = Of(outerResolver);
+
     private SourceColumnMemo? memo;
     private Binding[] bindings = NoBindings;
 
@@ -50,6 +58,15 @@ internal sealed class RowFrame(FromSource[] sources, BatchContext batch, Func<Mu
     /// everything that is not a <see cref="Reference"/>.
     /// </summary>
     public Func<MultiPartName, SqlValue> Resolver => field ??= this.ResolveByName;
+
+    /// <summary>
+    /// The frame <paramref name="resolver"/> is the by-name resolver of, if it
+    /// is one. Any other delegate — a probing run's wrapper that notes every
+    /// name read, the grouped resolver, a cursor's — answers null and is called
+    /// by name, so a wrapper is never skipped.
+    /// </summary>
+    public static RowFrame? Of(Func<MultiPartName, SqlValue>? resolver) =>
+        resolver?.Target is RowFrame frame && ReferenceEquals(frame.Resolver, resolver) ? frame : null;
 
     private struct Binding
     {
@@ -84,6 +101,8 @@ internal sealed class RowFrame(FromSource[] sources, BatchContext batch, Func<Mu
             return Selection.ReadSourceColumn(sources, this.Tuple, source, column, batch, outerResolver, this.memo);
         if (source != -1)
             return RowLocator.Resolve(sources, this.Tuple, source, column, batch);
+        if (this.outerFrame is { } outerFrame)
+            return outerFrame.Read(reference);
         return outerResolver is { } outer
             ? outer(reference.ReferencedName)
             : throw Selection.UnresolvedNameError(sources, reference.ReferencedName);

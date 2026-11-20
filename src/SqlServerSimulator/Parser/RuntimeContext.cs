@@ -45,6 +45,16 @@ internal readonly struct RuntimeContext
         this.Batch = batch;
     }
 
+    /// <summary>
+    /// A context over <paramref name="resolveColumn"/>, carrying the frame when
+    /// that delegate is a frame's own by-name resolver so a
+    /// <see cref="Expressions.Reference"/> read through it binds by reference.
+    /// Built once per operator, ahead of its row loop, because the type test is
+    /// not free.
+    /// </summary>
+    public static RuntimeContext Over(Func<MultiPartName, SqlValue> resolveColumn, BatchContext batch) =>
+        RowFrame.Of(resolveColumn) is { } frame ? new(frame, batch) : new(resolveColumn, batch);
+
     /// <summary>Maps a (possibly qualified) column name to its value for the current row.</summary>
     public Func<MultiPartName, SqlValue> ResolveColumn =>
         this.columns as Func<MultiPartName, SqlValue> ?? (this.columns as RowFrame)?.Resolver!;
