@@ -358,6 +358,21 @@ internal abstract partial class Collation : IComparer<string>, IEqualityComparer
     public abstract int GetHashCode(string obj);
 
     /// <summary>
+    /// <see cref="Compare(string?, string?)"/> as a string <em>value</em> compares:
+    /// trailing spaces are padding, so <c>'a '</c> sorts with <c>'a'</c>. Only U+0020
+    /// counts; every other whitespace character (tab, no-break space, ideographic
+    /// space) is significant. The base trims; a body overrides to answer from trimmed
+    /// spans without allocating the trimmed copies. Neither operand is null.
+    /// </summary>
+    internal virtual int ComparePadded(string x, string y) => this.Compare(x.TrimEnd(' '), y.TrimEnd(' '));
+
+    /// <summary><see cref="Equals(string?, string?)"/> with trailing spaces as padding (see <see cref="ComparePadded"/>).</summary>
+    internal virtual bool EqualsPadded(string x, string y) => this.Equals(x.TrimEnd(' '), y.TrimEnd(' '));
+
+    /// <summary>A hash that agrees with <see cref="EqualsPadded"/>: strings it calls equal hash alike.</summary>
+    internal virtual int GetPaddedHashCode(string s) => this.GetHashCode(s.TrimEnd(' '));
+
+    /// <summary>
     /// Returns the comparer body to use when this collation is pinned on
     /// a varchar / char column. The base implementation returns
     /// <see langword="this"/>; binary collations override to return a

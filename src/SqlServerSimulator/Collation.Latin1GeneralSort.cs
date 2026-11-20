@@ -705,6 +705,26 @@ internal abstract partial class Collation
 
         public override int GetHashCode(string obj) => this.WeightRunHash(obj);
 
+        // The value forms hand the walk each operand's text up to its trailing
+        // spaces, as spans, so a padded char(n) value costs no trimmed copy;
+        // identical text settles a sort's ties without the level walks and the
+        // minimal-weight keys behind them.
+        internal override int ComparePadded(string x, string y)
+        {
+            var xs = x.AsSpan().TrimEnd(' ');
+            var ys = y.AsSpan().TrimEnd(' ');
+            return xs.SequenceEqual(ys) ? 0 : this.CompareWeights(xs, ys);
+        }
+
+        internal override bool EqualsPadded(string x, string y)
+        {
+            var xs = x.AsSpan().TrimEnd(' ');
+            var ys = y.AsSpan().TrimEnd(' ');
+            return xs.SequenceEqual(ys) || this.CompareWeights(xs, ys) == 0;
+        }
+
+        internal override int GetPaddedHashCode(string s) => this.WeightRunHash(s.AsSpan().TrimEnd(' '));
+
         // Hash the primary weight run, a separator, then (where the name weighs
         // accents) the secondary run — mirrors the order Compare consults them,
         // so Compare-equal strings always hash equal; a foreign element adds
