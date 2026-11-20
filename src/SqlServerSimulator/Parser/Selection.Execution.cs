@@ -3820,11 +3820,9 @@ internal sealed partial class Selection
         var buffer = new List<(SqlValue[] Projected, SqlValue[] Keys)>();
 
         // Hoisted per-row resolution scaffolding — see InnerStream above.
-        var memo = new SourceColumnMemo();
-        var currentTuple = default(byte[]?[])!;
-        Func<MultiPartName, SqlValue> resolveSource = null!;
-        resolveSource = name => ResolveAcrossTuple(sources, currentTuple, name, batch, outerResolver, memo);
-        var rowRuntime = new RuntimeContext(resolveSource, batch);
+        var frame = new RowFrame(sources, batch, outerResolver);
+        var resolveSource = frame.Resolver;
+        var rowRuntime = new RuntimeContext(frame, batch);
 
         // Computed once: the column each projection reads, for the DISTINCT
         // ORDER BY check (a term may name the source column behind an alias).
@@ -3835,7 +3833,7 @@ internal sealed partial class Selection
         {
             foreach (var tuple in EnumerateJoinedRows(sources, joins, batch, outerResolver))
             {
-                currentTuple = tuple;
+                frame.Tuple = tuple;
                 var include = true;
                 foreach (var excluder in excluders)
                 {

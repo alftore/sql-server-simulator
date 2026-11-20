@@ -298,6 +298,7 @@ The original single-owner assumption ("Expression instances aren't shared across
 - **Column bindings** — which `(source, column)` a name reads is a function of the sources one enumeration reads, and one `Reference` node is read against different sources at once (a scan prefilter's one-source tuple, the joined tuple, every concurrent execution).
   The binding therefore lives in the `RowFrame` an enumerating method creates where its by-name closure and `SourceColumnMemo` were created, beside the tuple it reads, found by `Reference.Slot`; the node carries only that immutable `int`.
   A subquery's frame reads its enclosing row through the enclosing frame when the outer resolver it is handed is that frame's own by-name delegate (`RowFrame.Of`), which also binds the inner node in the outer frame's table; a wrapper (the uncorrelated-subquery probe) is never recognised, so it is called by name and still sees every read.
+  Each parallel aggregate worker builds a frame of its own over the shared sources and expression tree.
   A frame is used by one thread and never outlives its enumeration, so a stale cache entry that re-parses gets new nodes and nothing is re-bound in place.
   Debug builds re-resolve a bound reference on every power-of-two hit (`RowFrame.Audit`) and throw if the answer moved.
 

@@ -641,19 +641,17 @@ internal sealed partial class Selection
         /// One worker's loop: take a block, run every row in it through the
         /// same per-row pipeline the serial path runs, hand the block back.
         /// The scaffolding is hoisted exactly as the serial loop hoists it —
-        /// one mutable tuple capture, one cached self-referencing resolver
-        /// lambda, one <see cref="RuntimeContext"/>, one key scratch buffer —
+        /// one frame holding the tuple and the column bindings, one
+        /// <see cref="RuntimeContext"/>, one key scratch buffer —
         /// but per worker rather than per enumeration.
         /// </summary>
         private void Drain(int index)
         {
             var worker = this.workers[index];
-            var memo = new SourceColumnMemo();
             var keyScratch = new SqlValue[this.groupingSet.Length];
             var currentTuple = default(byte[]?[])!;
-            Func<MultiPartName, SqlValue> resolveColumn = null!;
-            resolveColumn = name => ResolveAcrossTuple(this.sources, currentTuple, name, this.batch, null, memo);
-            var runtime = new RuntimeContext(resolveColumn, this.batch);
+            var frame = new RowFrame(this.sources, this.batch, null);
+            var runtime = new RuntimeContext(frame, this.batch);
             var ungrouped = this.groupingSet.Length == 0 ? this.newGroup([]) : null;
             if (ungrouped is not null)
                 worker.Groups[SqlValueKey.Empty] = ungrouped;
@@ -664,7 +662,7 @@ internal sealed partial class Selection
                 {
                     for (var r = 0; r < block.Count; r++)
                     {
-                        currentTuple = block.Rows[r];
+                        frame.Tuple = currentTuple = block.Rows[r];
                         var include = true;
                         foreach (var excluder in this.excluders)
                         {

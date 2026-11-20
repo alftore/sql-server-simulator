@@ -128,18 +128,18 @@ internal sealed partial class Selection
             effectiveSets = [[]];
 
         // Row-invariant resolution scaffolding is hoisted out of every per-row
-        // loop below: `currentTuple` is a mutable capture rewritten per row,
-        // and the resolver is a cached delegate (see
-        // EnumerateJoinedRows), so each loop allocates one closure + one
-        // delegate + one RuntimeContext TOTAL instead of several per row —
-        // per-row delegate churn dominated the allocation profile.
+        // loop below: the frame holds the tuple, rewritten per row, and each
+        // reference's binding, so the loop allocates one frame + one
+        // RuntimeContext TOTAL instead of several per row — per-row delegate
+        // churn dominated the allocation profile. It is built here, after the
+        // last assignment to `sources` (the seek and the join narrowing above),
+        // because the frame holds the array where a closure held the variable.
         // `keyScratch` is the same idea for the grouping key, and
         // `ungroupedState` the implicit whole-input group (see Accumulate).
         var keyScratch = Array.Empty<SqlValue>();
         var ungroupedState = default(GroupState);
-        var currentTuple = default(byte[]?[])!;
-        SqlValue resolveColumn(MultiPartName name) => ResolveAcrossTuple(sources, currentTuple, name, batch, outerResolver, memo);
-        var rowRuntime = new RuntimeContext(resolveColumn, batch);
+        var frame = new RowFrame(sources, batch, outerResolver);
+        var rowRuntime = new RuntimeContext(frame, batch);
 
         // The groups are built straight off the enumeration and nothing is
         // buffered. One grouping set — no GROUP BY at all, or a plain GROUP BY
@@ -208,7 +208,7 @@ internal sealed partial class Selection
                     }
                 }
 
-                currentTuple = tuple;
+                frame.Tuple = tuple;
                 var include = true;
                 foreach (var excluder in fromClause.Excluders)
                 {

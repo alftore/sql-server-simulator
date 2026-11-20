@@ -293,4 +293,69 @@ public sealed class ColumnBindingTests
         AreEqual("1|6;2|2;3|1", Rows(sim, "select id, g from t order by id"));
         AreEqual("1|10|50;2|20|60", Rows(sim, "select id, was, now from trlog order by id"));
     }
+
+    private static Simulation Pushed()
+    {
+        var sim = new Simulation();
+        sim.ExecuteBatches(
+            "create table a (id int not null, y int not null)",
+            "insert a values (1, 0), (2, 2), (3, 3), (4, 5)",
+            "create table b (aid int not null, x int not null, label varchar(5) not null)",
+            "insert b values (1, 5, 'p'), (2, 5, 'q'), (2, 4, 'r'), (3, 5, 's'), (4, 6, 't')");
+        return sim;
+    }
+
+    /// <summary>
+    /// A conjunct on one side of a join is evaluated on that source alone at
+    /// slot 0 of a one-source tuple and again on the joined tuple at its real
+    /// slot: one <c>Reference</c> node, two bindings, whichever side is listed
+    /// first.
+    /// </summary>
+    [TestMethod]
+    public void PushedConjunct_BindsAtBothTheOneSourceAndTheJoinedSlot()
+    {
+        var sim = Pushed();
+        AreEqual("2|q;3|s", Rows(sim, "select a.id, b.label from a join b on b.aid = a.id where b.x = 5 and a.y > 1 order by a.id"));
+        AreEqual("2|q;3|s", Rows(sim, "select a.id, b.label from b join a on b.aid = a.id where b.x = 5 and a.y > 1 order by a.id"));
+        AreEqual("2|q;3|s", Rows(sim, "select a.id, b.label from b join a on b.aid = a.id where a.y > 1 and b.x = 5 order by a.id"));
+    }
+
+    /// <summary>
+    /// <c>HAVING</c> comparing an aggregate to the grouping column, projected
+    /// beside two aggregates: the key reads per row, the rest per group.
+    /// </summary>
+    [TestMethod]
+    public void GroupByHaving_AggregateAgainstTheGroupingColumn()
+    {
+        var sim = new Simulation();
+        sim.ExecuteBatches(
+            "create table gv (s int not null, v int not null)",
+            "insert gv values (1, 1), (1, 5), (2, 2), (2, 2), (3, 9), (3, 1), (4, 4), (4, 0)");
+        AreEqual(
+            "2|2|2;4|2|0",
+            Rows(sim, "select s, count(*), min(v) from gv group by s having max(v) = s order by s"));
+    }
+
+    /// <summary>
+    /// A second conjunct that raises (a failing <c>CAST</c>) only on a row the
+    /// first rejects never raises; one that raises on a kept row raises Msg 245
+    /// naming that row's value, directly and through a join.
+    /// </summary>
+    [TestMethod]
+    public void FilterThatRaises_RaisesOnlyOnTheRowThatReachesIt()
+    {
+        var sim = Pushed();
+        sim.ExecuteBatches(
+            "create table f (id int not null, s varchar(10) not null)",
+            "insert f values (1, '1'), (2, '2'), (3, 'x'), (4, '4')");
+        AreEqual("1;2;4", Rows(sim, "select id from f where id <> 3 and cast(s as int) > 0 order by id"));
+        AreEqual("1;2;4", Rows(sim, "select f.id from f join a on a.id = f.id where f.id <> 3 and cast(f.s as int) > 0 order by f.id"));
+
+        var direct = ThrowsExactly<SimulatedSqlException>(() => _ = Rows(sim, "select id from f where id <> 9 and cast(s as int) > 0"));
+        AreEqual(245, direct.Number);
+        Contains("'x'", direct.Message);
+        var joined = ThrowsExactly<SimulatedSqlException>(() => _ = Rows(sim, "select f.id from f join a on a.id = f.id where f.id <> 9 and cast(f.s as int) > 0"));
+        AreEqual(245, joined.Number);
+        Contains("'x'", joined.Message);
+    }
 }

@@ -358,9 +358,7 @@ partial class Selection
             return null;
 
         var tuple = new byte[]?[1];
-        var memo = new SourceColumnMemo();
-        SqlValue resolve(MultiPartName name) => ResolveAcrossTuple(one, tuple, name, batch, outerResolver, memo);
-        var runtime = new RuntimeContext(resolve, batch);
+        var runtime = new RuntimeContext(new RowFrame(one, batch, outerResolver) { Tuple = tuple }, batch);
         SqlValue probe;
         try
         {
@@ -523,15 +521,12 @@ partial class Selection
         int probeRows = PrefilterProbeRows,
         bool dropOnUnknown = true)
     {
-        // Hoisted per-row scaffolding: one single-slot tuple, one cached
-        // self-referencing resolver lambda (never a local function passed as its
-        // own conversion — that allocates a delegate per resolution
-        // per row) and one RuntimeContext for the whole enumeration.
+        // Hoisted per-row scaffolding: one single-slot tuple, one frame over it
+        // (which binds each reference once, and never builds a delegate per
+        // resolution per row) and one RuntimeContext for the whole enumeration.
         FromSource[] one = [source];
         var tuple = new byte[]?[1];
-        var memo = new SourceColumnMemo();
-        SqlValue resolve(MultiPartName name) => ResolveAcrossTuple(one, tuple, name, batch, outerResolver, memo);
-        var runtime = new RuntimeContext(resolve, batch);
+        var runtime = new RuntimeContext(new RowFrame(one, batch, outerResolver) { Tuple = tuple }, batch);
 
         var probed = 0;
         var kept = 0;
