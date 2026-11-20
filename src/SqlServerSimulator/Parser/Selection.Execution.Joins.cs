@@ -1533,15 +1533,37 @@ internal sealed partial class Selection
     /// lands on is always stored.
     /// </para>
     /// </remarks>
-    private static SqlValue ResolveWithinSource(FromSource source, byte[] bytes, BatchContext batch, MultiPartName name)
+    internal static SqlValue ResolveWithinSource(FromSource source, byte[] bytes, BatchContext batch, MultiPartName name)
     {
-        var collation = batch.CurrentDatabase.Collation;
+        var index = FindWithinSource(source, name.Leaf, batch.CurrentDatabase.Collation);
+        return index >= 0 ? DecodeOrCompute(source, index, bytes, batch) : throw SimulatedSqlException.InvalidColumnName(name);
+    }
+
+    /// <summary>
+    /// The index in <paramref name="source"/> of the column named
+    /// <paramref name="leaf"/> under <paramref name="collation"/>, or -1:
+    /// <see cref="ResolveWithinSource"/>'s match, shared with the frame that
+    /// binds a computed column's references once per enumeration.
+    /// </summary>
+    internal static int FindWithinSource(FromSource source, string leaf, Collation collation)
+    {
         for (var i = 0; i < source.ColumnNames.Length; i++)
         {
-            if (collation.Equals(source.ColumnNames[i], name.Leaf))
-                return DecodeOrCompute(source, i, bytes, batch);
+            if (collation.Equals(source.ColumnNames[i], leaf))
+                return i;
         }
 
-        throw SimulatedSqlException.InvalidColumnName(name);
+        return -1;
     }
+
+    /// <summary>
+    /// Whether a read of <paramref name="column"/> of <paramref name="source"/>
+    /// evaluates its computed expression: the conditions
+    /// <see cref="DecodeOrCompute"/> and <see cref="ReadSourceColumn"/> test,
+    /// in the order they test them.
+    /// </summary>
+    internal static bool ReadsComputedExpression(FromSource source, int column) =>
+        source.StorageOrdinals is not null
+        && !(source.DeferredColumns is { } deferred && deferred[column] is not null)
+        && source.Columns[column] is { Computed: not null, IsPersisted: false };
 }
