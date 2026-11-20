@@ -101,4 +101,47 @@ public sealed class DecimalParameterWireTests
             _ = command.Parameters.Add(new SimulatedDbParameter { ParameterName = "@x", DbType = DbType.Int32, Direction = ParameterDirection.Input, Value = null });
         return command;
     }
+
+    [TestMethod]
+    [DataRow(SqlDbType.DateTime2, 3, "2026-01-02T03:04:05.1234567")]
+    [DataRow(SqlDbType.DateTime2, 3, "2026-01-02T03:04:05.9999999")]
+    [DataRow(SqlDbType.DateTime2, 0, "2026-01-02T03:04:05.1234567")]
+    [DataRow(SqlDbType.Time, 3, "03:04:05.1234567")]
+    [DataRow(SqlDbType.DateTimeOffset, 3, "2026-01-02T03:04:05.9999999+02:00")]
+    public async Task TemporalInProcess_MatchesSqlClient(SqlDbType sqlDbType, int scale, string text)
+    {
+        var simulation = new Simulation();
+        await using var listener = await simulation.ListenLocalAsync(0, TestContext.CancellationToken);
+        await using var connection = await Wire.OpenAsync(listener, TestContext.CancellationToken);
+        object value = sqlDbType switch
+        {
+            SqlDbType.DateTime2 => DateTime.Parse(text, CultureInfo.InvariantCulture),
+            SqlDbType.Time => TimeSpan.Parse(text, CultureInfo.InvariantCulture),
+            _ => DateTimeOffset.Parse(text, CultureInfo.InvariantCulture),
+        };
+        var dbType = sqlDbType switch { SqlDbType.DateTime2 => DbType.DateTime2, SqlDbType.Time => DbType.Time, _ => DbType.DateTimeOffset };
+        const string query = "select convert(nvarchar(60), @t, 121)";
+
+        await using var wire = new SqlCommand(query, connection);
+        _ = wire.Parameters.Add(new SqlParameter("@t", sqlDbType) { Scale = (byte)scale, Value = value });
+        var inProcess = simulation.CreateDbConnection().CreateCommand();
+        inProcess.Connection!.Open();
+        inProcess.CommandText = query;
+        _ = inProcess.Parameters.Add(new SimulatedDbParameter { ParameterName = "@t", DbType = dbType, Scale = (byte)scale, Value = value });
+
+        AreEqual(inProcess.ExecuteScalar(), await wire.ExecuteScalarAsync(TestContext.CancellationToken));
+
+        // The declaration is the one SqlClient sent.
+        await using var wireDeclared = new SqlCommand("select @t, @x", connection);
+        _ = wireDeclared.Parameters.Add(new SqlParameter("@t", sqlDbType) { Scale = (byte)scale, Value = value });
+        _ = wireDeclared.Parameters.Add(new SqlParameter("@x", SqlDbType.Int) { Value = null });
+        var wireError = await ThrowsAsync<SqlException>(async () => await wireDeclared.ExecuteScalarAsync(TestContext.CancellationToken));
+        var inProcessDeclared = simulation.CreateDbConnection().CreateCommand();
+        inProcessDeclared.Connection!.Open();
+        inProcessDeclared.CommandText = "select @t, @x";
+        _ = inProcessDeclared.Parameters.Add(new SimulatedDbParameter { ParameterName = "@t", DbType = dbType, Scale = (byte)scale, Value = value });
+        _ = inProcessDeclared.Parameters.Add(new SimulatedDbParameter { ParameterName = "@x", DbType = DbType.Int32, Direction = ParameterDirection.Input, Value = null });
+        var inProcessError = Throws<SimulatedSqlException>(() => _ = inProcessDeclared.ExecuteScalar());
+        AreEqual(wireError.Message, inProcessError.Message);
+    }
 }

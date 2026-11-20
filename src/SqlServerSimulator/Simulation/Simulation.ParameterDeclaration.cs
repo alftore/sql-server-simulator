@@ -279,6 +279,51 @@ partial class Simulation
     }
 
     /// <summary>
+    /// The decimal or temporal <paramref name="parameter"/> whose
+    /// <see cref="SimulatedDbParameter.Precision"/> /
+    /// <see cref="SimulatedDbParameter.Scale"/> decide its type, bound as
+    /// SqlClient sends it; false for any other parameter, and for one whose
+    /// value does not convert, which the caller's own conversion then raises.
+    /// </summary>
+    internal static bool TryBindPrecisionScale(SimulatedDbParameter parameter, out SqlType type, out SqlValue seed)
+    {
+        switch (parameter.DbType)
+        {
+            case DbType.Decimal:
+                return TryBindDecimal(parameter, out type, out seed);
+            case DbType.DateTime2 or DbType.Time or DbType.DateTimeOffset when parameter.Scale is > 0 and < 7:
+                type = parameter.DbType switch
+                {
+                    DbType.DateTime2 => SqlType.GetDateTime2(parameter.Scale),
+                    DbType.Time => SqlType.GetTime(parameter.Scale),
+                    _ => SqlType.GetDateTimeOffset(parameter.Scale),
+                };
+                seed = parameter.Value is null or DBNull or SqlValue
+                    ? SqlValue.Null(type)
+                    : type.ConvertParameter(TruncateToScale(parameter.Value, TimeSpan.TicksPerSecond / (long)Math.Pow(10, parameter.Scale)));
+                return true;
+            default:
+                type = SqlType.Int32;
+                seed = default;
+                return false;
+        }
+    }
+
+    /// <summary>
+    /// <paramref name="value"/> with its time of day cut, not rounded, to a
+    /// multiple of <paramref name="unit"/> ticks, as SqlClient cuts a
+    /// temporal value to its parameter's scale before sending it.
+    /// </summary>
+    private static object TruncateToScale(object value, long unit) => value switch
+    {
+        DateTime dateTime => new DateTime(dateTime.Ticks - (dateTime.Ticks % unit), dateTime.Kind),
+        DateTimeOffset dateTimeOffset => new DateTimeOffset(dateTimeOffset.Ticks - (dateTimeOffset.Ticks % unit), dateTimeOffset.Offset),
+        TimeSpan timeSpan => TimeSpan.FromTicks(timeSpan.Ticks - (timeSpan.Ticks % unit)),
+        TimeOnly timeOnly => new TimeOnly(timeOnly.Ticks - (timeOnly.Ticks % unit)),
+        _ => value,
+    };
+
+    /// <summary>
     /// The text of the <see cref="ArgumentException"/> SqlClient raises, before
     /// sending, for a decimal parameter whose value does not fit its precision
     /// and scale, or null when every parameter fits. The message quotes the

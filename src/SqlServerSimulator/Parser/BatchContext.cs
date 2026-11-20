@@ -2329,10 +2329,11 @@ internal sealed partial class BatchContext
             var maxDeclared = parameter.Size == SqlType.MaxLengthSentinel ? AsMaxVariant(dbType) : null;
             if (maxDeclared is not null)
                 dbType = maxDeclared;
-            // A decimal parameter binds as SqlClient declares it: the set precision
-            // and scale, else the value's own, the value rounded to them.
+            // A decimal or temporal parameter binds as SqlClient declares it: a decimal
+            // at the set precision and scale, else the value's own, rounded to them,
+            // a temporal at the set scale, its value cut to it.
             SqlValue seed;
-            if (parameter.DbType is System.Data.DbType.Decimal && Simulation.TryBindDecimal(parameter, out var decimalType, out var decimalSeed))
+            if (Simulation.TryBindPrecisionScale(parameter, out var decimalType, out var decimalSeed))
             {
                 dbType = decimalType;
                 seed = decimalSeed;

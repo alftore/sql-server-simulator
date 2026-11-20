@@ -136,4 +136,46 @@ public sealed class DecimalParameterTypingTests
 
         AreEqual(1.240m, command.ExecuteScalar());
     }
+
+    private static object TemporalValue(DbType dbType, string text) => dbType switch
+    {
+        DbType.DateTime2 => DateTime.Parse(text, CultureInfo.InvariantCulture),
+        DbType.Time => TimeSpan.Parse(text, CultureInfo.InvariantCulture),
+        _ => DateTimeOffset.Parse(text, CultureInfo.InvariantCulture),
+    };
+
+    [TestMethod]
+    [DataRow(DbType.DateTime2, 3, "2026-01-02T03:04:05.1234567", "2026-01-02 03:04:05.123")]
+    [DataRow(DbType.DateTime2, 3, "2026-01-02T03:04:05.9999999", "2026-01-02 03:04:05.999")]
+    [DataRow(DbType.DateTime2, 0, "2026-01-02T03:04:05.1234567", "2026-01-02 03:04:05.1234567")]
+    [DataRow(DbType.DateTime2, 7, "2026-01-02T03:04:05.1234567", "2026-01-02 03:04:05.1234567")]
+    [DataRow(DbType.Time, 3, "03:04:05.1234567", "03:04:05.123")]
+    [DataRow(DbType.Time, 0, "03:04:05.1234567", "03:04:05.1234567")]
+    [DataRow(DbType.DateTimeOffset, 3, "2026-01-02T03:04:05.9999999+02:00", "2026-01-02 03:04:05.999 +02:00")]
+    [DataRow(DbType.DateTimeOffset, 0, "2026-01-02T03:04:05.1234567+02:00", "2026-01-02 03:04:05.1234567 +02:00")]
+    public void TemporalParameter_TruncatesToItsScale(DbType dbType, int scale, string value, string expected)
+    {
+        using var command = new Simulation().CreateOpenConnection().CreateCommand();
+        command.CommandText = "select convert(nvarchar(60), @t, 121)";
+        _ = command.Parameters.Add(new SimulatedDbParameter { ParameterName = "@t", DbType = dbType, Scale = (byte)scale, Value = TemporalValue(dbType, value) });
+
+        AreEqual(expected, command.ExecuteScalar());
+    }
+
+    [TestMethod]
+    [DataRow(DbType.DateTime2, 3, "(@t datetime2(3),@x int)")]
+    [DataRow(DbType.DateTime2, 0, "(@t datetime2(7),@x int)")]
+    [DataRow(DbType.Time, 3, "(@t time(3),@x int)")]
+    [DataRow(DbType.DateTimeOffset, 3, "(@t datetimeoffset(3),@x int)")]
+    public void TemporalParameter_IsDeclaredAtItsScale(DbType dbType, int scale, string declaration)
+    {
+        using var command = new Simulation().CreateOpenConnection().CreateCommand();
+        command.CommandText = "select @t, @x";
+        _ = command.Parameters.Add(new SimulatedDbParameter { ParameterName = "@t", DbType = dbType, Scale = (byte)scale, Value = DBNull.Value });
+        _ = command.Parameters.Add(new SimulatedDbParameter { ParameterName = "@x", DbType = DbType.Int32, Direction = ParameterDirection.Input, Value = null });
+
+        AreEqual(
+            $"The parameterized query '{declaration}select @t, @x' expects the parameter '@x', which was not supplied.",
+            Throws<SimulatedSqlException>(() => _ = command.ExecuteScalar()).Message);
+    }
 }

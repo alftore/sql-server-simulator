@@ -2275,7 +2275,7 @@ public sealed partial class Simulation
             {
                 dbType = SqlType.GetByDbType(parameter.DbType);
                 SqlValue? decimalValue = null;
-                if (parameter.DbType is DbType.Decimal && TryBindDecimal(parameter, out var decimalType, out var bound))
+                if (TryBindPrecisionScale(parameter, out var decimalType, out var bound))
                 {
                     dbType = decimalType;
                     decimalValue = bound;
