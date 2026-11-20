@@ -1127,7 +1127,7 @@ internal readonly partial struct SqlValue : IEquatable<SqlValue>, IComparable<Sq
             || (this.Type is SqlVariantSqlType
                 ? SqlVariantOrdering.Compare(this.AsVariantInner, other.AsVariantInner) == 0
                 : IsStringTypeRef(this.Type)
-                ? this.Type.Collation!.Equals(TrimTrailing((string)this.reference!), TrimTrailing((string)other.reference!))
+                ? this.Type.Collation!.EqualsPadded((string)this.reference!, (string)other.reference!)
                 : this.Type is DateTimeOffsetSqlType
                     ? this.primitive == other.primitive
                     : this.Type == SqlType.UniqueIdentifier
@@ -1206,13 +1206,6 @@ internal readonly partial struct SqlValue : IEquatable<SqlValue>, IComparable<Sq
         a is VarbinarySqlType or BinarySqlType && b is VarbinarySqlType or BinarySqlType;
 
     /// <summary>
-    /// Strips trailing ASCII spaces, modeling SQL Server's ANSI padding for
-    /// <c>=</c>/<c>&lt;&gt;</c>/<c>ORDER BY</c> on varchar/nvarchar — only
-    /// space (U+0020) is trimmed; other whitespace is significant.
-    /// </summary>
-    private static string TrimTrailing(string s) => s.TrimEnd(' ');
-
-    /// <summary>
     /// Orders two non-NULL same-typed values. NULL handling is the caller's
     /// responsibility (SQL's NULL-comparison semantics differ from .NET's
     /// IComparable convention, so we throw here rather than pick a side).
@@ -1248,9 +1241,7 @@ internal readonly partial struct SqlValue : IEquatable<SqlValue>, IComparable<Sq
                 SqlTypeCategory.Approximate => this.Type == SqlType.Float
                     ? this.AsDouble.CompareTo(other.AsDouble)
                     : this.AsSingle.CompareTo(other.AsSingle),
-                SqlTypeCategory.String => this.Type.Collation!.Compare(
-                    TrimTrailing((string)this.reference!),
-                    TrimTrailing((string)other.reference!)),
+                SqlTypeCategory.String => this.Type.Collation!.ComparePadded((string)this.reference!, (string)other.reference!),
                 SqlTypeCategory.UniqueIdentifier => new SqlGuid(this.AsGuid).CompareTo(new SqlGuid(other.AsGuid)),
                 SqlTypeCategory.Other => this.Type switch
                 {
@@ -1355,7 +1346,7 @@ internal readonly partial struct SqlValue : IEquatable<SqlValue>, IComparable<Sq
         {
             // Trailing spaces and case folding are part of equality, so the
             // hash must agree.
-            hash.Add(this.Type.Collation!.GetHashCode(TrimTrailing((string)this.reference!)));
+            hash.Add(this.Type.Collation!.GetPaddedHashCode((string)this.reference!));
         }
         else if (this.Type is DateTimeOffsetSqlType)
         {

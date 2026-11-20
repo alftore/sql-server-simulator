@@ -127,6 +127,28 @@ public sealed class CollationTests
         IsGreaterThan(0, Latin1General100CiAs.Compare("re-do", "redo"));
     }
 
+    /// <summary>
+    /// Strings tying at every level are told apart by the minimal-weight
+    /// tiebreak alone when one holds a hyphen or apostrophe; without one the
+    /// tiebreak has nothing to weigh and the tie stands.
+    /// </summary>
+    [TestMethod]
+    public void MinimalWeightTiebreak_SeparatesOnlyWhereAMinimalCharacterIs()
+    {
+        foreach (var collation in new[] { Latin1GeneralCiAs, Latin1General100CiAs })
+        {
+            IsGreaterThan(0, collation.Compare("co-op", "coop"));
+            IsLessThan(0, collation.Compare("coop", "co-op"));
+            IsGreaterThan(0, collation.Compare("a-b", "AB"));
+            IsGreaterThan(0, collation.Compare("o'brien", "OBRIEN"));
+            AreEqual(0, collation.Compare("ab", "AB"));
+            AreEqual(0, collation.Compare("co-op", "CO-OP"));
+            IsTrue(collation.Equals("ab", "AB"));
+            IsTrue(collation.Equals("a-b", "A-B"));
+            IsFalse(collation.Equals("co-op", "coop"));
+        }
+    }
+
     [TestMethod]
     public void Win100_Equality_IsStrictAboutSymbols_NotJustSort()
     {

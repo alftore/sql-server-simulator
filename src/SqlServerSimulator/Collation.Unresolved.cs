@@ -170,6 +170,12 @@ internal sealed class UnresolvedCollation(Collation inner, string rightName, str
 
     public override int GetHashCode(string obj) => this.inner.GetHashCode(obj);
 
+    internal override int ComparePadded(string x, string y) => this.inner.ComparePadded(x, y);
+
+    internal override bool EqualsPadded(string x, string y) => this.inner.EqualsPadded(x, y);
+
+    internal override int GetPaddedHashCode(string s) => this.inner.GetPaddedHashCode(s);
+
     // No storage substitution: a marker's comparison behavior is a fallback for
     // a value that shouldn't reach a comparer at all, so the binary-collation
     // varchar bodies buy nothing here and swapping one in would allocate a

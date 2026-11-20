@@ -361,6 +361,21 @@ internal abstract partial class Collation : IComparer<string>, IEqualityComparer
     public abstract int GetHashCode(string obj);
 
     /// <summary>
+    /// <see cref="Compare(string?, string?)"/> as a string <em>value</em> compares:
+    /// trailing spaces are padding, so <c>'a '</c> sorts with <c>'a'</c>. Only U+0020
+    /// counts; every other whitespace character (tab, no-break space, ideographic
+    /// space) is significant. The base trims; a body overrides to answer from trimmed
+    /// spans without allocating the trimmed copies. Neither operand is null.
+    /// </summary>
+    internal virtual int ComparePadded(string x, string y) => this.Compare(x.TrimEnd(' '), y.TrimEnd(' '));
+
+    /// <summary><see cref="Equals(string?, string?)"/> with trailing spaces as padding (see <see cref="ComparePadded"/>).</summary>
+    internal virtual bool EqualsPadded(string x, string y) => this.Equals(x.TrimEnd(' '), y.TrimEnd(' '));
+
+    /// <summary>A hash that agrees with <see cref="EqualsPadded"/>: strings it calls equal hash alike.</summary>
+    internal virtual int GetPaddedHashCode(string s) => this.GetHashCode(s.TrimEnd(' '));
+
+    /// <summary>
     /// Returns the comparer body to use when this collation is pinned on
     /// a varchar / char column. The base implementation returns
     /// <see langword="this"/>; binary collations override to return a
@@ -796,6 +811,44 @@ internal abstract partial class Collation : IComparer<string>, IEqualityComparer
                 hash.Add(this.compareInfo.GetHashCode(obj.AsSpan()[range], this.equalityOptions));
             return hash.ToHashCode();
         }
+
+        // A pair holding no NUL (under a name that weighs it) and no character
+        // needing special weighing is the plain path of Compare / Equals /
+        // GetHashCode, so the trailing spaces are cut off as spans and
+        // CompareInfo reads them; any other pair takes the trimming base. An
+        // East Asian family's primary table re-orders a non-zero ICU result,
+        // so ComparePadded leaves a pair that table reaches to the base too.
+        private bool ComparesDirectly(ReadOnlySpan<char> x, ReadOnlySpan<char> y) =>
+            (!this.weightsNul || (!x.Contains('\0') && !y.Contains('\0')))
+            && !this.Weightless.IsSpecial(x) && !this.Weightless.IsSpecial(y);
+
+        internal override int ComparePadded(string x, string y)
+        {
+            var xs = x.AsSpan().TrimEnd(' ');
+            var ys = y.AsSpan().TrimEnd(' ');
+            return this.ComparesDirectly(xs, ys) && (this.primaryFamily is null || !(CjkPrimaryOrder.Reaches(xs) || CjkPrimaryOrder.Reaches(ys)))
+                ? this.compareInfo.Compare(xs, ys, this.equalityOptions)
+                : base.ComparePadded(x, y);
+        }
+
+        internal override bool EqualsPadded(string x, string y)
+        {
+            var xs = x.AsSpan().TrimEnd(' ');
+            var ys = y.AsSpan().TrimEnd(' ');
+            if (xs.SequenceEqual(ys))
+                return true;
+            return this.ComparesDirectly(xs, ys)
+                ? this.compareInfo.Compare(xs, ys, this.equalityOptions) == 0
+                : base.EqualsPadded(x, y);
+        }
+
+        internal override int GetPaddedHashCode(string s)
+        {
+            var trimmed = s.AsSpan().TrimEnd(' ');
+            return !this.Weightless.HasDropped(trimmed) && (!this.weightsNul || !trimmed.Contains('\0'))
+                ? this.compareInfo.GetHashCode(trimmed, this.equalityOptions)
+                : base.GetPaddedHashCode(s);
+        }
     }
 
     /// <summary>
@@ -883,6 +936,17 @@ internal abstract partial class Collation : IComparer<string>, IEqualityComparer
         public override int GetHashCode(string obj) =>
             StringComparer.Ordinal.GetHashCode(obj);
 
+        // _BIN2 pads by itself, so its untrimmed operands order as the trimmed
+        // ones do; the pre-BIN2 form does not, so it trims. Equality is ordinal.
+        internal override int ComparePadded(string x, string y) =>
+            this.preBin2 ? ComparePreBin2(x.AsSpan().TrimEnd(' '), y.AsSpan().TrimEnd(' ')) : PaddedCompare<char>(x, y, ' ');
+
+        internal override bool EqualsPadded(string x, string y) =>
+            x.AsSpan().TrimEnd(' ').SequenceEqual(y.AsSpan().TrimEnd(' '));
+
+        internal override int GetPaddedHashCode(string s) =>
+            string.GetHashCode(s.AsSpan().TrimEnd(' '), StringComparison.Ordinal);
+
         /// <summary>
         /// Pre-Bin2 (Latin1_General_BIN era) compare: position 0 reads as a
         /// 16-bit code unit (matches Bin2 at that position); the rest compares
@@ -892,7 +956,7 @@ internal abstract partial class Collation : IComparer<string>, IEqualityComparer
         /// Applies uniformly to every <c>_BIN</c>-suffixed name regardless of
         /// locale or version.
         /// </summary>
-        private static int ComparePreBin2(string x, string y)
+        private static int ComparePreBin2(ReadOnlySpan<char> x, ReadOnlySpan<char> y)
         {
             if (x.Length == 0 || y.Length == 0)
                 return x.Length.CompareTo(y.Length);
@@ -963,7 +1027,17 @@ internal abstract partial class Collation : IComparer<string>, IEqualityComparer
                 ? y is null
                 : y is not null && this.EncodedEqual(x, y);
 
-        private bool EncodedEqual(string x, string y)
+        // CompareBytes pads the shorter operand with 0x20, which is what a
+        // trailing space encodes to in every ANSI code page (and no DBCS trail
+        // byte is 0x20), so the untrimmed text orders as the trimmed does.
+        internal override int ComparePadded(string x, string y) => this.CompareBytes(x, y);
+
+        internal override bool EqualsPadded(string x, string y) =>
+            this.EncodedEqual(x.AsSpan().TrimEnd(' '), y.AsSpan().TrimEnd(' '));
+
+        internal override int GetPaddedHashCode(string s) => this.EncodedHash(s.AsSpan().TrimEnd(' '));
+
+        private bool EncodedEqual(ReadOnlySpan<char> x, ReadOnlySpan<char> y)
         {
             var xCount = this.encoding.GetByteCount(x);
             var yCount = this.encoding.GetByteCount(y);
@@ -974,7 +1048,9 @@ internal abstract partial class Collation : IComparer<string>, IEqualityComparer
             return xBuffer[..this.encoding.GetBytes(x, xBuffer)].SequenceEqual(yBuffer[..this.encoding.GetBytes(y, yBuffer)]);
         }
 
-        public override int GetHashCode(string obj)
+        public override int GetHashCode(string obj) => this.EncodedHash(obj);
+
+        private int EncodedHash(ReadOnlySpan<char> obj)
         {
             // Sized by GetByteCount rather than char count: the DBCS code
             // pages (932 / 936 / 949 / 950) emit two bytes for most of their
@@ -1051,6 +1127,16 @@ internal abstract partial class Collation : IComparer<string>, IEqualityComparer
 
         public override bool Equals(string? x, string? y) =>
             string.Equals(x, y, StringComparison.Ordinal);
+
+        // Compare pads by itself, and equality is ordinal, so the padded hash
+        // is the ordinal one of the trimmed text, without GetHashCode's byte[].
+        internal override int ComparePadded(string x, string y) => this.Compare(x, y);
+
+        internal override bool EqualsPadded(string x, string y) =>
+            x.AsSpan().TrimEnd(' ').SequenceEqual(y.AsSpan().TrimEnd(' '));
+
+        internal override int GetPaddedHashCode(string s) =>
+            string.GetHashCode(s.AsSpan().TrimEnd(' '), StringComparison.Ordinal);
 
         public override int GetHashCode(string obj)
         {
