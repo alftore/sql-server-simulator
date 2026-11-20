@@ -1413,11 +1413,36 @@ internal sealed class Heap(bool sessionPrivate = false)
     /// slot. Walks the slot directories, so it is for catalog readers, not
     /// per-query planning.
     /// </summary>
-    public long CountLiveRows()
+    public long CountLiveRows() => this.CountLiveRows(out _);
+
+    /// <summary>
+    /// <see cref="CountLiveRows()"/> with the number of pages holding at least
+    /// one of those rows, which is how many pages a scan in heap order enters.
+    /// Read without the latch, as a scan is: the answer stands only when
+    /// <see cref="WriteSequence"/> is the same before and after.
+    /// </summary>
+    internal long CountLiveRows(out int pagesWithRows)
     {
         long count = 0;
+        pagesWithRows = 0;
+        // A forward target is a slot a scan passes over, so a page holding
+        // nothing else is one it never enters.
+        Dictionary<int, int>? targetsPerPage = null;
+        if (this.forwardTargetCount != 0)
+        {
+            targetsPerPage = [];
+            foreach (var (target, _) in this.forwardTargets)
+                targetsPerPage[target.Page] = targetsPerPage.GetValueOrDefault(target.Page) + 1;
+        }
+        var index = 0;
         foreach (var page in this.Pages)
-            count += page.UntombstonedSlotCount;
+        {
+            var slots = page.UntombstonedSlotCount;
+            count += slots;
+            if (slots > (targetsPerPage?.GetValueOrDefault(index) ?? 0))
+                pagesWithRows++;
+            index++;
+        }
         return count - this.forwardTargetCount;
     }
 

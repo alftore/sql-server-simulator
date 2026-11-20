@@ -39,6 +39,13 @@ internal sealed class CountAggregator(bool isStar, bool isBigCount, bool distinc
         }
     }
 
+    /// <summary>
+    /// Counts <paramref name="rows"/> rows at once, as that many
+    /// <see cref="Add"/>s of a row would — for the <c>*</c> form only, whose
+    /// rows are counted whatever they hold.
+    /// </summary>
+    public void AddRows(long rows) => this.count += rows;
+
     // A plain row/value count decrements cleanly; the DISTINCT form can't,
     // since the dedup set doesn't carry per-value multiplicity, so a sliding
     // frame over APPROX_COUNT_DISTINCT(ALL x) — the one distinct count real

@@ -28,7 +28,7 @@ namespace SqlServerSimulator.Parser.Expressions;
 /// target's for a synonym.</description></item>
 /// <item><description><c>SchemaId</c> — owning schema's <see cref="Schema.SchemaId"/>.</description></item>
 /// <item><description><c>Cardinality</c> — table row count
-/// (<see cref="Heap.CountLiveRows"/>), 0 for a multi-statement function's return
+/// (<see cref="Heap.CountLiveRows()"/>), 0 for a multi-statement function's return
 /// table; NULL for other kinds.</description></item>
 /// <item><description>The whole <c>Table*</c> family, shared with
 /// <see cref="ObjectProperty"/>.</description></item>

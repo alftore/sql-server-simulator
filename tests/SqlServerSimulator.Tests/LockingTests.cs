@@ -1040,4 +1040,57 @@ public sealed class LockingTests
             $"select request_mode from sys.dm_tran_locks where request_session_id = {spid} and resource_type = 'OBJECT'")));
         _ = connection.CreateCommand("rollback").ExecuteNonQuery();
     }
+
+    /// <summary>
+    /// A <c>COUNT(*)</c> over a whole table, which the heap's live row count
+    /// answers while nothing is in flight, still waits out another session's
+    /// uncommitted insert, delete or update as a scan does, and answers what
+    /// the writer leaves.
+    /// </summary>
+    [TestMethod]
+    [DataRow(false, "insert t values (100, 100)", true, 4)]
+    [DataRow(false, "insert t values (100, 100)", false, 3)]
+    [DataRow(false, "delete t where id = 2", true, 2)]
+    [DataRow(false, "delete t where id = 2", false, 3)]
+    [DataRow(false, "delete t", true, 0)]
+    [DataRow(false, "update t set a = a + 1 where id = 2", true, 3)]
+    [DataRow(true, "insert t values (100, 100)", true, 4)]
+    [DataRow(true, "insert t values (100, 100)", false, 3)]
+    [DataRow(true, "delete t where id = 2", true, 2)]
+    [DataRow(true, "delete t where id = 2", false, 3)]
+    [DataRow(true, "update t set a = a + 1 where id = 2", false, 3)]
+    public async Task CountStar_WholeTable_WaitsOutAnotherSessionsUncommittedWrite(bool clustered, string write, bool commit, int expected)
+    {
+        var sim = new Simulation();
+        _ = sim.ExecuteNonQuery($"create table t (id int not null{(clustered ? " primary key" : "")}, a int not null); insert t values (1, 1), (2, 2), (3, 3)");
+        using var writer = sim.CreateOpenConnection();
+        using var reader = sim.CreateOpenConnection();
+        using var bigReader = sim.CreateOpenConnection();
+
+        _ = writer.CreateCommand($"begin tran; {write}").ExecuteNonQuery();
+        var counted = await sim.StartBlocked(reader, "select count(*) from t", TestContext.CancellationToken);
+        var countedBig = await sim.StartBlocked(bigReader, "select count_big(*) from t", TestContext.CancellationToken);
+        _ = writer.CreateCommand(commit ? "commit" : "rollback").ExecuteNonQuery();
+
+        AreEqual(expected, (await counted).Single());
+        AreEqual((long)expected, (await countedBig).Single());
+        AreEqual(expected, reader.CreateCommand("select count(*) from t").ExecuteScalar());
+    }
+
+    /// <summary>
+    /// A <c>READPAST</c> count skips the rows another session holds, and a
+    /// <c>NOLOCK</c> one reads them, where the unhinted count waits.
+    /// </summary>
+    [TestMethod]
+    public void CountStar_WholeTable_ReadpastSkipsAndNolockReadsAnotherSessionsWrite()
+    {
+        var sim = new Simulation();
+        _ = sim.ExecuteNonQuery("create table t (id int not null primary key, a int not null); insert t values (1, 1), (2, 2), (3, 3)");
+        using var writer = sim.CreateOpenConnection();
+        _ = writer.CreateCommand("begin tran; insert t values (100, 100); delete t where id = 1").ExecuteNonQuery();
+        AreEqual(3, sim.ExecuteScalar("select count(*) from t with (nolock)"));
+        AreEqual(2, sim.ExecuteScalar("select count(*) from t with (readpast)"));
+        _ = writer.CreateCommand("rollback").ExecuteNonQuery();
+        AreEqual(3, sim.ExecuteScalar("select count(*) from t"));
+    }
 }

@@ -662,4 +662,39 @@ public sealed class SnapshotIsolationTests
         AreEqual("1:100,2:100", sim.ExecuteScalar("set transaction isolation level snapshot; begin tran; select string_agg(concat(id, ':', bal), ',') within group (order by id) from acc; commit"));
         _ = writer.CreateCommand("rollback").ExecuteNonQuery();
     }
+
+    /// <summary>
+    /// A whole-table <c>COUNT(*)</c> reads the snapshot's rows, not the
+    /// heap's: a row committed after the snapshot isn't counted, nor one still
+    /// in flight — where a <c>NOLOCK</c> read counts the latter.
+    /// </summary>
+    [TestMethod]
+    public void CountStar_WholeTable_UnderSnapshot_CountsTheSnapshotsRows()
+    {
+        var sim = TwoAccounts();
+        using var writer = sim.CreateOpenConnection();
+        using var reader = sim.CreateOpenConnection();
+
+        _ = writer.CreateCommand("begin tran; insert acc values (3, 100)").ExecuteNonQuery();
+        AreEqual(2, reader.CreateCommand("set transaction isolation level snapshot; begin tran; select count(*) from acc").ExecuteScalar());
+        AreEqual(3, reader.CreateCommand("select count(*) from acc with (nolock)").ExecuteScalar());
+
+        _ = writer.CreateCommand("commit; begin tran; delete acc where id = 1; insert acc values (4, 100); commit").ExecuteNonQuery();
+        AreEqual(2, reader.CreateCommand("select count(*) from acc").ExecuteScalar());
+        AreEqual(2L, reader.CreateCommand("select count_big(*) from acc").ExecuteScalar());
+        _ = reader.CreateCommand("commit").ExecuteNonQuery();
+        AreEqual(3, reader.CreateCommand("select count(*) from acc").ExecuteScalar());
+    }
+
+    [TestMethod]
+    public void CountStar_WholeTable_UnderReadCommittedSnapshot_CountsTheCommittedRows()
+    {
+        var sim = TwoAccounts("alter database simulated set read_committed_snapshot on;");
+        using var writer = sim.CreateOpenConnection();
+        _ = writer.CreateCommand("begin tran; insert acc values (3, 100)").ExecuteNonQuery();
+        AreEqual(2, sim.ExecuteScalar("select count(*) from acc"));
+        AreEqual(3, sim.ExecuteScalar("select count(*) from acc with (nolock)"));
+        _ = writer.CreateCommand("rollback").ExecuteNonQuery();
+        AreEqual(2, sim.ExecuteScalar("select count(*) from acc"));
+    }
 }

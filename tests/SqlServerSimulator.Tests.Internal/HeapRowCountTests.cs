@@ -158,4 +158,39 @@ public sealed class HeapRowCountTests
         AreEqual(10, heap.RowCount);
         AssertConsistent(heap);
     }
+
+    /// <summary>
+    /// The live row count and the pages holding one are the rows and pages a
+    /// scan in heap order yields and enters, after every kind of write — a
+    /// delete emptying a page, a forwarded row (and a page holding nothing else),
+    /// a rolled-back delete and a truncate.
+    /// </summary>
+    [TestMethod]
+    public void LiveRowCountAndPagesEqualTheScans()
+    {
+        using var connection = OpenWithTable();
+        var heap = HeapOf(connection);
+        void AssertScan()
+        {
+            var scanned = heap.EnumerateRowsWithAddress().ToList();
+            AreEqual(scanned.Count, heap.CountLiveRows());
+            AreEqual(scanned.Count, heap.CountLiveRows(out var pages));
+            AreEqual(scanned.Select(static row => row.PageIndex).Distinct().Count(), pages);
+        }
+        AssertScan();
+        Fill(connection, 300);
+        AssertScan();
+        Exec(connection, "delete t where id between 1 and 160");
+        AssertScan();
+        Exec(connection, "update t set pad = replicate('y', 380) where id % 4 = 0");
+        AssertScan();
+        Exec(connection, "update t set pad = replicate('z', 400) where id > 250");
+        AssertScan();
+        Exec(connection, "begin tran; delete t; rollback");
+        AssertScan();
+        Exec(connection, "delete t where id > 160");
+        AssertScan();
+        Exec(connection, "truncate table t");
+        AssertScan();
+    }
 }
