@@ -13,6 +13,12 @@ internal class WireItem
     public DateTime? Stocked { get; set; }
 }
 
+internal sealed class WireEventsContext(Simulation simulation, int port) : TestDbContext(simulation)
+{
+    protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder) =>
+        optionsBuilder.UseSqlServer($"Server=127.0.0.1,{port};User ID=sa;Password=anything;TrustServerCertificate=True;Pooling=False;Connect Timeout=15");
+}
+
 internal sealed class WireDbContext(string connectionString) : DbContext
 {
     public DbSet<WireItem> Items => this.Set<WireItem>();
@@ -31,6 +37,34 @@ internal sealed class WireDbContext(string connectionString) : DbContext
 public sealed class EFCoreOverWire
 {
     public TestContext TestContext { get; set; } = null!;
+
+    /// <summary>
+    /// EF Core sets a <c>datetime2(3)</c> column's parameter <c>Scale</c> to 3, and
+    /// SqlClient truncates the value to it before sending, so a value 0.5 ms past a
+    /// millisecond stores as the millisecond below. The in-process provider must
+    /// store the same, from the same parameter.
+    /// </summary>
+    [TestMethod]
+    public async Task Insert_ScaledDateTime_StoresAsOverTheWire()
+    {
+        var updated = new DateTime(2026, 5, 4, 13, 45, 30, 100).AddTicks(5_000);
+        var overWire = TestDbContext.CreateEventsSimulation();
+        await using (var listener = await overWire.ListenLocalAsync(0, TestContext.CancellationToken))
+        {
+            using var context = new WireEventsContext(overWire, listener.Port);
+            _ = context.Events.Add(new Event { Id = 1, CreatedAt = new DateTime(2026, 5, 4), Updated = updated });
+            _ = await context.SaveChangesAsync(TestContext.CancellationToken);
+        }
+        using var inProcess = new TestDbContext(TestDbContext.CreateEventsSimulation());
+        _ = inProcess.Events.Add(new Event { Id = 1, CreatedAt = new DateTime(2026, 5, 4), Updated = updated });
+        _ = await inProcess.SaveChangesAsync(TestContext.CancellationToken);
+
+        using var wireConnection = overWire.CreateOpenConnection();
+        using var inProcessConnection = inProcess.Simulation.CreateOpenConnection();
+        const string Stored = "select convert(varchar(30), Updated, 121) from Events";
+        Assert.AreEqual("2026-05-04 13:45:30.100", wireConnection.CreateCommand(Stored).ExecuteScalar());
+        Assert.AreEqual("2026-05-04 13:45:30.100", inProcessConnection.CreateCommand(Stored).ExecuteScalar());
+    }
 
     [TestMethod]
     public async Task VanillaUseSqlServer_OverTcp_FullCrudRoundTrip()
