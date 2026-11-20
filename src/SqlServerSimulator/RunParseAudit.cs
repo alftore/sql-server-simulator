@@ -24,6 +24,14 @@ internal static class RunParseAudit
     /// </summary>
     private static readonly string[] Unrestored = ["tokens", "commandMentionsOption", "lineMemoIndex", "lineMemoLine", "StatementVariables", "RemoteWriteAliasKind"];
 
+    /// <summary>
+    /// The collections a parser allocates on first use, for which the audit
+    /// treats unallocated and empty alike: an abandoned parse that allocated
+    /// one and emptied it again has put it back. A non-empty one is still held
+    /// to its identity and count.
+    /// </summary>
+    private static readonly string[] AllocatedOnFirstUse = ["NamedWindowDefinitions", "PendingNamedWindows", "ApplyLeftScopes"];
+
     /// <summary>The fields of <paramref name="walk"/>'s parser, batch and statement frame, as they stand.</summary>
     public static Dictionary<string, object?> Snapshot(BatchContext walk)
     {
@@ -33,7 +41,10 @@ internal static class RunParseAudit
             foreach (var field in target.GetType().GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
             {
                 var value = field.GetValue(target);
-                values[$"{target.GetType().Name}.{field.Name}"] = value is ICollection collection ? (value, collection.Count) : value;
+                values[$"{target.GetType().Name}.{field.Name}"] = Array.IndexOf(AllocatedOnFirstUse, field.Name) >= 0
+                    && (value is null || (int)value.GetType().GetProperty("Count")!.GetValue(value)! == 0)
+                    ? 0
+                    : value is ICollection collection ? (value, collection.Count) : value;
             }
         }
         return values;

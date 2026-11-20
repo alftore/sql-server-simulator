@@ -2071,7 +2071,7 @@ internal sealed partial class Selection
         // A query block owns its named windows, and its select list takes a
         // windowed function wherever the block itself sits — a subquery in an
         // enclosing WHERE included (probed 2026-09-29 against SQL Server 2025).
-        using var windowScope = ParserScope.Enter(ref context.NamedWindowScope, (context.PendingNamedWindows.Count, context.NamedWindowDefinitions.Count));
+        using var windowScope = ParserScope.Enter(ref context.NamedWindowScope, (context.PendingNamedWindows?.Count ?? 0, context.NamedWindowDefinitions?.Count ?? 0));
         using var allowsWindows = ParserScope.Enter(ref context.AllowsWindowExpressions, true);
         using var inWhere = ParserScope.Enter(ref context.InWhereClause, false);
         // A body a browse statement flattens takes the arming its FROM source
@@ -3473,7 +3473,7 @@ internal sealed partial class Selection
                 throw SimulatedSqlException.SyntaxErrorNear(context);
             if (TryFindWindowDefinition(context, nameToken.Value, out _))
                 throw SimulatedSqlException.DuplicateWindowName();
-            context.NamedWindowDefinitions.Add((nameToken.Value, body));
+            (context.NamedWindowDefinitions ??= []).Add((nameToken.Value, body));
             context.MoveNextOptional();
         } while (context.Token is Operator { Character: ',' });
     }
@@ -3487,13 +3487,14 @@ internal sealed partial class Selection
     private static void ResolvePendingNamedWindows(ParserContext context)
     {
         var (pendingStart, definitionStart) = context.NamedWindowScope;
-        var pending = context.PendingNamedWindows;
-        for (var i = pendingStart; i < pending.Count; i++)
-            pending[i].Window.ApplyNamedWindow(MergeWindowReference(context, pending[i].Reference, [], pending[i].Window.Kind));
-        if (pending.Count > pendingStart)
-            pending.RemoveRange(pendingStart, pending.Count - pendingStart);
-        var definitions = context.NamedWindowDefinitions;
-        if (definitions.Count > definitionStart)
+        if (context.PendingNamedWindows is { } pending)
+        {
+            for (var i = pendingStart; i < pending.Count; i++)
+                pending[i].Window.ApplyNamedWindow(MergeWindowReference(context, pending[i].Reference, [], pending[i].Window.Kind));
+            if (pending.Count > pendingStart)
+                pending.RemoveRange(pendingStart, pending.Count - pendingStart);
+        }
+        if (context.NamedWindowDefinitions is { } definitions && definitions.Count > definitionStart)
             definitions.RemoveRange(definitionStart, definitions.Count - definitionStart);
     }
 
@@ -3504,14 +3505,16 @@ internal sealed partial class Selection
     /// </summary>
     private static bool TryFindWindowDefinition(ParserContext context, string name, out Expressions.WindowExpression.WindowBody body)
     {
-        var collation = context.Batch.CurrentDatabase.Collation;
-        var definitions = context.NamedWindowDefinitions;
-        for (var i = context.NamedWindowScope.Definitions; i < definitions.Count; i++)
+        if (context.NamedWindowDefinitions is { } definitions)
         {
-            if (collation.Equals(definitions[i].Name, name))
+            var collation = context.Batch.CurrentDatabase.Collation;
+            for (var i = context.NamedWindowScope.Definitions; i < definitions.Count; i++)
             {
-                body = definitions[i].Body;
-                return true;
+                if (collation.Equals(definitions[i].Name, name))
+                {
+                    body = definitions[i].Body;
+                    return true;
+                }
             }
         }
         body = default;
@@ -3547,7 +3550,7 @@ internal sealed partial class Selection
         {
             throw SimulatedSqlException.WindowIsUndefined(name, (byte)(visiting.Count > 0
                 ? 7
-                : context.NamedWindowDefinitions.Count > context.NamedWindowScope.Definitions ? 4 : 3));
+                : context.NamedWindowDefinitions?.Count > context.NamedWindowScope.Definitions ? 4 : 3));
         }
         if (collation.Equals(definition.BaseWindowName, name))
             throw SimulatedSqlException.WindowIsUndefined(name, 7);

@@ -319,7 +319,7 @@ internal sealed class MatchPredicate : BooleanExpression
         {
             var outer = context.EnclosingScopes[enclosing];
             sources = [.. sources, .. outer];
-            applyLeft.AddRange(Enumerable.Repeat(context.ApplyLeftScopes.Contains(outer), outer.Length));
+            applyLeft.AddRange(Enumerable.Repeat(context.ApplyLeftScopes is { } applyLeftScopes && applyLeftScopes.Contains(outer), outer.Length));
         }
         var collation = context.Batch.CurrentDatabase.Collation;
 

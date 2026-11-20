@@ -709,7 +709,8 @@ internal sealed class ParserContext(SimulatedDbCommand command, BatchContext bat
     /// past <see cref="NamedWindowScope"/>, so a subquery's clause neither sees
     /// nor answers its enclosing block's.
     /// </summary>
-    public readonly List<(string Name, Expressions.WindowExpression.WindowBody Body)> NamedWindowDefinitions = [];
+    // Null until a WINDOW clause defines one.
+    public List<(string Name, Expressions.WindowExpression.WindowBody Body)>? NamedWindowDefinitions;
 
     /// <summary>
     /// <c>OVER w</c> / <c>OVER (w …)</c> references awaiting resolution against
@@ -718,7 +719,8 @@ internal sealed class ParserContext(SimulatedDbCommand command, BatchContext bat
     /// the reference's own refining elements and patched once the WINDOW clause
     /// is read.
     /// </summary>
-    public readonly List<(Expressions.WindowExpression Window, Expressions.WindowExpression.WindowBody Reference)> PendingNamedWindows = [];
+    // Null until a reference is registered.
+    public List<(Expressions.WindowExpression Window, Expressions.WindowExpression.WindowBody Reference)>? PendingNamedWindows;
 
     /// <summary>
     /// Where the query block being parsed starts in
@@ -1028,7 +1030,8 @@ internal sealed class ParserContext(SimulatedDbCommand command, BatchContext bat
     /// left side rather than an enclosing query, which a <c>MATCH</c> on the
     /// right side may not bind against (Msg 13920).
     /// </summary>
-    public readonly HashSet<FromSource[]> ApplyLeftScopes = new(ReferenceEqualityComparer.Instance);
+    // Null until an APPLY parses its right side.
+    public HashSet<FromSource[]>? ApplyLeftScopes;
 
     /// <summary>
     /// Set while a <c>MERGE</c>'s <c>USING</c> table source parses, where an
@@ -1738,8 +1741,8 @@ internal sealed class ParserContext(SimulatedDbCommand command, BatchContext bat
         public readonly int SequenceDrawsParsed = context.SequenceDrawsParsed;
         public readonly int UnwindowedSequenceDrawsParsed = context.UnwindowedSequenceDrawsParsed;
         public readonly int StatementVariablesStart = context.StatementVariablesStart;
-        public readonly int PendingNamedWindows = context.PendingNamedWindows.Count;
-        public readonly int NamedWindowDefinitions = context.NamedWindowDefinitions.Count;
+        public readonly int PendingNamedWindows = context.PendingNamedWindows?.Count ?? 0;
+        public readonly int NamedWindowDefinitions = context.NamedWindowDefinitions?.Count ?? 0;
         public readonly bool ReadsRowLocators = context.ReadsRowLocators;
         public readonly bool ForBrowseSeen = context.ForBrowseSeen;
         public readonly bool SimpleParameterizationBlocked = context.SimpleParameterizationBlocked;
@@ -1775,8 +1778,8 @@ internal sealed class ParserContext(SimulatedDbCommand command, BatchContext bat
         this.SequenceDrawsParsed = state.SequenceDrawsParsed;
         this.UnwindowedSequenceDrawsParsed = state.UnwindowedSequenceDrawsParsed;
         this.StatementVariablesStart = state.StatementVariablesStart;
-        this.PendingNamedWindows.RemoveRange(state.PendingNamedWindows, this.PendingNamedWindows.Count - state.PendingNamedWindows);
-        this.NamedWindowDefinitions.RemoveRange(state.NamedWindowDefinitions, this.NamedWindowDefinitions.Count - state.NamedWindowDefinitions);
+        this.PendingNamedWindows?.RemoveRange(state.PendingNamedWindows, this.PendingNamedWindows.Count - state.PendingNamedWindows);
+        this.NamedWindowDefinitions?.RemoveRange(state.NamedWindowDefinitions, this.NamedWindowDefinitions.Count - state.NamedWindowDefinitions);
         this.ReadsRowLocators = state.ReadsRowLocators;
         this.ForBrowseSeen = state.ForBrowseSeen;
         this.SimpleParameterizationBlocked = state.SimpleParameterizationBlocked;

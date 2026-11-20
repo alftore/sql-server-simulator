@@ -1074,7 +1074,7 @@ internal sealed class WindowExpression : Expression
     /// </summary>
     private static WindowExpression RegisterNamedWindowReference(ParserContext context, WindowExpression expression, WindowBody reference)
     {
-        context.PendingNamedWindows.Add((expression, reference));
+        (context.PendingNamedWindows ??= []).Add((expression, reference));
         return Register(context, expression);
     }
 
