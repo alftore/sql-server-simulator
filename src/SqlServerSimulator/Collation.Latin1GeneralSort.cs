@@ -713,7 +713,7 @@ internal abstract partial class Collation
         // Compare applies ignores it (the _100_ table's narrow no-break space
         // weighs as one). Streamed through the cursor so no weight lists are
         // materialized.
-        private int WeightRunHash(string s)
+        private int WeightRunHash(ReadOnlySpan<char> s)
         {
             var hash = new HashCode();
             var space = this.table.Space.Primary;
@@ -994,7 +994,7 @@ internal abstract partial class Collation
         // the letters and 'aB' < 'Ab' on the first case difference, lowercase
         // first, and a ligature carries the case of its letters ('Æ' = 'AE',
         // probed 2026-10-02 against SQL Server 2025).
-        private int CompareWeights(string x, string y)
+        private int CompareWeights(ReadOnlySpan<char> x, ReadOnlySpan<char> y)
         {
             var primary = this.CompareLevel(x, y, Level.Primary);
             if (primary != 0)
@@ -1064,7 +1064,7 @@ internal abstract partial class Collation
         // ref structs over the source strings — no weight lists are
         // allocated, so the common single-pass primary comparison is
         // allocation-free.
-        private int CompareLevel(string x, string y, Level level)
+        private int CompareLevel(ReadOnlySpan<char> x, ReadOnlySpan<char> y, Level level)
         {
             var cx = new WeightCursor(x, this, leadMarks: level == Level.Secondary);
             var cy = new WeightCursor(y, this, leadMarks: level == Level.Secondary);
@@ -1125,7 +1125,7 @@ internal abstract partial class Collation
         // table weighs as its Outsider — its spelling's elements, an accent on
         // the letter before it, or a foreign element of its own. One element
         // per MoveNext.
-        private ref struct WeightCursor(string s, Latin1GeneralTableCollation owner, bool leadMarks = false)
+        private ref struct WeightCursor(ReadOnlySpan<char> s, Latin1GeneralTableCollation owner, bool leadMarks = false)
         {
             // Whether a run of combining marks with no letter to ride on is an
             // element of its own, as it is at the accent level alone.
@@ -1133,7 +1133,7 @@ internal abstract partial class Collation
 
             // The string being read: the cursor's own, or the table text a
             // character past the table weighs as while that is read.
-            private string s = s;
+            private ReadOnlySpan<char> s = s;
 
             private readonly Latin1GeneralTableCollation owner = owner;
 
@@ -1149,7 +1149,9 @@ internal abstract partial class Collation
 
             // While a spelling is read, the string it stands in and the
             // position past its character, read again once the spelling ends.
-            private string? resume;
+            private ReadOnlySpan<char> resume;
+
+            private bool resuming;
 
             private int resumeIndex;
 
@@ -1167,7 +1169,7 @@ internal abstract partial class Collation
 
             private int foreignLength;
 
-            internal readonly ReadOnlySpan<char> ForeignText => this.s.AsSpan(this.foreignStart, this.foreignLength);
+            internal readonly ReadOnlySpan<char> ForeignText => this.s.Slice(this.foreignStart, this.foreignLength);
 
             internal readonly int Weight(Level level) => level switch
             {
@@ -1189,9 +1191,10 @@ internal abstract partial class Collation
                 {
                     if (this.index >= this.s.Length)
                     {
-                        if (this.resume is null)
+                        if (!this.resuming)
                             return Element.End;
-                        (this.s, this.index, this.resume) = (this.resume, this.resumeIndex, null);
+                        this.s = this.resume;
+                        (this.index, this.resuming) = (this.resumeIndex, false);
                         continue;
                     }
 
@@ -1224,7 +1227,11 @@ internal abstract partial class Collation
                                 // The table covers every spelling, so none
                                 // holds a spelling of its own.
                                 if (spelling.Length != 0)
-                                    (this.resume, this.resumeIndex, this.s, this.index) = (this.s, this.index, spelling, 0);
+                                {
+                                    this.resume = this.s;
+                                    this.s = spelling;
+                                    (this.resumeIndex, this.resuming, this.index) = (this.index, true, 0);
+                                }
                                 continue;
                             }
                             // A combining mark with no table letter to ride on
@@ -1292,7 +1299,7 @@ internal abstract partial class Collation
         // a string with fewer or later minimal marks sorts first (absence
         // before presence: 'coop' < 'co-op'), and the raw length difference an
         // expansion leaves behind (e.g. 'ß' vs 'ss') is ignored.
-        private int MinimalWeightTiebreak(string x, string y)
+        private int MinimalWeightTiebreak(ReadOnlySpan<char> x, ReadOnlySpan<char> y)
         {
             var keyX = this.MinimalWeightKey(x);
             var keyY = this.MinimalWeightKey(y);
@@ -1310,7 +1317,7 @@ internal abstract partial class Collation
             return keyX.Count.CompareTo(keyY.Count);
         }
 
-        private List<(int Preceding, int Rank)> MinimalWeightKey(string s)
+        private List<(int Preceding, int Rank)> MinimalWeightKey(ReadOnlySpan<char> s)
         {
             var key = new List<(int, int)>();
             var preceding = 0;
