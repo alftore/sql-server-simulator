@@ -110,25 +110,34 @@ partial class Simulation
             return memo;
         }
 
-        var command = batch.Parser.Command;
+        var command = batch.Command;
         string? declaration;
-        try
+        switch (batch.CachedPlanOrigin)
         {
-            declaration = batch.CachedPlanOrigin switch
-            {
-                CachedPlanOrigin.ClientBatch when command.Parameters.Count != 0 || command.ParameterDeclaration is not null =>
-                    command.ParameterDeclaration ?? SqlClientParameterDeclaration(command.Parameters),
-                CachedPlanOrigin.ExecuteSql when batch.CachedPlanDeclaration is { Length: > 0 } declared => declared,
-                _ => null,
-            };
-        }
-        catch (ArgumentException)
-        {
-            // A parameter whose value maps to no DbType — the simulator's own
-            // commands binding SqlValues, a TVP bound to a reader — has no
-            // declaration SqlClient would send, so its batch keeps no plan.
-            batch.CachedPlanDeclined = true;
-            return null;
+            case CachedPlanOrigin.ClientBatch when command.Parameters.Count != 0 || command.ParameterDeclaration is not null:
+                if (command.ParameterDeclaration is { } sent)
+                {
+                    declaration = sent;
+                }
+                else if (ParameterShapeOf(command) is { } shape)
+                {
+                    declaration = shape.GetDeclaration();
+                }
+                else
+                {
+                    // A parameter whose value maps to no DbType — the simulator's own
+                    // commands binding SqlValues, a TVP bound to a reader — has no
+                    // declaration SqlClient would send, so its batch keeps no plan.
+                    batch.CachedPlanDeclined = true;
+                    return null;
+                }
+                break;
+            case CachedPlanOrigin.ExecuteSql when batch.CachedPlanDeclaration is { Length: > 0 } declared:
+                declaration = declared;
+                break;
+            default:
+                declaration = null;
+                break;
         }
         var kind = declaration is null ? CachedPlanKind.Adhoc : CachedPlanKind.Prepared;
         // A batch carrying a secret is cached under its masked text — one
@@ -201,14 +210,14 @@ partial class Simulation
         if (batch.CachedPlanOrigin == CachedPlanOrigin.None || batch.CachedPlanDeclined || connection.NestingLevel != 0 || IsModuleBody(batch))
             return false;
         var simulation = connection.Simulation;
-        var text = batch.Parser.Command.CommandText;
+        var text = batch.Command.CommandText;
         var start = Math.Clamp(batch.CurrentStatement.StartIndex, 0, text.Length);
         var end = ExtendedEvents.LockReports.StatementEnd(simulation, text, start);
         var through = end < 0 ? text.Length : Math.Min(end + 1, text.Length);
         var database = batch.CachedPlanDatabase ?? batch.CurrentDatabase;
         if (simulation.QueryStoreShapeOf(text.AsSpan(start, through - start).TrimEnd().TrimEnd(';').TrimEnd(), database, parser: null, tokensFrom: null) is not { PreparedText: { } prepared })
             return false;
-        var key = new CachedPlanKey(CachedPlanKind.Prepared, database.Id, 0, prepared, null, SetOptionsOf(connection, batch.Parser.QuotedIdentifiers),
+        var key = new CachedPlanKey(CachedPlanKind.Prepared, database.Id, 0, prepared, null, SetOptionsOf(connection, batch.QuotedIdentifiers),
             connection.Language.LangId, DateFormatCode(connection.DateFormat), connection.DateFirst);
         // A plan of a dropped database whose id the new one took isn't live.
         return simulation.CachedPlans.Find(key) is { } plan && ReferenceEquals(plan.Database, database);
@@ -233,7 +242,7 @@ partial class Simulation
     private static bool SettingsMatch(BatchContext batch, in CachedPlanKey key)
     {
         var connection = batch.Connection;
-        return key.SetOptions == SetOptionsOf(connection, batch.Parser.QuotedIdentifiers)
+        return key.SetOptions == SetOptionsOf(connection, batch.QuotedIdentifiers)
             && key.LanguageId == connection.Language.LangId
             && key.DateFormat == DateFormatCode(connection.DateFormat)
             && key.DateFirst == connection.DateFirst;
@@ -250,7 +259,7 @@ partial class Simulation
     private static CachedPlan GetOrAddBatchPlan(BatchContext batch, CachedPlanKind kind, string text, string? declaration, Database database, int userId, out bool created)
     {
         var connection = batch.Connection;
-        var key = new CachedPlanKey(kind, database.Id, 0, text, declaration, SetOptionsOf(connection, batch.Parser.QuotedIdentifiers),
+        var key = new CachedPlanKey(kind, database.Id, 0, text, declaration, SetOptionsOf(connection, batch.QuotedIdentifiers),
             connection.Language.LangId, DateFormatCode(connection.DateFormat), connection.DateFirst);
         var registry = connection.Simulation.CachedPlans;
         if (registry.Find(key) is { } found)
@@ -262,10 +271,14 @@ partial class Simulation
             }
             // The plan of a dropped, restored-over or detached database whose id
             // this one took is no plan of this one's.
-            registry.Remove(plan => ReferenceEquals(plan, found));
+            RemoveFoundPlan(registry, found);
         }
         var planText = declaration is null ? text : "(" + declaration + ")" + text;
         return registry.Add(new CachedPlan(key, database, planText, module: null, userId, batch.CurrentStatement.UtcNow), out created);
+
+        // Apart from the caller so the closure's capture is allocated only on this branch.
+        static void RemoveFoundPlan(CachedPlanRegistry registry, CachedPlan found) =>
+            registry.Remove(plan => ReferenceEquals(plan, found));
     }
 
     /// <summary>
@@ -348,7 +361,7 @@ partial class Simulation
             // A module's statements sit where its CREATE text has them, and a
             // prepared batch's past its declaration.
             var shift = target.Module is not null ? batch.ModuleBodyOffset()
-                : target.Key.Kind == CachedPlanKind.Prepared ? target.Text!.Length - batch.Parser.Command.CommandText.Length
+                : target.Key.Kind == CachedPlanKind.Prepared ? target.Text!.Length - batch.Command.CommandText.Length
                 : 0;
             startOffset = 2 * (start + shift);
             endOffset = 2 * (end - 1 + shift);

@@ -1050,7 +1050,10 @@ partial class Simulation
                 }
                 compiled = true;
                 this.AttachStatementPlans(innerBatch, dynamicKey);
-                outcomes.AddRange(CompileFailuresSent(innerBatch, inliningFailures));
+                if (inliningFailures is not null)
+                {
+                    outcomes.AddRange(CompileFailuresSent(innerBatch, inliningFailures));
+                }
                 if (compileClock is not null)
                     outcomes.Add(new SimulatedInfoOutcome(CompileTime(innerBatch, compileClock, compileContext?.LastTopLevelStatementLine ?? 0, innerBatch.ErrorProcedureName)));
 

@@ -967,7 +967,7 @@ internal sealed partial class Selection
         // The left side encloses the right for what correlates to it — a
         // `.nodes()` column the right side may read only through a method.
         context.EnclosingScopes.Add(leftSources);
-        var pushedApplyLeft = context.ApplyLeftScopes.Add(leftSources);
+        var pushedApplyLeft = (context.ApplyLeftScopes ??= new(ReferenceEqualityComparer.Instance)).Add(leftSources);
         try
         {
             using (ParserScope.Enter(ref context.AggregateCollector, boundary))
@@ -979,7 +979,7 @@ internal sealed partial class Selection
         {
             context.EnclosingScopes.RemoveAt(context.EnclosingScopes.Count - 1);
             if (pushedApplyLeft)
-                _ = context.ApplyLeftScopes.Remove(leftSources);
+                _ = context.ApplyLeftScopes?.Remove(leftSources);
         }
         foreach (var aggregate in boundary)
         {

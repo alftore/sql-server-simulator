@@ -1,7 +1,6 @@
 using SqlServerSimulator.Parser;
 using SqlServerSimulator.Parser.Tokens;
 using SqlServerSimulator.Storage;
-using System.Data;
 using System.Data.Common;
 using System.Runtime.ExceptionServices;
 
@@ -367,40 +366,15 @@ public sealed partial class Simulation
                 ? new PlanCacheKey(text, currentDb.Name, connection.Security.EffectiveDefaultSchemaName(currentDb), signature, connection.QuotedIdentifiers, connection.DateFormat, connection.AnsiNulls, connection.ConcatNullYieldsNull)
                 : null;
 
-    private static string? BuildPlanCacheParameterSignature(SimulatedDbCommand command)
-    {
-        var parameters = command.Parameters;
-        if (parameters.Count == 0)
-            return "";
-        var sb = new System.Text.StringBuilder();
-        foreach (SimulatedDbParameter p in parameters)
-        {
-            if (sb.Length > 0)
-                _ = sb.Append('|');
-            // DbType is a stable shorthand that already covers the type-
-            // inference dimension parser code reads (string vs numeric vs
-            // temporal); precision / scale / size catch the
-            // decimal(p,s) / varchar(n) variants that bind through the same
-            // DbType. ParameterName is included because the parser resolves
-            // VariableReference by name. The getter raises ArgumentException
-            // for an unmapped CLR Value (the TVP IDataReader binding path is
-            // the live case) — returning null bypasses the cache for this
-            // command, which is the right behavior anyway since structured
-            // parameters carry session-scoped data the cache doesn't model.
-            DbType dbType;
-            try
-            {
-                dbType = p.DbType;
-            }
-            catch (ArgumentException)
-            {
-                return null;
-            }
-            _ = sb.Append(p.ParameterName).Append(':').Append((int)dbType).Append(':')
-                .Append(p.Size).Append(':').Append((int)p.Precision).Append(':').Append((int)p.Scale);
-        }
-        return sb.ToString();
-    }
+    // The shape reads DbType through its getter, which raises ArgumentException
+    // for an unmapped CLR Value (the TVP IDataReader binding path is the live
+    // case); no shape bypasses the cache for this command, which is the right
+    // behavior anyway since structured parameters carry session-scoped data the
+    // cache doesn't model. Name, type, size, precision and scale all fold in
+    // because the parser resolves VariableReference by name and reads the rest
+    // for type inference.
+    private static string? BuildPlanCacheParameterSignature(SimulatedDbCommand command) =>
+        command.Parameters.Count == 0 ? "" : ParameterShapeOf(command)?.Signature;
 
     /// <summary>
     /// What a replayed statement gives back as it ends — the reads it counted,
@@ -434,7 +408,7 @@ public sealed partial class Simulation
     /// </remarks>
     private static IEnumerable<SimulatedStatementOutcome> ReplayCachedSelections(SimulatedDbCommand command, PlanCacheEntry entry, System.Runtime.CompilerServices.StrongBox<bool> stale)
     {
-        var batch = new BatchContext(command)
+        var batch = new BatchContext(command, deferParser: true)
         {
             CachedPlanOrigin = CachedPlanOrigin.ClientBatch,
             CachedPlanDatabase = command.Connection?.CurrentDatabase,

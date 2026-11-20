@@ -94,7 +94,7 @@ partial class Simulation
     private static void EndQueryStoreCapture(
         BatchContext batch, QueryStoreCapture capture, IoStatistics? io, int start, int end, byte executionType, long rowCount, ParserContext.Checkpoint? tokensFrom = null)
     {
-        var commandText = batch.Parser.Command.CommandText;
+        var commandText = batch.Command.CommandText;
         if (start < 0 || end <= start || end > commandText.Length)
             return;
         var connection = batch.Connection;
@@ -108,7 +108,7 @@ partial class Simulation
         {
             // The plan cache alone records the statement, and reads the text
             // Query Store would store for it only as the statement first runs.
-            var shape = connection.Simulation.QueryStoreShapeOf(commandText.AsSpan(start, end - start), capture.Database, batch.Parser, tokensFrom);
+            var shape = connection.Simulation.QueryStoreShapeOf(commandText.AsSpan(start, end - start), capture.Database, tokensFrom is null ? null : batch.Parser, tokensFrom);
             if (IsCapturedShape(batch, shape))
                 RecordCachedPlanStatement(batch, capture.Database, shape, storeKey: null, start, end, tokensFrom, now, elapsed / 10, cpu / 10, reads, rowCount);
             return;
@@ -172,9 +172,9 @@ partial class Simulation
     /// </summary>
     private static QueryStoreQueryKey? QueryStoreKeyOf(BatchContext batch, Database database, int start, int end, ParserContext.Checkpoint? tokensFrom, out QueryStoreShape shape, out long offsetStart, out long offsetEnd)
     {
-        var commandText = batch.Parser.Command.CommandText;
+        var commandText = batch.Command.CommandText;
         var connection = batch.Connection;
-        shape = connection.Simulation.QueryStoreShapeOf(commandText.AsSpan(start, end - start), database, batch.Parser, tokensFrom);
+        shape = connection.Simulation.QueryStoreShapeOf(commandText.AsSpan(start, end - start), database, tokensFrom is null ? null : batch.Parser, tokensFrom);
         offsetStart = offsetEnd = 0;
         if (!IsCapturedShape(batch, shape))
             return null;
@@ -209,7 +209,7 @@ partial class Simulation
                 prefix = VariablePrefix(batch, shape);
             }
             text = prefix is null ? shape.Text : shape.Declared(prefix);
-            parameterizationType = prefix is not null && (batch.ProcFrame is { IsDynamicSql: true } || (connection.NestingLevel == 0 && batch.Parser.Command.Parameters.Count > 0))
+            parameterizationType = prefix is not null && (batch.ProcFrame is { IsDynamicSql: true } || (connection.NestingLevel == 0 && batch.Command.Parameters.Count > 0))
                 ? (byte)1
                 : (byte)0;
             // A module's statements are placed in its CREATE text.
@@ -219,7 +219,7 @@ partial class Simulation
         }
 
         var context = new QueryStoreContextKey(
-            SetOptionsOf(connection, batch.Parser.QuotedIdentifiers),
+            SetOptionsOf(connection, batch.QuotedIdentifiers),
             connection.Language.LangId,
             DateFormatCode(connection.DateFormat),
             connection.DateFirst,
@@ -341,35 +341,83 @@ partial class Simulation
     {
         if (shape.IsConditionOrReturn)
             return null;
-        StringBuilder? prefix = null;
         Dictionary<string, VariableSlot>? asDeclared = null;
+
+        // The last prefix built, which the next execution's parameters are
+        // typically declared as: the same names, spelled alike, of the same
+        // types. Types are interned, so a reference compare is the equality
+        // that gives the same description.
+        var memo = shape.LastPrefix();
+        if (memo is not null)
+        {
+            var resolved = 0;
+            var matches = true;
+            foreach (var name in shape.Variables)
+            {
+                if (!TryResolveVariable(batch, name, ref asDeclared, out var declared, out var slot))
+                    continue;
+                if (resolved == memo.Types.Length
+                    || !ReferenceEquals(memo.Types[resolved], slot.DeclaredType)
+                    || memo.SpelledNumeric[resolved] != slot.SpelledNumeric
+                    || !string.Equals(memo.DeclaredNames[resolved], declared, StringComparison.Ordinal))
+                {
+                    matches = false;
+                    break;
+                }
+                resolved++;
+            }
+            if (matches && resolved == memo.Types.Length)
+                return memo.Prefix;
+        }
+
+        StringBuilder? prefix = null;
+        List<string>? names = null;
+        List<SqlType>? types = null;
+        List<bool>? spelled = null;
         foreach (var name in shape.Variables)
         {
-            // A name spelled as it was declared is found ordinally, under the
-            // key that is its declared spelling; only one spelled otherwise
-            // pays the culture-aware lookup and the search for the key. That
-            // lookup per name was the dominant cost of a statement naming
-            // many parameters, such as EF Core's multi-row INSERT / MERGE,
-            // where an ordinal copy of the variables pays for itself; a
-            // handful are scanned instead.
-            var declared = name;
-            if (!TryFindAsDeclared(batch.Variables, name, ref asDeclared, out var slot))
-            {
-                if (!batch.Variables.TryGetValue(name, out slot))
-                    continue;
-                foreach (var (key, _) in batch.Variables)
-                {
-                    if (BatchContext.VariableNameComparer.Equals(key, name))
-                    {
-                        declared = key;
-                        break;
-                    }
-                }
-            }
+            if (!TryResolveVariable(batch, name, ref asDeclared, out var declared, out var slot))
+                continue;
             prefix = prefix is null ? new StringBuilder("(") : prefix.Append(',');
             _ = prefix.Append('@').Append(declared).Append(' ').Append(DescribeTypeName(slot.DeclaredType, slot.SpelledNumeric));
+            (names ??= []).Add(declared);
+            (types ??= []).Add(slot.DeclaredType);
+            (spelled ??= []).Add(slot.SpelledNumeric);
         }
-        return prefix?.Append(')').ToString();
+        if (prefix is null)
+            return null;
+        var built = prefix.Append(')').ToString();
+        shape.RememberPrefix(new QueryStorePrefix([.. names!], [.. types!], [.. spelled!], built));
+        return built;
+    }
+
+    /// <summary>
+    /// The variable <paramref name="name"/> names, with the spelling it was
+    /// declared under; false for one the batch doesn't hold.
+    /// </summary>
+    private static bool TryResolveVariable(BatchContext batch, string name, ref Dictionary<string, VariableSlot>? asDeclared, out string declared, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out VariableSlot? slot)
+    {
+        // A name spelled as it was declared is found ordinally, under the
+        // key that is its declared spelling; only one spelled otherwise
+        // pays the culture-aware lookup and the search for the key. That
+        // lookup per name was the dominant cost of a statement naming
+        // many parameters, such as EF Core's multi-row INSERT / MERGE,
+        // where an ordinal copy of the variables pays for itself; a
+        // handful are scanned instead.
+        declared = name;
+        if (TryFindAsDeclared(batch.Variables, name, ref asDeclared, out slot))
+            return true;
+        if (!batch.Variables.TryGetValue(name, out slot))
+            return false;
+        foreach (var (key, _) in batch.Variables)
+        {
+            if (BatchContext.VariableNameComparer.Equals(key, name))
+            {
+                declared = key;
+                break;
+            }
+        }
+        return true;
     }
 
     private static bool TryFindAsDeclared(Dictionary<string, VariableSlot> variables, string name, ref Dictionary<string, VariableSlot>? asDeclared, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out VariableSlot? slot)
@@ -546,7 +594,7 @@ partial class Simulation
             return null;
         var connection = batch.Connection;
         var key = new QueryStoreContextKey(
-            SetOptionsOf(connection, batch.Parser.QuotedIdentifiers),
+            SetOptionsOf(connection, batch.QuotedIdentifiers),
             connection.Language.LangId,
             DateFormatCode(connection.DateFormat),
             connection.DateFirst,
@@ -862,6 +910,16 @@ internal sealed class QueryStoreShape
     }
 
     private Tuple<string, string>? lastDeclared;
+
+    /// <summary>
+    /// The variable declaration last built for this statement, which the next
+    /// execution reuses when its variables resolve to the same names and types.
+    /// </summary>
+    public QueryStorePrefix? LastPrefix() => Volatile.Read(ref this.lastPrefix);
+
+    public void RememberPrefix(QueryStorePrefix prefix) => Volatile.Write(ref this.lastPrefix, prefix);
+
+    private QueryStorePrefix? lastPrefix;
 
     /// <summary>An <c>IF</c> / <c>WHILE</c> condition or a <c>RETURN</c>, whose text real stores without a declaration.</summary>
     public readonly bool IsConditionOrReturn;
@@ -1199,4 +1257,18 @@ internal sealed class QueryStoreShape
             return bytes;
         }
     }
+}
+
+/// <summary>
+/// A statement's variable declaration with what it was built from — each
+/// resolved variable's declared spelling, type and whether it spelled a decimal
+/// as numeric — immutable, and holding no session state, so the statement's
+/// shape, which sessions share, can keep it.
+/// </summary>
+internal sealed class QueryStorePrefix(string[] declaredNames, SqlType[] types, bool[] spelledNumeric, string prefix)
+{
+    public readonly string[] DeclaredNames = declaredNames;
+    public readonly SqlType[] Types = types;
+    public readonly bool[] SpelledNumeric = spelledNumeric;
+    public readonly string Prefix = prefix;
 }

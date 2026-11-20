@@ -261,4 +261,31 @@ public class ParameterTests
         p.ResetDbType();
         AreEqual(DbType.Int32, p.DbType);
     }
+
+    // A parameter's variable name is the name without its leading @, kept
+    // between executions and reset by renaming it.
+    [TestMethod]
+    public void RenamedParameter_OfAReusedCommand_BindsItsNewName()
+    {
+        using var connection = new Simulation().CreateOpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = "select @new";
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = "@old";
+        parameter.Value = 5;
+        _ = command.Parameters.Add(parameter);
+
+        AreEqual(137, Throws<SimulatedSqlException>(() => _ = command.ExecuteScalar()).Number);
+        AreEqual(137, Throws<SimulatedSqlException>(() => _ = command.ExecuteScalar()).Number);
+
+        parameter.ParameterName = "new";
+        AreEqual(5, command.ExecuteScalar());
+        AreEqual(5, command.ExecuteScalar());
+
+        parameter.ParameterName = "@new";
+        AreEqual(5, command.ExecuteScalar());
+
+        parameter.ParameterName = "@old";
+        AreEqual(137, Throws<SimulatedSqlException>(() => _ = command.ExecuteScalar()).Number);
+    }
 }

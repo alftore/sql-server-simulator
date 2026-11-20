@@ -74,6 +74,8 @@ Two mechanisms carry it:
 - **Eligibility by counting.** `BatchContext.TopLevelStatementsDispatched` counts what the dispatch loop ran; `PlanCacheSequence` counts what the SELECT arm collected.
   Equal counts at the promotion site mean every statement the batch ran was an admitted SELECT — anything else (a `SET`, a DML write, a `BEGIN…END` block, an `EXEC`) advances the counter without contributing a plan and so declines the whole batch.
   Counting keeps the eligibility rule in one place instead of a decline call in every arm of the dispatch switch.
+- **No parser unless asked.** The replay's `BatchContext` is constructed with `deferParser`, so it builds no `ParserContext` unless a replayed operator reads `batch.Parser` (none of the shapes probed does); Query Store and the cached-plan DMV code read `batch.Command` and `batch.QuotedIdentifiers` instead.
+  The command text and `QUOTED_IDENTIFIER` the parser's construction would have captured are snapshotted when the batch is, so a parser created late parses the text the batch began with, not one set while a reader was open.
   (The loop counts the current statement only after the arm returns, hence the `+ 1` at the comparison.)
 - **End-of-batch by probe.** `IsAtEndOfBatch` walks forward over `;` separators from the parser's lookahead position and restores it, so **a trailing semicolon no longer disqualifies** — which is the difference between a cache that serves an ORM and one that serves only text with no trailing punctuation.
   The probe swallows a tokenizer error rather than raising it: text the tokenizer refuses lying past the separators is not the end of the batch, and reporting it from here would put the error ahead of the result set the statement has already produced.
