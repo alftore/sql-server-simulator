@@ -925,6 +925,28 @@ public sealed class IndexSeekTests
         AreEqual(first, rows[0]);
     }
 
+    // An INSERT of a key above the last one appends its address to the
+    // entry's key order, so an insert followed by an ordered read of the table
+    // doesn't list every key again; one below the last key drops the order,
+    // and a delete of the last address followed by an append starts a new
+    // array, since a reader may still hold the run the delete narrowed.
+    [TestMethod]
+    [DataRow("insert t values (51, 0)", false, 51)]
+    [DataRow("insert t select value, 0 from generate_series(51, 60)", false, 60)]
+    [DataRow("insert t values (0, 0)", true, 50)]
+    [DataRow("delete t where id = 50; insert t values (51, 0)", false, 51)]
+    [DataRow("begin tran; insert t values (51, 0); rollback", false, 50)]
+    public void InsertAboveTheLastKey_KeepsTheKeyOrder(string mutate, bool listsAgain, int first)
+    {
+        var (trace, rows) = WarmMutateProbe(
+            "create table t (id int not null primary key, v int not null); insert t select value, 0 from generate_series(1, 50)",
+            "select top (1) id from t order by id desc",
+            mutate,
+            "select top (1) id from t order by id desc");
+        AreEqual(listsAgain, trace.Contains("KeyOrderBuild"));
+        AreEqual(first, rows[0]);
+    }
+
     // A bounded ordered read walks the entry's sorted keys until the walks
     // since the table's last write have visited as many keys as the entry
     // holds; from then on until a write it cuts its run from the cached key
