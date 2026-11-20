@@ -120,6 +120,21 @@ A failed conversion is never memoized, so Msg 241 still surfaces from the row th
 Like the [LIKE pattern memo](collations.md#the-pattern-compilation-is-memoized-per-node) the entry is immutable and published through `Volatile`, since a cached plan shares the node across sessions.
 `InExpression` doesn't carry one — a list of literals would thrash a single entry.
 
+#### A numeric constant's conversion is memoized too
+
+`WHERE Amount > 50000` over a `decimal(18,2)` column promotes to `decimal(18,2)`, so the literal's `int` was converted once per scanned row, to the same answer each time (`ComparisonType` gives the column's own type, so the literal's conversion was the whole mixed-pair excess; the column side already returns itself).
+`ConstantConversionMemo`, one per `CompareExpression` holding an entry per side, remembers the last conversion of a **constant** operand (`IsRuntimeConstant`: a literal, a parameter or variable, `-5`, `CAST(5 AS bigint)`), so a column side never allocates an entry per row.
+It admits a non-NULL exact, approximate, money or integer source into a numeric target; a string source keeps `StringCoercionMemo`.
+The key is the source's type and the target by reference and the source's payload **by identity** — the `long` primitive and the reference field by `ReferenceEquals` (`SqlValue.HasSamePayload`): an integer, money, float or narrow decimal is its primitive, a decimal wider than a `long` is one immutable box per parameter binding.
+Identity, not value equality, so `-0.0` never folds onto `0.0` and two scales of one number never fold together; the cost is that equal wide decimals bound in two executions miss once.
+It is sound because `CoerceTo`'s numeric branches are a function of the value and the two types alone (no batch, connection or session setting; the `AsyncLocal` date settings are read only by date and string targets).
+The entry is immutable and published whole with `Volatile.Write`, so two concurrent replays of one cached plan with different `` each validate the key against their own value and never read the other's conversion; it holds a value, no batch, so `PlanCacheCaptureAudit` has nothing to find.
+A failed conversion is never stored: Msg 8115 / 232 rise from the same row, as often, as before; the NULL short-circuit, the `sql_variant` path, the LOB refusal and the exact `datetime` order all run ahead of it.
+Debug builds convert again on every power-of-two hit and throw `InvalidOperationException` if the answer or its type differs.
+It does not cover `BETWEEN`, `IN` or quantified comparisons, nor the column side's own conversion where the common type only widens it (a mixed `int` column against a `bigint` or `decimal` constant still converts the column on every row).
+ColBench, 16,000 rows, Release, minimum of three alternating runs (2026-11-20, ±10–20%, bytes unchanged): `Amount > 50000` 3.47 → 1.96 ms (`dec-col`, the same-type pair, is 2.1), `Amount > @p` as `int` 3.70 → 2.21 and as `bigint` 4.01 → 2.67, `Amount > 50000.00` 2.17 → 2.02, `Action = 'Deleted' AND Amount > 50000` 3.68 → 3.29; SimBench's `Scan: equality on unindexed column` (100,000 rows) 26.3 → 24.5 ms with 16,813,220 bytes either way.
+An `int` column against a `bigint` or `decimal` constant is unchanged (3.1 and 3.6 ms against 1.5 for `int` and `int`): the column's conversion is what remains, and a literal converted while binding would not touch it.
+
 The pair's legality check and its comparison type are kept the same way (`TypePairMemo`, one per `CompareExpression`), for the first pair of operand types that passed — keyed by both types' identity, which a column and a literal or variable hold for a whole scan — so later rows skip `SqlType.PairError` and the promotion.
 `COUNT(*)` over 200,000 rows filtered by a `bit`, a `smallint` and a `varchar` column each beside a literal went from 52 to 46 ms (Release, measured 2026-10-26).
 A string `+` keeps the type its operand types concatenate in the same way (`Add.StringPairType`, its collation settled with it), so `',' + name` over a column stops promoting and settling collations per row: `SUM(LEN(fn + ' ' + ln))` over 200,000 rows of a `varchar` and an `nvarchar` column went from 99 to 72 ms (Release, measured 2026-10-26).

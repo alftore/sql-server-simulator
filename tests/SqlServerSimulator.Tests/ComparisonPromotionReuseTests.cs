@@ -143,4 +143,176 @@ public sealed class ComparisonPromotionReuseTests
             return (int)command.ExecuteScalar()!;
         }
     }
+
+    // A numeric constant beside a column of another numeric type converts to the
+    // comparison type once and is reused for every row; these pin that the answers
+    // are the per-row ones, whichever side the constant sits on.
+
+    private const string NumericSeed = """
+        create table n (id int not null primary key, i int null, b bigint null, ti tinyint null,
+                        d decimal(18,2) null, m money null, sm smallmoney null, f float null, flag int null);
+        insert n values
+            (1, 5,          5000000000, 100, 1.50,     1.50,     1.50,         1.5,     0),
+            (2, 500,        6000000000, 200, 500.00,   500.00,   500.00,       500.5,   0),
+            (3, 501,        4000000000, 255, 50000.00, 50000.00, 30000.00,     50000.0, 0),
+            (4, 2000000000, null,       0,   50000.01, 214748.36, 214748.3647, 60000.5, 0),
+            (5, null,       null,       null, null,    null,     null,         null,    0);
+        """;
+
+    private static string NumericIds(string where)
+    {
+        var ids = new List<string>();
+        using var reader = new Simulation().ExecuteReader($"{NumericSeed} select id from n where {where} order by id");
+        while (reader.Read())
+            ids.Add(reader.GetInt32(0).ToString(System.Globalization.CultureInfo.InvariantCulture));
+        return string.Join(',', ids);
+    }
+
+    [TestMethod]
+    public void DecimalColumn_AgainstAnIntLiteral()
+    {
+        AreEqual("3,4", NumericIds("d > 500"));
+        AreEqual("2,3,4", NumericIds("d >= 500"));
+        AreEqual("2", NumericIds("d = 500"));
+        AreEqual("1,2", NumericIds("500 >= d"));
+        AreEqual(NumericIds("d > CAST(500 AS decimal(18,2))"), NumericIds("d > 500"));
+    }
+
+    [TestMethod]
+    public void IntColumn_AgainstABigintLiteral()
+    {
+        AreEqual("1,2,3,4", NumericIds("i < 5000000000"));
+        AreEqual("", NumericIds("i > 5000000000"));
+        AreEqual("2,3,4", NumericIds("5000000000 > i and i >= 500"));
+        AreEqual("1,2,3", NumericIds("b = 5000000000 or i = 501 or i = 500"));
+    }
+
+    [TestMethod]
+    public void IntColumn_AgainstADecimalLiteral()
+    {
+        AreEqual("3,4", NumericIds("i > 500.5"));
+        AreEqual("2", NumericIds("i = 500.0"));
+        AreEqual("", NumericIds("i = 500.5"));
+    }
+
+    [TestMethod]
+    public void TinyintColumn_AgainstAnIntConstant()
+    {
+        // The small-integer widening: a tinyint beside an int constant compares as int,
+        // so a constant past tinyint's range compares rather than overflowing.
+        AreEqual("", NumericIds("ti > 255"));
+        AreEqual("3", NumericIds("ti >= 255"));
+        AreEqual("1,2,3,4", NumericIds("ti < 300"));
+        AreEqual("1,2,3", NumericIds("ti > CAST(0 AS smallint)"));
+    }
+
+    [TestMethod]
+    public void MoneyColumn_AgainstAnIntLiteral()
+    {
+        AreEqual("3,4", NumericIds("m > 500"));
+        AreEqual("3,4", NumericIds("sm > 500"));
+        AreEqual("2", NumericIds("sm = 500"));
+        // A smallmoney beside an integer compares as money, so an int past smallmoney's range compares.
+        AreEqual("1,2,3,4", NumericIds("sm < 2000000000"));
+    }
+
+    [TestMethod]
+    public void FloatColumn_AgainstADecimalLiteral()
+    {
+        AreEqual("2", NumericIds("f = 500.5"));
+        AreEqual("3,4", NumericIds("f > 500.5"));
+        AreEqual("1", NumericIds("f < 1.6"));
+    }
+
+    /// <summary>
+    /// A constant too large for the comparison type raises Msg 8115 from the first row
+    /// that compares a value, as before: never from an empty table, never from a row a
+    /// preceding conjunct rejects, and never from a NULL row.
+    /// </summary>
+    [TestMethod]
+    public void ConstantThatOverflowsTheComparisonType_RaisesOnTheFirstNonNullRow()
+    {
+        const string Huge = "CAST(9000000000000000000 AS bigint)";
+        const string Create = "create table o (id int not null primary key, sm smallmoney null, flag int null);";
+
+        // (a) an empty table raises nothing.
+        AreEqual(0, new Simulation().ExecuteScalar<int>($"{Create} select count(*) from o where sm > {Huge}"));
+
+        // (b) NULL rows first, then one value.
+        var simulation = new Simulation();
+        _ = simulation.ExecuteNonQuery($"{Create} insert o values (1, null, 1), (2, null, 1), (3, 5, 1)");
+        _ = simulation.AssertSqlError($"select count(*) from o where sm > {Huge}", 8115);
+        AreEqual(0, simulation.ExecuteScalar<int>($"select count(*) from o where id < 3 and sm > {Huge}"));
+
+        // (c) a conjunct that rejects every row keeps the constant from being compared.
+        AreEqual(0, simulation.ExecuteScalar<int>($"select count(*) from o where flag = 0 and sm > {Huge}"));
+    }
+
+    [TestMethod]
+    public void ParameterThatOverflowsTheComparisonType_RaisesOnTheFirstNonNullRow()
+    {
+        const long Huge = 9_000_000_000_000_000_000L;
+        var simulation = new Simulation();
+        _ = simulation.ExecuteNonQuery("create table o (id int not null primary key, sm smallmoney null, flag int null)");
+        using var connection = simulation.CreateOpenConnection();
+
+        using (var empty = connection.CreateCommand("select count(*) from o where sm > @p", ("@p", Huge)))
+            AreEqual(0, (int)empty.ExecuteScalar()!);
+
+        _ = simulation.ExecuteNonQuery("insert o values (1, null, 1), (2, null, 1), (3, 5, 1)");
+        using (var nonNull = connection.CreateCommand("select count(*) from o where sm > @p", ("@p", Huge)))
+        {
+            var error = ThrowsExactly<SimulatedSqlException>(nonNull.ExecuteScalar);
+            AreEqual(8115, error.Number);
+        }
+
+        using (var rejected = connection.CreateCommand("select count(*) from o where flag = 0 and sm > @p", ("@p", Huge)))
+            AreEqual(0, (int)rejected.ExecuteScalar()!);
+
+        // The same text with a value that fits converts fine, after the failure.
+        using var fits = connection.CreateCommand("select count(*) from o where sm > @p", ("@p", 4L));
+        AreEqual(1, (int)fits.ExecuteScalar()!);
+    }
+
+    /// <summary>
+    /// The numeric twin of the string case above: a cached plan re-run with a
+    /// different <c>bigint</c> parameter converts the new value, and going back
+    /// converts the old one again.
+    /// </summary>
+    [TestMethod]
+    public void CachedPlan_ReRunWithADifferentNumericParameter_FiltersOnTheNewOne()
+    {
+        var simulation = new Simulation();
+        _ = simulation.ExecuteNonQuery(NumericSeed);
+        using var connection = simulation.CreateOpenConnection();
+        AreEqual(2, Above(connection, 500L));
+        AreEqual(0, Above(connection, 5_000_000_000L));
+        AreEqual(3, Above(connection, 5L));
+        AreEqual(2, Above(connection, 500L));
+        AreEqual(1, Above(connection, 501L));
+
+        static int Above(DbConnection connection, long bound)
+        {
+            using var command = connection.CreateCommand("select count(*) from n where i > @p", ("@p", bound));
+            return (int)command.ExecuteScalar()!;
+        }
+    }
+
+    [TestMethod]
+    public void CachedPlan_ReRunWithADifferentDecimalParameter_FiltersOnTheNewOne()
+    {
+        var simulation = new Simulation();
+        _ = simulation.ExecuteNonQuery(NumericSeed);
+        using var connection = simulation.CreateOpenConnection();
+        AreEqual(2, Above(connection, 500.00m));
+        AreEqual(1, Above(connection, 50000.00m));
+        AreEqual(2, Above(connection, 500.00m));
+        AreEqual(4, Above(connection, 1.00m));
+
+        static int Above(DbConnection connection, decimal bound)
+        {
+            using var command = connection.CreateCommand("select count(*) from n where d > @p", ("@p", bound));
+            return (int)command.ExecuteScalar()!;
+        }
+    }
 }

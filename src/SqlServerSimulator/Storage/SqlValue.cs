@@ -1120,6 +1120,15 @@ internal readonly partial struct SqlValue : IEquatable<SqlValue>, IComparable<Sq
             ? this.IdentityPrimitive == other.IdentityPrimitive
             : EqualsSlow(other);
 
+    /// <summary>
+    /// Whether the two values are one payload: the same type instance, the same
+    /// primitive and the same reference <em>instance</em>, NULL or not. Identity,
+    /// never value equality, so no two distinct numbers, scales or zeros fold
+    /// together; what <see cref="ConstantConversionMemo"/> keys on.
+    /// </summary>
+    internal bool HasSamePayload(in SqlValue other) =>
+        ReferenceEquals(this.Type, other.Type) && this.primitive == other.primitive && ReferenceEquals(this.reference, other.reference) && this.IsNull == other.IsNull;
+
     private bool EqualsSlow(SqlValue other) =>
         (this.Type == other.Type || IsLengthOnlyBinaryVariance(this.Type, other.Type))
         && this.IsNull == other.IsNull
