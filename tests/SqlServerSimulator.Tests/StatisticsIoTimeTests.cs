@@ -330,4 +330,16 @@ public sealed partial class StatisticsIoTimeTests
             insert @o exec('dbcc useroptions');
             select count(*) from @o where o in ('statistics io', 'statistics time')
             """));
+
+    /// <summary>
+    /// A whole-table <c>COUNT(*)</c> that can be answered without reading a
+    /// row still reports the scan it stands for.
+    /// </summary>
+    [TestMethod]
+    public void Io_CountStarOfAWholeTable_ReportsItsScan()
+    {
+        using var connection = Open("create table t (id int primary key, v int); insert t values (1, 1), (2, 2), (3, 3); create table h (x int); insert h values (1), (2); set statistics io on");
+        AreSame(["3", Io(1, "t", 1, 1)], Run(connection, "select count(*) from t"));
+        AreSame(["2", Io(1, "h", 1, 1)], Run(connection, "select count_big(*) from h"));
+    }
 }

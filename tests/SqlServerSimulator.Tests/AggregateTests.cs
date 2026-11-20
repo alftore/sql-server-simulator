@@ -899,4 +899,105 @@ public sealed class AggregateTests
         => AreEqual(state, new Simulation().AssertSqlError($"""
             select string_agg(v, {separator}) from (values (replicate({unit}, 3000)), (replicate({unit}, 3000)), (replicate({unit}, 3000))) t(v)
             """, 9829).State);
+
+    private static void AssertWholeTableCount(DbConnection connection, int expected)
+    {
+        AreEqual(expected, connection.CreateCommand("select count(*) from t").ExecuteScalar());
+        AreEqual((long)expected, connection.CreateCommand("select count_big(*) from t").ExecuteScalar());
+        AreEqual(expected, connection.CreateCommand("select count(1) from t").ExecuteScalar());
+        // A WHERE keeps the rows read, so this is the count the scan gives.
+        AreEqual(expected, connection.CreateCommand("select count(*) from t where a >= -1").ExecuteScalar());
+    }
+
+    /// <summary>
+    /// A <c>COUNT(*)</c> over a whole table is answered from the heap's live
+    /// row count, which has to be the scan's answer after every write that
+    /// moves a slot: inserts, deletes, a rolled-back delete, updates growing a
+    /// row past its page (forwarded rows), <c>TRUNCATE</c>, and an empty table.
+    /// </summary>
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public void CountStar_WholeTable_EqualsTheScanAfterEveryKindOfWrite(bool clustered)
+    {
+        using var connection = new Simulation().CreateOpenConnection();
+        _ = connection.CreateCommand($"create table t (id int not null{(clustered ? " primary key" : "")}, a int not null, pad varchar(4000) not null)").ExecuteNonQuery();
+        AssertWholeTableCount(connection, 0);
+
+        _ = connection.CreateCommand("insert t select value, value, replicate('x', 100) from generate_series(1, 300)").ExecuteNonQuery();
+        AssertWholeTableCount(connection, 300);
+
+        _ = connection.CreateCommand("delete t where id % 3 = 0").ExecuteNonQuery();
+        AssertWholeTableCount(connection, 200);
+
+        _ = connection.CreateCommand("update t set pad = replicate('y', 3000) where id % 5 = 0").ExecuteNonQuery();
+        AssertWholeTableCount(connection, 200);
+
+        _ = connection.CreateCommand("insert t select value, value, replicate('x', 100) from generate_series(301, 350)").ExecuteNonQuery();
+        AssertWholeTableCount(connection, 250);
+
+        _ = connection.CreateCommand("delete t where id <= 120").ExecuteNonQuery();
+        AssertWholeTableCount(connection, 170);
+
+        _ = connection.CreateCommand("begin tran; delete t; rollback").ExecuteNonQuery();
+        AssertWholeTableCount(connection, 170);
+
+        _ = connection.CreateCommand("begin tran; insert t values (1000, 1000, 'z'); rollback").ExecuteNonQuery();
+        AssertWholeTableCount(connection, 170);
+
+        _ = connection.CreateCommand("delete t").ExecuteNonQuery();
+        AssertWholeTableCount(connection, 0);
+
+        _ = connection.CreateCommand("insert t select value, value, replicate('x', 100) from generate_series(1, 200); truncate table t").ExecuteNonQuery();
+        AssertWholeTableCount(connection, 0);
+
+        _ = connection.CreateCommand("insert t values (1, 1, 'a'), (2, 2, 'b'); begin tran; truncate table t; rollback").ExecuteNonQuery();
+        AssertWholeTableCount(connection, 2);
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public void CountStar_WholeTable_BesideOtherAggregatesAndConstants(bool clustered)
+    {
+        using var connection = new Simulation().CreateOpenConnection();
+        _ = connection.CreateCommand($"create table t (id int not null{(clustered ? " primary key" : "")}, a int not null)").ExecuteNonQuery();
+        _ = connection.CreateCommand("insert t values (1, 10), (2, 20), (3, 30)").ExecuteNonQuery();
+        using var reader = connection.CreateCommand("select count(*), count_big(*), 7, count(*) + 1, sum(a), count(a) from t").ExecuteReader();
+        IsTrue(reader.Read());
+        AreEqual("3|3|7|4|60|3", string.Join("|", Enumerable.Range(0, reader.FieldCount).Select(reader.GetValue)));
+        IsFalse(reader.Read());
+    }
+
+    /// <summary>
+    /// The session's own uncommitted writes are read by its own count, which
+    /// keeps the scan for them rather than the heap's slots.
+    /// </summary>
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public void CountStar_InsideATransaction_CountsTheSessionsOwnWrites(bool clustered)
+    {
+        using var connection = new Simulation().CreateOpenConnection();
+        _ = connection.CreateCommand($"create table t (id int not null{(clustered ? " primary key" : "")}, a int not null); insert t values (1, 1), (2, 2), (3, 3)").ExecuteNonQuery();
+        _ = connection.CreateCommand("begin tran; insert t values (4, 4), (5, 5)").ExecuteNonQuery();
+        AssertWholeTableCount(connection, 5);
+        _ = connection.CreateCommand("delete t where id in (1, 4, 5)").ExecuteNonQuery();
+        AssertWholeTableCount(connection, 2);
+        _ = connection.CreateCommand("rollback").ExecuteNonQuery();
+        AssertWholeTableCount(connection, 3);
+    }
+
+    /// <summary>
+    /// The count keeps its result type: <c>int</c> for <c>COUNT</c>, <c>bigint</c>
+    /// for <c>COUNT_BIG</c>, which the aggregator the scan feeds gives it.
+    /// </summary>
+    [TestMethod]
+    public void CountStar_WholeTable_StillTypesItsResult()
+    {
+        using var connection = new Simulation().CreateOpenConnection();
+        _ = connection.CreateCommand("create table t (a int not null); insert t values (1), (2)").ExecuteNonQuery();
+        AreEqual(typeof(int), connection.CreateCommand("select count(*) from t").ExecuteScalar()!.GetType());
+        AreEqual(typeof(long), connection.CreateCommand("select count_big(*) from t").ExecuteScalar()!.GetType());
+    }
 }

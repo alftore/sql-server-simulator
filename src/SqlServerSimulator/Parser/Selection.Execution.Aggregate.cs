@@ -114,7 +114,13 @@ internal sealed partial class Selection
         var indexEnds = fromClause.GroupingSets.Count == 0 && fromClause.GroupByAllFilter is null && windows.Count == 0
             ? TryReadIndexEnds(sources, joins, fromClause.Excluders, aggregates, batch, outerResolver)
             : null;
-        if (indexEnds is null)
+
+        // A COUNT(*) over a whole table is the heap's live row count
+        // (TryCountLiveRows), which likewise reads no row.
+        var liveRows = indexEnds is null && fromClause.GroupingSets.Count == 0 && fromClause.GroupByAllFilter is null && windows.Count == 0
+            ? TryCountLiveRows(sources, joins, fromClause, aggregates, batch)
+            : null;
+        if (indexEnds is null && liveRows is null)
         {
             sources = MaybeApplyIndexSeek(sources, joins, fromClause.Excluders, batch, outerResolver, where: true);
             (sources, joins) = NarrowJoinSources(sources, joins, fromClause.Excluders, batch, outerResolver);
@@ -183,7 +189,7 @@ internal sealed partial class Selection
         var groupedAnyRow = false;
         try
         {
-            foreach (var tuple in indexEnds is null ? EnumerateJoinedRows(sources, joins, batch, outerResolver) : [])
+            foreach (var tuple in indexEnds is null && liveRows is null ? EnumerateJoinedRows(sources, joins, batch, outerResolver) : [])
             {
                 var rowOrdinal = enumeratedRows++;
                 if (parallel is not null)
@@ -262,6 +268,11 @@ internal sealed partial class Selection
             {
                 if (indexEnds[i] is { } end)
                     ungroupedState!.Aggregators[i].Add(end);
+            }
+            for (var i = 0; liveRows is { } counted && i < aggregates.Count; i++)
+            {
+                if (!aggregates[i].OperandUnreachable && !aggregates[i].ResultUnread)
+                    ((Aggregators.CountAggregator)ungroupedState!.Aggregators[i]).AddRows(counted);
             }
         }
         catch (SimulatedSqlException accumulationError) when (parallel is null)

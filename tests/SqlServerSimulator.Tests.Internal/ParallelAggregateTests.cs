@@ -169,10 +169,10 @@ public sealed class ParallelAggregateTests
     }
 
     [TestMethod]
-    [DataRow("select count(*) from t")]
+    [DataRow("select count(*), count(measure) from t")]
     [DataRow("select count(measure) from t")]
     [DataRow("select count(distinct measure) from t")]
-    [DataRow("select count_big(*) from t")]
+    [DataRow("select count_big(*), count(measure) from t")]
     [DataRow("select approx_count_distinct(measure) from t")]
     [DataRow("select sum(measure) from t")]
     [DataRow("select sum(distinct measure) from t")]

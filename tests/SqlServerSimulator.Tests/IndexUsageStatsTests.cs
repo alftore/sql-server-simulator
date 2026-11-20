@@ -191,4 +191,29 @@ public sealed class IndexUsageStatsTests
         IsTrue(schema[1].AllowDBNull);
         IsFalse(schema[2].AllowDBNull);
     }
+
+    /// <summary>
+    /// A whole-table <c>COUNT(*)</c>, which the table's live row count can
+    /// answer without reading a row, counts as the scan of the base index it
+    /// stands for, as the read of every row does.
+    /// </summary>
+    [TestMethod]
+    public void CountStarOfAWholeTable_IsAScanOfTheBaseIndex()
+    {
+        var counted = new Simulation();
+        var scanned = new Simulation();
+        foreach (var sim in new[] { counted, scanned })
+            _ = sim.ExecuteNonQuery(Schema + "insert t values (1, 10, 100, 'a'), (2, 20, 200, 'b')");
+        _ = counted.ExecuteNonQuery("select count(*) from t");
+        _ = counted.ExecuteNonQuery("select count_big(*) from t");
+        _ = scanned.ExecuteNonQuery("select * from t");
+        _ = scanned.ExecuteNonQuery("select * from t");
+        AreEqual("0/2/0/1", Usage(counted, "pk_t"));
+        foreach (var index in new[] { "pk_t", "ix_a", "ix_b" })
+        {
+            AreEqual(Usage(scanned, index), Usage(counted, index), index);
+            AreEqual(Operations(scanned, index), Operations(counted, index), index);
+        }
+        IsFalse(counted.ExecuteScalar("select last_user_scan from sys.dm_db_index_usage_stats where database_id = db_id() and index_id = 1") is DBNull);
+    }
 }
