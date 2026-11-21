@@ -1219,8 +1219,20 @@ internal sealed partial class Selection
             }
         }
 
+        /// <summary>
+        /// Whether <paramref name="write"/> left the columns <paramref name="ordinals"/>
+        /// as they were. A column either image stores off-row counts as
+        /// changed: the images are decoded at a later fetch, after the chains
+        /// they name may have been given up at commit and reused by another
+        /// value — possibly the very value the comparison would then match.
+        /// </summary>
         private static bool Unchanged(HeapTable table, Heap.SeekJournalEvent write, int[] ordinals)
         {
+            if (RowDecoder.StoresOffRow(table.StoredColumns, write.OldImage!, ordinals)
+                || RowDecoder.StoresOffRow(table.StoredColumns, write.NewImage!, ordinals))
+            {
+                return false;
+            }
             foreach (var ordinal in ordinals)
             {
                 if (!RowDecoder.DecodeColumn(table.StoredColumns, write.OldImage!, ordinal, table.Heap)
