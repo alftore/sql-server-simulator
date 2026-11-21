@@ -1,5 +1,4 @@
 using SqlServerSimulator.Storage;
-using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 
 namespace SqlServerSimulator.Parser;
@@ -282,7 +281,7 @@ internal sealed partial class BatchContext
     /// Server 2025: <c>LCK_M_S</c> on a key, however the session reads). A
     /// name an object answers to waits on that object's Sch-S instead.
     /// </summary>
-    public void AwaitDefinitionName(ConcurrentDictionary<string, DefinitionLock> registry, string leaf)
+    public void AwaitDefinitionName(CountedDictionary<string, DefinitionLock> registry, string leaf)
     {
         if (registry.IsEmptyLockFree() || !registry.TryGetValue(leaf, out var nameLock))
             return;

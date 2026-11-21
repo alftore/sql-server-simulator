@@ -93,7 +93,7 @@ internal readonly struct CachedPlanKey(CachedPlanKind kind, short databaseId, in
 
     public override bool Equals(object? obj) => obj is CachedPlanKey other && this.Equals(other);
 
-    public override int GetHashCode() => HashCode.Combine(this.Kind, this.DatabaseId, this.ObjectId, this.Text, this.Declaration, this.SetOptions, this.DateFormat, this.DateFirst);
+    public override int GetHashCode() => HashCode.Combine(this.Kind, this.DatabaseId, this.ObjectId, TextHash.Of(this.Text), this.Declaration, this.SetOptions, this.DateFormat, this.DateFirst);
 }
 
 /// <summary>

@@ -1025,7 +1025,7 @@ internal sealed class HeapTable : SchemaObject
     /// every deleted one (probed 2026-09-26 against SQL Server 2025). An
     /// entry retires with the release of its row X.
     /// </summary>
-    public readonly ConcurrentDictionary<SessionToken, ConcurrentDictionary<(int PageIndex, int SlotIndex), (byte[] Image, LockResource Lock)>> SupersededKeyImages;
+    public readonly CountedDictionary<SessionToken, ConcurrentDictionary<(int PageIndex, int SlotIndex), (byte[] Image, LockResource Lock)>> SupersededKeyImages;
 
     /// <summary>
     /// Drops <paramref name="resource"/>, the lock of the row at

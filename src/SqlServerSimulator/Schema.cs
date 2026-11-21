@@ -212,13 +212,13 @@ internal sealed class Schema
     /// create, alter, drop or rename holds, each while it is held (see
     /// <see cref="DefinitionLock"/>); empty while no change is pending.
     /// </summary>
-    public readonly ConcurrentDictionary<string, DefinitionLock> DefinitionLocks;
+    public readonly CountedDictionary<string, DefinitionLock> DefinitionLocks;
 
     /// <summary>
     /// <see cref="DefinitionLocks"/> for the type namespace — table types and
     /// alias types, whose names real keeps apart from the objects'.
     /// </summary>
-    public readonly ConcurrentDictionary<string, DefinitionLock> TypeDefinitionLocks;
+    public readonly CountedDictionary<string, DefinitionLock> TypeDefinitionLocks;
 
     /// <summary>
     /// Yields every <see cref="SchemaObject"/> in this schema's

@@ -235,5 +235,5 @@ internal readonly struct TokenMemoKey(string commandText, Collation collation, C
     public override bool Equals(object? obj) => obj is TokenMemoKey other && this.Equals(other);
 
     public override int GetHashCode() =>
-        HashCode.Combine(this.CommandText, this.Collation, this.CompatibilityLevel, this.QuotedIdentifiers);
+        HashCode.Combine(TextHash.Of(this.CommandText), this.Collation, this.CompatibilityLevel, this.QuotedIdentifiers);
 }

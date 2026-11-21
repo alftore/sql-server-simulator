@@ -1,5 +1,3 @@
-using System.Collections.Concurrent;
-
 namespace SqlServerSimulator.Storage;
 
 /// <summary>
@@ -25,7 +23,7 @@ internal sealed class DefinitionLock
     public readonly LockResource Resource;
 
     /// <summary>The schema's registry of names a change holds, which holds this lock under <see cref="Name"/> while it is held.</summary>
-    public readonly ConcurrentDictionary<string, DefinitionLock> Registry;
+    public readonly CountedDictionary<string, DefinitionLock> Registry;
 
     public readonly string Name;
 
@@ -46,7 +44,7 @@ internal sealed class DefinitionLock
 
     private readonly Lock gate = new();
 
-    public DefinitionLock(ConcurrentDictionary<string, DefinitionLock> registry, string name)
+    public DefinitionLock(CountedDictionary<string, DefinitionLock> registry, string name)
     {
         this.Registry = registry;
         this.Name = name;

@@ -874,7 +874,7 @@ public sealed class SimulatedDbTransaction : DbTransaction
         foreach (var table in tables)
         {
             if (table.SupersededKeyImages.TryRemove(from, out var images))
-                table.SupersededKeyImages[to] = images;
+                table.SupersededKeyImages.Set(to, images);
         }
         foreach (var entry in this.PendingVersionEntries)
         {
