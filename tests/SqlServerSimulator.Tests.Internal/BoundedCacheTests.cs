@@ -127,4 +127,41 @@ public sealed class BoundedCacheTests
         IsGreaterThan(0L, cache.Evictions);
         IsLessThanOrEqualTo(32 + Threads, cache.Count);
     }
+
+    [TestMethod]
+    public void OversubscribedInserts_NeverLeaveTheCacheOverItsBound()
+    {
+        // More threads than cores, so a sweeping thread is preempted while
+        // the others insert past it and leave it their overshoot. A sweep
+        // that gave up after a few rounds still over the bound left it there
+        // for good once every key was in: lookups alone never sweep.
+        const int Keys = 400;
+        var threads = Environment.ProcessorCount * 4;
+        var cancellation = this.TestContext.CancellationToken;
+        for (var run = 0; run < 100; run++)
+        {
+            var cache = new BoundedCache<int, string>(32);
+            using var start = new Barrier(threads);
+            var workers = new Thread[threads];
+            for (var t = 0; t < threads; t++)
+            {
+                var seed = (run * threads) + t;
+                workers[t] = new Thread(() =>
+                {
+                    var random = new Random(seed);
+                    start.SignalAndWait(cancellation);
+                    for (var i = 0; i < 4_000; i++)
+                    {
+                        var key = random.Next(Keys);
+                        if (!cache.TryGetValue(key, out _))
+                            _ = cache.TryAdd(key, "v");
+                    }
+                });
+                workers[t].Start();
+            }
+            foreach (var worker in workers)
+                worker.Join();
+            IsLessThanOrEqualTo(32 + threads, cache.Count, $"run {run}");
+        }
+    }
 }
