@@ -21,6 +21,11 @@ internal sealed class RunParseScope
     /// <summary>The statistics the parse deferred (<see cref="BatchContext.DeferredStatistics"/>), taken as it left.</summary>
     public List<(HeapTable Table, int Ordinal)>? Statistics;
 
+#if DEBUG
+    /// <summary>Whether a write's split point declined its plan, turning the attempt away there (see <c>Simulation.WalkSplitDeclines</c>).</summary>
+    public bool DeclinedAtSplit;
+#endif
+
     public RunParseScope(BatchContext walk)
     {
         (this.skips, this.createTime, this.compiling, this.scoped, this.gathered) =

@@ -349,6 +349,7 @@ An `IF`'s condition resets it to 0 for the branch it chooses, whatever the condi
 The split sits where the interleaved statement already stopped reading: `UPDATE` and `DELETE` start their execution with the permission checks and the SERIALIZABLE fence, and `INSERT` with evaluating the tuples, ahead of the checks real makes once the source is read (auto-generated columns, identity, ragged tuples), so no error changes place.
 Two session reads moved across it — `IDENTITY_INSERT` and whether an `INSTEAD OF INSERT` trigger is enabled are read as the `INSERT` runs rather than as it parses — and neither raises.
 An `INSERT` reading a `SELECT`, `EXEC` or `DEFAULT VALUES` source reads it as it parses and then writes through the same `InsertRows`.
+A batch's first compile parses a plain write as far as this split for the run — a client `OUTPUT` clause included, on a table with no trigger — and its run replays that parse ([`plan-cache.md`](plan-cache.md#the-compile-walk-against-the-run)).
 
 ## INSERT … SELECT
 `INSERT [INTO] target [(cols)] SELECT …` accepts the full Selection grammar — WHERE/JOIN/GROUP BY/aggregates/ORDER BY/TOP/OFFSET-FETCH/UNION/INTERSECT/EXCEPT all work source-side.

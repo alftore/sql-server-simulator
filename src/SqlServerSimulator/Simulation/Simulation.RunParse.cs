@@ -93,6 +93,34 @@ partial class Simulation
     /// point parses the walk's way instead, by <paramref name="parse"/>, from
     /// where it began.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A split point that declines the plan turns the attempt away the same
+    /// way — <see cref="NoteDmlPlan"/> throws <see cref="RunParseDeclinedException"/>
+    /// ahead of the execution half — so nothing of the statement runs under
+    /// the attempt. The declines the pre-scan's shapes can still reach: a
+    /// target whose writes check the session's SET options (an indexed view,
+    /// a filtered index, a persisted computed column), an <c>UPDATE</c>
+    /// assigning a variable, a FROM-less subquery whose values the parse
+    /// settles, an <c>XACT_STATE()</c> call, and a trigger another session
+    /// creates on the target between the pre-scan and the split point of a
+    /// write with a client <c>OUTPUT</c> clause. A Debug build counts them by
+    /// statement kind (<c>WalkSplitDeclines</c>).
+    /// </para>
+    /// <para>
+    /// A client <c>OUTPUT</c> clause (one with no <c>INTO</c>) parses as the
+    /// run's own parse does: its items bind <c>INSERTED</c> / <c>DELETED</c>
+    /// to the target's columns alone; they take no lock, check no permission
+    /// (the execution half checks <c>SELECT</c> on the columns they read),
+    /// load no statistic and send nothing; a masked column among them carries
+    /// its mask as a definition, applied for the executing principal as the
+    /// rows go out; and the rows a streaming reader takes start in the
+    /// execution half. Over a table with a trigger, enabled or not, the
+    /// statement isn't attempted: the parse settles Msg 334 from the
+    /// triggers' enabled state, which no schema change records, so the plan
+    /// declines it (<see cref="BlocksDmlPlan"/>).
+    /// </para>
+    /// </remarks>
     private SimulatedStatementOutcome ParseWriteForRun(ParserContext context, Func<ParserContext, SimulatedStatementOutcome> parse)
     {
         var walk = context.Batch;
@@ -101,8 +129,9 @@ partial class Simulation
         // away as its parse resolved it.
         if (walk.CompiledFor is not { PlanCacheKey: { } key, CachedPlanOrigin: CachedPlanOrigin.ClientBatch } running
             || !ParsesForRunUnder(walk, key)
-            || PlainWriteTarget(context.MemoizedTokensAhead()) is not { } target
-            || !walk.TryResolveSchema(target, out var schema) || !schema.HeapTables.ContainsKey(target.Leaf))
+            || PlainWriteTarget(context.MemoizedTokensAhead(), out var clientOutput) is not { } target
+            || !walk.TryResolveSchema(target, out var schema) || !schema.HeapTables.TryGetValue(target.Leaf, out var table)
+            || (clientOutput && TableHasAnyTrigger(walk, table)))
         {
             return RunMutation(context, parse);
         }
@@ -135,6 +164,8 @@ partial class Simulation
 #if DEBUG
             EndPrincipalWatch(recording);
             RunParseAudit.Verify(walk, before);
+            if (scope.DeclinedAtSplit)
+                _ = this.WalkSplitDeclines.AddOrUpdate(((ReservedKeyword)start.Token!).Keyword, 1, static (_, count) => count + 1);
 #endif
             return RunMutation(context, parse);
         }
@@ -244,20 +275,25 @@ partial class Simulation
     /// sends what a compile sends or touches what belongs to the session.
     /// </summary>
     private static bool ReadsAsPlainQuery(ReadOnlySpan<Token> tokens) =>
-        tokens is [ReservedKeyword { Keyword: Keyword.Select }, ..] && ReadsAsPlainClauses(tokens, 0, writes: false, out var readsFrom) && readsFrom;
+        tokens is [ReservedKeyword { Keyword: Keyword.Select }, ..] && ReadsAsPlainClauses(tokens, 0, writes: false, out var readsFrom, out _) && readsFrom;
 
     /// <summary>
     /// The table or view the statement <paramref name="tokens"/> open with
     /// writes, named by one or two parts, when it writes it with no
-    /// <c>TOP</c>, hint, <c>OUTPUT</c> clause or <c>FROM</c> clause of its
+    /// <c>TOP</c>, hint, <c>OUTPUT … INTO</c> or <c>FROM</c> clause of its
     /// own: an <c>INSERT</c> of a column list's <c>VALUES</c>, plain query or
     /// <c>DEFAULT VALUES</c>, an <c>UPDATE</c>'s <c>SET</c> list and filter,
     /// or a <c>DELETE</c>'s filter — each read as a plain query's clauses
-    /// (<see cref="ReadsAsPlainQuery"/>), a <c>DEFAULT</c> among them. Null
-    /// for any other statement.
+    /// (<see cref="ReadsAsPlainQuery"/>), a <c>DEFAULT</c> among them — with
+    /// at most a client <c>OUTPUT</c> clause read the same way where the verb
+    /// takes one, which <paramref name="clientOutput"/> answers: an
+    /// <c>INSERT</c>'s ahead of its source, an <c>UPDATE</c>'s after its
+    /// <c>SET</c> list and a <c>DELETE</c>'s after its target, either ahead
+    /// of its filter. Null for any other statement.
     /// </summary>
-    private static MultiPartName? PlainWriteTarget(ReadOnlySpan<Token> tokens)
+    private static MultiPartName? PlainWriteTarget(ReadOnlySpan<Token> tokens, out bool clientOutput)
     {
+        clientOutput = false;
         if (tokens is not [ReservedKeyword { Keyword: Keyword.Insert or Keyword.Update or Keyword.Delete } verb, ..])
             return null;
         var at = 1;
@@ -290,20 +326,59 @@ partial class Simulation
                 return null;
             at++;
         }
+        if (verb.Keyword == Keyword.Insert && at < tokens.Length && tokens[at] is UnquotedString { ContextualKeyword: ContextualKeyword.Output })
+        {
+            if (ClientOutputEnd(tokens, at) is not (> 0 and var source))
+                return null;
+            clientOutput = true;
+            at = source;
+        }
         var plain = verb.Keyword switch
         {
             Keyword.Insert => at < tokens.Length && tokens[at] switch
             {
-                ReservedKeyword { Keyword: Keyword.Values } => ReadsAsPlainClauses(tokens, at + 1, writes: true, out _),
-                ReservedKeyword { Keyword: Keyword.Select } => ReadsAsPlainClauses(tokens, at, writes: false, out var readsFrom) && readsFrom,
+                ReservedKeyword { Keyword: Keyword.Values } => ReadsAsPlainClauses(tokens, at + 1, writes: true, out _, out _),
+                ReservedKeyword { Keyword: Keyword.Select } => ReadsAsPlainClauses(tokens, at, writes: false, out var readsFrom, out _) && readsFrom,
                 ReservedKeyword { Keyword: Keyword.Default } => at + 1 < tokens.Length && tokens[at + 1] is ReservedKeyword { Keyword: Keyword.Values }
-                    && ReadsAsPlainClauses(tokens, at + 2, writes: true, out _),
+                    && ReadsAsPlainClauses(tokens, at + 2, writes: true, out _, out _),
                 _ => false,
             },
-            Keyword.Update => at < tokens.Length && tokens[at] is ReservedKeyword { Keyword: Keyword.Set } && ReadsAsPlainClauses(tokens, at + 1, writes: true, out _),
-            _ => ReadsAsPlainClauses(tokens, at, writes: true, out _),
+            Keyword.Update => at < tokens.Length && tokens[at] is ReservedKeyword { Keyword: Keyword.Set }
+                && ReadsAsPlainClauses(tokens, at + 1, writes: true, out _, out clientOutput, takesOutput: true),
+            _ => ReadsAsPlainClauses(tokens, at, writes: true, out _, out clientOutput, takesOutput: true),
         };
         return plain ? target : null;
+    }
+
+    /// <summary>
+    /// Where the source of an <c>INSERT</c> begins — its <c>VALUES</c>,
+    /// <c>SELECT</c> or <c>DEFAULT VALUES</c> — after the client <c>OUTPUT</c>
+    /// clause opening at <paramref name="output"/>, when that clause's items
+    /// read as a write's plain clauses (<see cref="ReadsAsPlainClauses"/>),
+    /// which holds no <c>INTO</c>; otherwise 0.
+    /// </summary>
+    private static int ClientOutputEnd(ReadOnlySpan<Token> tokens, int output)
+    {
+        var depth = 0;
+        for (var at = output + 1; at < tokens.Length; at++)
+        {
+            switch (tokens[at])
+            {
+                case Operator { Character: '(' }:
+                    depth++;
+                    break;
+                case Operator { Character: ')' }:
+                    depth--;
+                    break;
+                case Operator { Character: ';' } when depth == 0:
+                    return 0;
+                case ReservedKeyword { Keyword: Keyword.Values or Keyword.Select or Keyword.Default } when depth == 0:
+                    return ReadsAsPlainClauses(tokens[..at], output + 1, writes: true, out _, out _) ? at : 0;
+                case ReservedKeyword { Keyword: var keyword } when depth == 0 && EndsQuery(keyword, tokens[at - 1]):
+                    return 0;
+            }
+        }
+        return 0;
     }
 
     /// <summary>
@@ -313,14 +388,19 @@ partial class Simulation
     /// one- or two-part names, no function but a built-in one, no hint.
     /// <paramref name="readsFrom"/> answers whether they hold a <c>FROM</c>
     /// clause outside parentheses. With <paramref name="writes"/> they are
-    /// a write's, which takes a <c>DEFAULT</c> and neither an <c>OUTPUT</c>
-    /// clause nor a <c>FROM</c> clause of its own.
+    /// a write's, which takes a <c>DEFAULT</c> and no <c>FROM</c> clause of
+    /// its own, and no <c>OUTPUT</c> clause either unless
+    /// <paramref name="takesOutput"/>: then one client <c>OUTPUT</c> clause
+    /// ahead of any filter, which <paramref name="clientOutput"/> answers —
+    /// an <c>INTO</c>, never a plain query's keyword, turning it away.
     /// </summary>
-    private static bool ReadsAsPlainClauses(ReadOnlySpan<Token> tokens, int start, bool writes, out bool readsFrom)
+    private static bool ReadsAsPlainClauses(ReadOnlySpan<Token> tokens, int start, bool writes, out bool readsFrom, out bool clientOutput, bool takesOutput = false)
     {
         var depth = 0;
         var cases = 0;
+        var filtered = false;
         readsFrom = false;
+        clientOutput = false;
         Token? previous = null;
         for (var i = start; i < tokens.Length; previous = tokens[i++])
         {
@@ -372,9 +452,16 @@ partial class Simulation
                             return false;
                         readsFrom = true;
                     }
+                    else if (keyword == Keyword.Where && depth == 0)
+                    {
+                        filtered = true;
+                    }
                     break;
                 case UnquotedString { ContextualKeyword: ContextualKeyword.Output } when writes && depth == 0:
-                    return false;
+                    if (!takesOutput || clientOutput || filtered || cases != 0)
+                        return false;
+                    clientOutput = true;
+                    break;
                 case AtPrefixedString when IsFromSourceLead(tokens, i):
                     return false;
                 case Name name when name.Value.StartsWith('#') || name.Value.StartsWith('$'):
