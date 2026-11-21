@@ -200,6 +200,19 @@ internal sealed class CatalogView(
     public readonly string[]? PushdownColumns = pushdownColumns;
 
     /// <summary>
+    /// For a <see cref="Cacheable"/> view, the <see cref="PushdownColumns"/> whose
+    /// pushed equality reads <see cref="FilteredRowGenerator"/> where the row
+    /// cache holds no live rowset, instead of building the whole rowset to seek
+    /// it. The generator may over-produce but never drop a row the predicate
+    /// keeps, as for any filtered read. A hit still seeks the rowset. The
+    /// trade: a database whose only reads of the view are such seeks never
+    /// caches it and regenerates its user rows on each, which is cheaper than
+    /// one build for the single probe a fresh database sees. Null for every view
+    /// that builds on a miss. Set beside <see cref="Cacheable"/>.
+    /// </summary>
+    internal string[]? FilterBeforeCaching;
+
+    /// <summary>
     /// How a restricted principal's metadata-visibility filter reads this view's
     /// governing object per row; <see langword="null"/> for views that aren't
     /// object-scoped (always fully visible to everyone, e.g. <c>sys.schemas</c> /

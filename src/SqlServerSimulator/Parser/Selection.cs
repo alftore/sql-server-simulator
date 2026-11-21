@@ -464,15 +464,19 @@ internal sealed partial class Selection
     /// listing includes the reader's own <c>#temp</c> tables) or a database this
     /// simulation doesn't hold, or the session's metadata visibility filters the
     /// view. The caller has already run the view's read-permission check.
+    /// With <paramref name="build"/> false a read that finds no live rowset
+    /// gets null too, and builds none.
     /// </summary>
-    internal static CatalogRowSet? CachedCatalogRows(CatalogView view, BatchContext batch, Database targetDatabase)
+    internal static CatalogRowSet? CachedCatalogRows(CatalogView view, BatchContext batch, Database targetDatabase, bool build = true)
     {
         if (!view.Cacheable || targetDatabase.Name == Simulation.TempdbDatabaseName)
             return null;
         var simulation = batch.Connection.Simulation;
         return simulation.Databases.TryGetValue(targetDatabase.Name, out var held) && ReferenceEquals(held, targetDatabase)
             && BuiltInResources.ReadsUnfiltered(view, batch, targetDatabase)
-            ? simulation.CatalogRows.GetOrBuild(view, targetDatabase, batch, GenerateCatalogRows)
+            ? build
+                ? simulation.CatalogRows.GetOrBuild(view, targetDatabase, batch, GenerateCatalogRows)
+                : simulation.CatalogRows.TryGetLive(view, targetDatabase, batch, GenerateCatalogRows)
             : null;
     }
 
@@ -561,8 +565,14 @@ internal sealed partial class Selection
                 if (!dirtyRead)
                     batch.AwaitCatalogDefinitions(view, targetDatabase, pushdownColumn, values);
                 PermissionEnforcement.CheckCatalogViewRead(batch, view, targetDatabase);
-                if (CachedCatalogRows(view, batch, targetDatabase) is { } set)
+                // A column the view filters before caching reads the generator
+                // where no rowset is live, building nothing; a live one is seeked.
+                var filterFirst = filteredGenerator is not null && view.FilterBeforeCaching is { } early
+                    && Array.Exists(early, column => BuiltInToken.Equals(column, pushdownColumn));
+                if (CachedCatalogRows(view, batch, targetDatabase, build: !filterFirst) is { } set)
                     return set.Seek(ordinal, values);
+                if (filterFirst)
+                    targetDatabase.EnsureSeeded();
                 // Past the cache, a column the view's own filtered generator
                 // keys narrows that; any other seek reads the whole view, which
                 // the residual predicate then filters.

@@ -272,7 +272,7 @@ internal static partial class BuiltInResources
         var checkType = SqlValue.FromChar(charTwo, "C ");
         var checkTypeDesc = SqlValue.FromNVarchar("CHECK_CONSTRAINT");
         var zeroParent = SqlValue.FromInt32(0);
-        Sys("objects",
+        SysP("objects",
         [
             new("object_id", SqlType.Int32, null, false),
             new("name", SqlType.SystemName, 128, false),
@@ -290,8 +290,8 @@ internal static partial class BuiltInResources
             new("is_ms_shipped", SqlType.Bit, null, false),
             new("is_published", SqlType.Bit, null, false),
             new("is_schema_published", SqlType.Bit, null, false),
-        ], (batch, database) =>
-            EnumerateObjects(batch, database, charTwo, pkType, pkTypeDesc, uqType, uqTypeDesc, checkType, checkTypeDesc, zeroParent, notMsShipped));
+        ], ["type"], (batch, database, filter) => ObjectsForFilter(
+            batch, database, filter, charTwo, pkType, pkTypeDesc, uqType, uqTypeDesc, checkType, checkTypeDesc, zeroParent, notMsShipped));
 
         // sys.all_objects: sys.objects plus sys.system_objects, as real
         // lists it (probed 2026-09-24).
@@ -960,6 +960,95 @@ internal static partial class BuiltInResources
         }
     }
 
+    /// <summary>
+    /// <c>sys.objects</c> for a pushed <c>type</c> equality (or all of it for
+    /// <see cref="CatalogFilter.None"/>): the full listing, less the system
+    /// tables' and shipped queues' rows when the comparand can match none of
+    /// their type codes (<see cref="MaySeekSystemRows"/>). The user objects are
+    /// always all generated, so the result is the full listing minus rows the
+    /// residual <c>WHERE</c> rejects, in the same order.
+    /// </summary>
+    private static IEnumerable<SqlValue[]> ObjectsForFilter(
+        Parser.BatchContext batch,
+        Database database,
+        CatalogFilter filter,
+        SqlType charTwo,
+        SqlValue pkType, SqlValue pkTypeDesc,
+        SqlValue uqType, SqlValue uqTypeDesc,
+        SqlValue checkType, SqlValue checkTypeDesc,
+        SqlValue zeroParent, SqlValue notMsShipped)
+    {
+        var systemRows = MaySeekSystemRows(filter);
+#if DEBUG
+        if (!systemRows)
+        {
+            AuditDroppedSystemRows(batch, database, filter, charTwo, pkType, pkTypeDesc, uqType, uqTypeDesc, checkType, checkTypeDesc, zeroParent, notMsShipped);
+        }
+#endif
+        return EnumerateObjects(batch, database, charTwo, pkType, pkTypeDesc, uqType, uqTypeDesc, checkType, checkTypeDesc, zeroParent, notMsShipped, systemRows);
+    }
+
+#if DEBUG
+    private static long objectsFilterAudits;
+
+    /// <summary>
+    /// Debug audit of <see cref="MaySeekSystemRows"/> answering false. Every
+    /// time, the comparand is compared with each system type code under the
+    /// column's collation and the reading database's; on a power-of-two count
+    /// the full listing is also generated and checked against the filtered one:
+    /// no system row equal to the comparand was dropped, and the filtered rows
+    /// are the full rows less system rows, in the same order.
+    /// </summary>
+    private static void AuditDroppedSystemRows(
+        Parser.BatchContext batch,
+        Database database,
+        CatalogFilter filter,
+        SqlType charTwo,
+        SqlValue pkType, SqlValue pkTypeDesc,
+        SqlValue uqType, SqlValue uqTypeDesc,
+        SqlValue checkType, SqlValue checkTypeDesc,
+        SqlValue zeroParent, SqlValue notMsShipped)
+    {
+        var comparand = filter.Value.AsString;
+        foreach (var code in SystemObjectTypeCodes)
+        {
+            foreach (var collation in new[] { Collation.Catalog, database.Collation })
+            {
+                if (collation.EqualsPadded(code, comparand))
+                    throw new InvalidOperationException($"sys.objects dropped a system row whose type {code.TrimEnd()} equals the comparand");
+            }
+        }
+
+        if (!System.Numerics.BitOperations.IsPow2(Interlocked.Increment(ref objectsFilterAudits)))
+            return;
+        const int typeOrdinal = 5;
+        // The system rows are the ones SystemTableObjectRows yields; user objects
+        // of the same codes ('IT' of a JSON index, a user queue's 'SQ') stay.
+        var systemIds = SystemTableObjectRows(database, SqlValue.FromBoolean(true), SqlValue.FromBoolean(false)).Select(row => row[0].AsInt32).ToHashSet();
+        var full = EnumerateObjects(batch, database, charTwo, pkType, pkTypeDesc, uqType, uqTypeDesc, checkType, checkTypeDesc, zeroParent, notMsShipped).ToList();
+        var filtered = EnumerateObjects(batch, database, charTwo, pkType, pkTypeDesc, uqType, uqTypeDesc, checkType, checkTypeDesc, zeroParent, notMsShipped, systemRows: false).ToList();
+        var kept = full.Where(row => !systemIds.Contains(row[0].AsInt32)).ToList();
+        var same = kept.Count == filtered.Count;
+        for (var i = 0; same && i < kept.Count; i++)
+        {
+            same = kept[i][0].AsInt32 == filtered[i][0].AsInt32 && kept[i][typeOrdinal].AsString == filtered[i][typeOrdinal].AsString;
+        }
+
+        if (!same)
+            throw new InvalidOperationException("sys.objects without its system rows is not its full listing less those rows.");
+        foreach (var row in full)
+        {
+            if (!systemIds.Contains(row[0].AsInt32))
+                continue;
+            foreach (var collation in new[] { Collation.Catalog, database.Collation })
+            {
+                if (collation.EqualsPadded(row[typeOrdinal].AsString, comparand))
+                    throw new InvalidOperationException($"sys.objects dropped a system row whose type {row[typeOrdinal].AsString.TrimEnd()} equals the comparand");
+            }
+        }
+    }
+#endif
+
     private static IEnumerable<SqlValue[]> EnumerateObjects(
         Parser.BatchContext batch,
         Database database,
@@ -967,7 +1056,8 @@ internal static partial class BuiltInResources
         SqlValue pkType, SqlValue pkTypeDesc,
         SqlValue uqType, SqlValue uqTypeDesc,
         SqlValue checkType, SqlValue checkTypeDesc,
-        SqlValue zeroParent, SqlValue notMsShipped)
+        SqlValue zeroParent, SqlValue notMsShipped,
+        bool systemRows = true)
     {
         _ = batch;
         var nullPrincipal = SqlValue.Null(SqlType.Int32);
@@ -1054,8 +1144,11 @@ internal static partial class BuiltInResources
             }
         }
 
-        foreach (var row in SystemTableObjectRows(database, msShipped, notPublished))
-            yield return row;
+        if (systemRows)
+        {
+            foreach (var row in SystemTableObjectRows(database, msShipped, notPublished))
+                yield return row;
+        }
 
         // One table's constraint rows — keys, then defaults, then CHECKs, then
         // foreign keys, real's own object-id order for one CREATE TABLE.
