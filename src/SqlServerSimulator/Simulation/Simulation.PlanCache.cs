@@ -119,8 +119,26 @@ public sealed partial class Simulation
 
         public override bool Equals(object? obj) => obj is PlanCacheKey other && this.Equals(other);
 
-        public override int GetHashCode() =>
-            HashCode.Combine(this.CommandText, this.DatabaseName, this.DefaultSchemaName, this.ParameterSignature, this.QuotedIdentifiers, this.DateFormat, this.AnsiNulls, this.ConcatNullYieldsNull);
+        // Computed once as the key is built: a write's key is hashed three times per
+        // command (the plan cache, the statement plan sets and the compile memo), and
+        // each hash walks the whole command text.
+        private readonly int hash = HashCode.Combine(commandText, databaseName, defaultSchemaName, parameterSignature, quotedIdentifiers, dateFormat, ansiNulls, concatNullYieldsNull);
+
+#if DEBUG
+        private static int hashAudits;
+#endif
+
+        public override int GetHashCode()
+        {
+#if DEBUG
+            if (System.Numerics.BitOperations.IsPow2(Interlocked.Increment(ref hashAudits))
+                && this.hash != HashCode.Combine(this.CommandText, this.DatabaseName, this.DefaultSchemaName, this.ParameterSignature, this.QuotedIdentifiers, this.DateFormat, this.AnsiNulls, this.ConcatNullYieldsNull))
+            {
+                throw new InvalidOperationException($"PlanCacheKey's stored hash differs from its fields' for '{this.CommandText}'.");
+            }
+#endif
+            return this.hash;
+        }
     }
 
     /// <summary>Cache entry: the batch's parsed <see cref="Selection"/>s in

@@ -24,6 +24,7 @@ Any of those can affect what the parse produces, so a mismatch demands a fresh p
 Every other session setting is read by the executing batch at run time, which `PlanCacheSessionTests` pins by differential: a replay under `DATEFIRST`, `LANGUAGE`, `ARITHABORT` / `ANSI_WARNINGS`, `NUMERIC_ROUNDABORT`, `TEXTSIZE`, `CONTEXT_INFO`, session context, an open transaction, a `#temp` table or another principal must answer what a fresh parse under that setting answers, in both directions.
 `QUOTED_IDENTIFIER` is in the key because it changes what the *same text* tokenizes to — `"x"` is a delimited identifier when on, a varchar literal when off — so a cached plan from one setting is wrong under the other.
 Backed by `ConcurrentDictionary` with the default ordinal-case-sensitive string comparer.
+The key carries its own hash, computed once as it is built, because a write's key is looked up three times per command (the plan cache, the statement plan sets and the compile memo) and each hash walks the command text.
 
 The parameter signature is built defensively: a TVP whose `Value` is an `IDataReader` causes `SimulatedDbParameter.DbType`'s getter to throw `ArgumentException` (CA1065 — documented at the property), and the signature builder catches it and returns `null` for that command.
 A null signature means "skip the cache for this call" — caching wouldn't help anyway because structured parameters carry session-scoped data the cache doesn't model.
