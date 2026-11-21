@@ -349,6 +349,7 @@ An `IF`'s condition resets it to 0 for the branch it chooses, whatever the condi
 The split sits where the interleaved statement already stopped reading: `UPDATE` and `DELETE` start their execution with the permission checks and the SERIALIZABLE fence, and `INSERT` with evaluating the tuples, ahead of the checks real makes once the source is read (auto-generated columns, identity, ragged tuples), so no error changes place.
 Two session reads moved across it — `IDENTITY_INSERT` and whether an `INSTEAD OF INSERT` trigger is enabled are read as the `INSERT` runs rather than as it parses — and neither raises.
 An `INSERT` reading a `SELECT`, `EXEC` or `DEFAULT VALUES` source reads it as it parses and then writes through the same `InsertRows`.
+A batch's first compile parses a plain write as far as this split for the run — a client `OUTPUT` clause included, on a table with no trigger — and its run replays that parse ([`plan-cache.md`](plan-cache.md#the-compile-walk-against-the-run)).
 
 ## INSERT … SELECT
 `INSERT [INTO] target [(cols)] SELECT …` accepts the full Selection grammar — WHERE/JOIN/GROUP BY/aggregates/ORDER BY/TOP/OFFSET-FETCH/UNION/INTERSECT/EXCEPT all work source-side.
@@ -587,6 +588,7 @@ Trigger bodies see the post-MERGE state in INSERTED/DELETED.
 ### EF Core reach
 
 EF Core 7+ emits MERGE for SaveChanges batch INSERT (the OUTPUT-INSERTED-id shape).
+A batch's first compile parses that shape, and any MERGE from a `VALUES` list, a plain query or a table into a table with no `INSTEAD OF` trigger, as far as its `;` for the run, which replays that parse rather than parsing it again ([`plan-cache.md`](plan-cache.md#the-compile-walk-against-the-run)).
 Multi-action MERGE through EF requires raw SQL (`FromSqlInterpolated` for the body) — EF's LINQ surface doesn't reach the multi-branch form.
 EF Core's `ExecuteUpdate` / `ExecuteDelete` for batched single-statement DML emits regular `UPDATE FROM` / `DELETE FROM` (the simulator's existing joined-source UPDATE/DELETE paths handle those), not MERGE.
 

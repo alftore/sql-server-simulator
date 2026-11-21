@@ -88,6 +88,24 @@ public sealed class BatchCompilationTests
     }
 
     /// <summary>
+    /// A <c>MERGE</c>'s binder error is gathered with a query's, in the order
+    /// the batch holds them, whichever comes first, and nothing in the batch
+    /// runs — the walk parsing the <c>MERGE</c> for the run or not.
+    /// </summary>
+    [TestMethod]
+    [DataRow("insert t values (1); select nosuch1 from t; merge t using (values (2)) as s (a) on s.a = t.a when not matched then insert (nosuch2) values (s.a);")]
+    [DataRow("insert t values (1); merge t using (values (2)) as s (a) on s.a = t.a when not matched then insert (nosuch1) values (s.a); select nosuch2 from t")]
+    [DataRow("insert t values (1); merge t using (values (2)) as s (a) on s.a = t.a when matched then update set a = s.nosuch1; select nosuch2 from t")]
+    public void MergeBinderErrorBesideAQuerys_BothReportedInOrder_NothingRuns(string sql)
+    {
+        var (_, connection) = Open();
+        CollectionAssert.AreEqual(
+            new[] { "Invalid column name 'nosuch1'.", "Invalid column name 'nosuch2'." },
+            Fails(connection, sql).Errors.Select(e => e.Message).ToArray());
+        AreEqual(0, Scalar(connection, "select count(*) from t"));
+    }
+
+    /// <summary>
     /// A column the batch adds doesn't exist when the batch compiles, so a
     /// statement reading it fails the batch and the column is never added.
     /// </summary>

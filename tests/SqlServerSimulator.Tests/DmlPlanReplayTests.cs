@@ -1238,4 +1238,205 @@ public sealed class DmlPlanReplayTests
         });
         AreEqual(iterations * workers * (workers + 1) / 2, simulation.ExecuteScalar("select sum(v) from c"));
     }
+
+    /// <summary>
+    /// A <c>DROP</c> the batch compile walk meets, here in a branch never taken
+    /// and on the text's first line so no line moves, keeps the walk from
+    /// parsing any statement of the batch for its run: each parses as it runs.
+    /// </summary>
+    private const string WalkParsesNothingForTheRun = "if 1 = 0 drop table if exists walk_parses_nothing_for_the_run; ";
+
+    /// <summary>
+    /// Each run executes <paramref name="text"/> on a plan cache emptied before
+    /// it, so its batch compiles afresh and a statement the compile walk parsed
+    /// for the run runs on that parse; the transcript has to be the one the
+    /// same runs give when the walk parses nothing for the run.
+    /// </summary>
+    private static void AssertWalkParseMatchesOwnParse(string setup, string text, string state, params Run[] runs)
+    {
+        var own = Transcript(setup, WalkParsesNothingForTheRun + text, state, runs, freshEachRun: true);
+        var walked = Transcript(setup, text, state, runs, freshEachRun: true);
+        AreEqual(own, walked);
+    }
+
+    [TestMethod]
+    public void OnTheWalksParse_EfInsertWithOutput_ConstraintConversionAndTruncationErrors()
+        => AssertWalkParseMatchesOwnParse(Tables, EfInsert, TableState + "; select scope_identity(), @@rowcount",
+            With(("@p0", "a"), ("@p1", 1), ("@p2", 1), ("@p3", "aaa")),
+            With(("@p0", "b"), ("@p1", -1), ("@p2", 1), ("@p3", "bbb")),
+            With(("@p0", "c"), ("@p1", 2), ("@p2", 9), ("@p3", "ccc")),
+            With(("@p0", "toolong"), ("@p1", 3), ("@p2", 1), ("@p3", "ddd")),
+            With(("@p0", "e"), ("@p1", "x"), ("@p2", 1), ("@p3", "eee")),
+            With(("@p0", "h"), ("@p1", 6), ("@p2", 2), ("@p3", "hhh")));
+
+    [TestMethod]
+    public void OnTheWalksParse_EfUpdatePairWithOutput_ErrorsLinesAndXactAbortInATransaction()
+        => AssertWalkParseMatchesOwnParse(
+            Tables + "insert t (name, v, pid, code) values (N'a', 1, 1, 'aaa'), (N'b', 2, 2, 'bbb');",
+            EfUpdatePair,
+            TableState,
+            With(("@p0", 10), ("@p1", 1), ("@p2", "bb"), ("@p3", 2)),
+            With(("@p0", -5), ("@p1", 1), ("@p2", "cc"), ("@p3", 2)),
+            With(("@p0", 11), ("@p1", 1), ("@p2", "waytoolong"), ("@p3", 2)),
+            With(("@p0", "nope"), ("@p1", 1), ("@p2", "dd"), ("@p3", 2)),
+            new Run("begin tran", ("@p0", 12), ("@p1", 1), ("@p2", "ee"), ("@p3", 2)),
+            new Run("set xact_abort on", ("@p0", 13), ("@p1", 1), ("@p2", "ff"), ("@p3", 99)),
+            new Run("begin tran", ("@p0", -7), ("@p1", 1), ("@p2", "gg"), ("@p3", 2)),
+            new Run("set xact_abort off; begin tran", ("@p0", -8), ("@p1", 1), ("@p2", "hh"), ("@p3", 2)),
+            new Run("rollback", ("@p0", 14), ("@p1", 1), ("@p2", "ii"), ("@p3", 2)));
+
+    [TestMethod]
+    public void OnTheWalksParse_ConversionErrorInAnOutputExpression_RowsInOrderAndRowcount()
+        => AssertWalkParseMatchesOwnParse(
+            Tables + "insert t (name, v, pid, code) values (N'a', 1, 1, '1'), (N'b', 2, 2, 'bbb'), (N'c', 3, 1, '3');",
+            "update t set v = v + @d output deleted.v, inserted.v, convert(int, inserted.code) where v >= @from; select @@rowcount;\ndelete t output deleted.id, deleted.name where v > @gone; select @@rowcount",
+            TableState,
+            With(("@d", 1), ("@from", 3), ("@gone", 100)),
+            With(("@d", 1), ("@from", 0), ("@gone", 100)),
+            With(("@d", 10), ("@from", 4), ("@gone", 5)),
+            new Run("update t set code = null", ("@d", 1), ("@from", 0), ("@gone", 100)));
+
+    [TestMethod]
+    public void OnTheWalksParse_DuplicateKeyUnderAnInsertsOutput()
+        => AssertWalkParseMatchesOwnParse(
+            "create table k (id int primary key, v int unique)",
+            "insert into k (id, v) output inserted.id, inserted.v values (@id, @v); select @@rowcount",
+            "select id, v from k order by id",
+            With(("@id", 1), ("@v", 1)),
+            With(("@id", 1), ("@v", 2)),
+            With(("@id", 2), ("@v", 1)),
+            With(("@id", 2), ("@v", 3)));
+
+    [TestMethod]
+    public void OnTheWalksParse_InsertSelectAndDefaultValuesWithOutput()
+        => AssertWalkParseMatchesOwnParse(
+            "create table d (id int identity primary key, v int not null default 3); create table src (v int)",
+            "insert d (v) output inserted.id, inserted.v * 2 select v from src where v < @top; insert into d output inserted.id, inserted.v default values",
+            "select id, v from d order by id",
+            new Run("insert src values (1), (5), (null)", ("@top", 3)),
+            With(("@top", 9)),
+            new Run("delete src where v is null", ("@top", 9)));
+
+    [TestMethod]
+    public void OnTheWalksParse_MaskedColumnInTheOutput_PrincipalsInAlternation()
+        => AssertWalkParseMatchesOwnParse(
+            Principals,
+            "SET NOCOUNT ON;\nUPDATE [m] SET [copy] = [s]\nOUTPUT INSERTED.[s], INSERTED.[copy]\nWHERE [id] = @p0;\nDELETE [m] OUTPUT DELETED.[s] WHERE [id] = @p0 + 10;",
+            "select id, copy, user_name() from m order by id",
+            As("blind", ("@p0", 1)),
+            As("seer", ("@p0", 2)),
+            As("blind", ("@p0", 3)),
+            new Run("revert; revoke unmask from seer; execute as user = 'seer'", ("@p0", 1)),
+            new Run("revert; grant unmask to blind; execute as user = 'blind'", ("@p0", 2)),
+            new Run("revert; deny select on m to blind; execute as user = 'blind'", ("@p0", 3)));
+
+    [TestMethod]
+    public void OnTheWalksParse_TriggerCreatedBetweenRuns_RefusesTheClientOutput()
+        => AssertWalkParseMatchesOwnParse(
+            """
+            create table tt (id int primary key, v int not null);
+            insert tt values (1, 1);
+            """,
+            "UPDATE [tt] SET [v] = @p0 OUTPUT 1 WHERE [id] = @p1;\nINSERT [tt] OUTPUT INSERTED.[id] VALUES (@p0, @p0);",
+            "select id, v from tt order by id",
+            With(("@p0", 5), ("@p1", 1)),
+            new Run("create trigger tt_noop on tt after update, insert as return", ("@p0", 6), ("@p1", 1)),
+            new Run("disable trigger tt_noop on tt", ("@p0", 7), ("@p1", 1)),
+            new Run("enable trigger tt_noop on tt", ("@p0", 8), ("@p1", 1)),
+            new Run("drop trigger tt_noop", ("@p0", 9), ("@p1", 1)));
+
+    [TestMethod]
+    public void OnTheWalksParse_BinderErrorInAnOutputList_ReportedInOrder()
+        => AssertWalkParseMatchesOwnParse(
+            Tables,
+            "select nosuch1 from t;\nupdate t set v = 1 output inserted.nosuch2 where id = @id;\nupdate t set v = 2 output inserted.id where id = @id;\ndelete t output deleted.nosuch3 where id = @id",
+            TableState,
+            With(("@id", 1)),
+            With(("@id", 2)));
+
+    [TestMethod]
+    public void OnTheWalksParse_BinderErrorInAnOutputList_AheadOfAnotherStatements()
+        => AssertWalkParseMatchesOwnParse(
+            Tables,
+            "update t set v = 1 output inserted.nosuch1 where id = @id;\nselect nosuch2 from t",
+            TableState,
+            With(("@id", 1)),
+            With(("@id", 2)));
+
+    [TestMethod]
+    public void OnTheWalksParse_EfMerge_ConstraintConversionTruncationAndXactAbort()
+        => AssertWalkParseMatchesOwnParse(Tables, EfMerge, TableState + "; select scope_identity(), @@rowcount",
+            With(("@p0", "a"), ("@p1", 1), ("@p2", 1), ("@p3", "aaa"), ("@p4", "b"), ("@p5", 2), ("@p6", 2), ("@p7", "bbb")),
+            With(("@p0", "c"), ("@p1", 3), ("@p2", 1), ("@p3", "ccc"), ("@p4", "d"), ("@p5", -1), ("@p6", 2), ("@p7", "ddd")),
+            With(("@p0", "e"), ("@p1", 3), ("@p2", 9), ("@p3", "eee"), ("@p4", "f"), ("@p5", 1), ("@p6", 2), ("@p7", "fff")),
+            With(("@p0", "toolong"), ("@p1", 3), ("@p2", 1), ("@p3", "ggg"), ("@p4", "h"), ("@p5", 1), ("@p6", 2), ("@p7", "hhh")),
+            With(("@p0", "i"), ("@p1", "x"), ("@p2", 1), ("@p3", "iii"), ("@p4", "j"), ("@p5", 1), ("@p6", 2), ("@p7", "jjj")),
+            new Run("begin tran", ("@p0", "k"), ("@p1", 4), ("@p2", 1), ("@p3", "kkk"), ("@p4", "l"), ("@p5", 1), ("@p6", 2), ("@p7", "lll")),
+            new Run("set xact_abort on", ("@p0", "m"), ("@p1", -3), ("@p2", 1), ("@p3", "mmm"), ("@p4", "n"), ("@p5", 1), ("@p6", 2), ("@p7", "nnn")),
+            new Run("set xact_abort off; begin tran", ("@p0", "o"), ("@p1", 5), ("@p2", 9), ("@p3", "ooo"), ("@p4", "p"), ("@p5", 6), ("@p6", 2), ("@p7", "ppp")),
+            new Run("rollback", ("@p0", "q"), ("@p1", 5), ("@p2", 1), ("@p3", "qqq"), ("@p4", "r"), ("@p5", 6), ("@p6", 2), ("@p7", "rrr")));
+
+    [TestMethod]
+    public void OnTheWalksParse_DuplicateKeyMerge_MultipleMatchesAndRowcount()
+        => AssertWalkParseMatchesOwnParse(
+            "create table k (id int primary key, v int unique); insert k values (1, 1), (2, 2); create table src (id int, v int)",
+            "merge k using src as s on k.id = s.id when matched then update set v = s.v when not matched then insert (id, v) values (s.id, s.v) when not matched by source and k.v > @cap then delete output inserted.id, inserted.v, deleted.id;\nselect @@rowcount;",
+            "select id, v from k order by id",
+            new Run("insert src values (3, 3), (4, 1)", ("@cap", 100)),
+            new Run("delete src; insert src values (5, 5), (6, 5)", ("@cap", 100)),
+            new Run("delete src; insert src values (1, 7), (1, 8)", ("@cap", 100)),
+            new Run("delete src; insert src values (1, 10), (7, 7)", ("@cap", 2)));
+
+    [TestMethod]
+    public void OnTheWalksParse_MergeFromAQueryAndAValuesList_ConversionAndDivideByZero()
+        => AssertWalkParseMatchesOwnParse(
+            "create table m (id int primary key, v int not null); insert m values (1, 10), (2, 20); create table src (id int, d int)",
+            "merge m using (select id, d from src where d is not null) as s on s.id = m.id when matched then update set v = m.v / s.d output inserted.id, inserted.v;\nmerge m as tgt using (values (@id, @v)) as s (id, v) on s.id = tgt.id when matched then update set v = convert(int, s.v) when not matched then insert (id, v) values (s.id, s.v) output deleted.v, inserted.v;",
+            "select id, v from m order by id",
+            new Run("insert src values (1, 2)", ("@id", 3), ("@v", "30")),
+            new Run("delete src; insert src values (2, 0)", ("@id", 1), ("@v", "11")),
+            new Run("delete src", ("@id", 2), ("@v", "x")));
+
+    [TestMethod]
+    public void OnTheWalksParse_MergeTriggersCreatedBetweenRuns_334And5316()
+        => AssertWalkParseMatchesOwnParse(
+            "create table io (id int primary key, v int not null); insert io values (1, 1); create table seen (v int)",
+            "MERGE io USING (VALUES (@id, @v)) AS s (id, v) ON io.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v) OUTPUT inserted.id;",
+            "select id, v from io order by id; select v from seen",
+            With(("@id", 2), ("@v", 2)),
+            new Run("create trigger io_after on io after update as return", ("@id", 1), ("@v", 3)),
+            new Run("disable trigger io_after on io", ("@id", 3), ("@v", 3)),
+            new Run("drop trigger io_after", ("@id", 4), ("@v", 4)),
+            new Run("create trigger io_ins on io instead of insert as insert seen select v from inserted", ("@id", 5), ("@v", 5)),
+            new Run("disable trigger io_ins on io", ("@id", 6), ("@v", 6)),
+            new Run("enable trigger io_ins on io", ("@id", 1), ("@v", 7)),
+            new Run("drop trigger io_ins", ("@id", 7), ("@v", 7)));
+
+    [TestMethod]
+    public void OnTheWalksParse_MergeBinderErrors_ReportedInOrder()
+        => AssertWalkParseMatchesOwnParse(
+            Tables,
+            "select nosuch1 from t;\nmerge t using (values (@id, 1)) as s (id, v) on s.id = t.id when matched then update set v = s.nosuch2;",
+            TableState,
+            With(("@id", 1)));
+
+    [TestMethod]
+    public void OnTheWalksParse_MergeBinderErrors_AheadOfAnotherStatements()
+        => AssertWalkParseMatchesOwnParse(
+            Tables,
+            "merge t using (values (@id, 1)) as s (id, v) on s.id = t.id when matched and s.nosuch1 > 0 then update set v = s.v when not matched then insert (nosuch2) values (s.v);\nselect nosuch3 from t;\nmerge t using (values (@id, 1)) as s (id, v) on s.id = t.id when matched then update set v = s.v output inserted.nosuch4;",
+            TableState,
+            With(("@id", 1)));
+
+    [TestMethod]
+    public void OnTheWalksParse_MaskedMerge_PrincipalsInAlternation()
+        => AssertWalkParseMatchesOwnParse(
+            Principals,
+            "merge m as tgt using (values (@id, @s)) as src (id, s) on tgt.id = src.id when matched then update set copy = tgt.s + src.s output inserted.copy, deleted.s;",
+            "select id, copy from m order by id",
+            As("seer", ("@id", 1), ("@s", "!")),
+            As("blind", ("@id", 2), ("@s", "!")),
+            As("seer", ("@id", 3), ("@s", "?")),
+            new Run("revert; revoke unmask from seer; execute as user = 'seer'", ("@id", 1), ("@s", "?")),
+            new Run("revert; deny update on m to blind; execute as user = 'blind'", ("@id", 2), ("@s", "?")));
 }

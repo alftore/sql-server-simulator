@@ -35,7 +35,9 @@ public sealed class WalkPlanTests
     /// <summary>
     /// Runs <see cref="Setup"/> and <paramref name="before"/> (batches split on
     /// <c>go</c> lines), then <paramref name="text"/> once, returning the walk's
-    /// parses its run replayed.
+    /// parses its run replayed. In a Debug build, no write the walk attempted
+    /// may have been turned away at its split point: the pre-scan admits only
+    /// what reaches a plan.
     /// </summary>
     private static long WalkReplays(string text, string before = "")
     {
@@ -46,7 +48,13 @@ public sealed class WalkPlanTests
         foreach (var batch in before.Split("\ngo\n", StringSplitOptions.RemoveEmptyEntries))
             Execute(connection, batch);
         var replays = simulation.WalkPlanReplays;
+#if DEBUG
+        var declines = simulation.WalkSplitDeclines.Values.Sum();
+#endif
         Execute(connection, text);
+#if DEBUG
+        AreEqual(declines, simulation.WalkSplitDeclines.Values.Sum(), "A write the pre-scan admitted declined at its split point.");
+#endif
         return simulation.WalkPlanReplays - replays;
     }
 
@@ -100,12 +108,30 @@ public sealed class WalkPlanTests
     [DataRow("delete from u where id = 10")]
     [DataRow("delete u")]
     [DataRow("insert t values (3, 3); update t set v = 0 where id = 3; delete t where id = 3")]
-    public void APlainWrite_RunsOnTheWalksParse(string text) => AreEqual(text.Split(';').Length, WalkReplays(text));
+    [DataRow("update t set v = 0 output inserted.id")]
+    [DataRow("insert t (id, v) output inserted.id, inserted.v select id + 10, v from t")]
+    [DataRow("delete u output deleted.* where id = 10")]
+    [DataRow("merge t using u on u.t_id = t.id when matched then delete;")]
+    [DataRow("merge into dbo.t as tgt using (values (1, 5), (3, 3)) as s (id, v) on s.id = tgt.id when matched then update set v = s.v when not matched then insert (id, v) values (s.id, s.v) output inserted.id, deleted.v;")]
+    [DataRow("merge t using (select t_id, count(*) as n from u group by t_id) s on s.t_id = t.id when matched and exists (select 1 from u where u.t_id = t.id) then update set v = t.v + s.n;")]
+    [DataRow("merge u x using t on t.id = x.t_id when not matched by source then delete;")]
+    public void APlainWrite_RunsOnTheWalksParse(string text) => AreEqual(text.TrimEnd(';').Split(';').Length, WalkReplays(text));
+
+    /// <summary>
+    /// EF Core's writes, each with a client <c>OUTPUT</c> clause (captured from
+    /// EF Core 10's SqlServer provider), run on the walk's parse; the
+    /// <c>SET</c>s ahead of them have no plan to run on.
+    /// </summary>
+    [TestMethod]
+    [DataRow("SET IMPLICIT_TRANSACTIONS OFF;\nSET NOCOUNT ON;\nINSERT INTO [t] ([id], [v])\nOUTPUT INSERTED.[id]\nVALUES (3, 3);\n", 1, DisplayName = "INSERT … OUTPUT … VALUES")]
+    [DataRow("SET NOCOUNT ON;\nUPDATE [t] SET [v] = 5\nOUTPUT 1\nWHERE [id] = 1;\nUPDATE [u] SET [t_id] = 2\nOUTPUT 1\nWHERE [id] = 10;\n", 2, DisplayName = "UPDATE … OUTPUT 1 WHERE, twice")]
+    [DataRow("SET IMPLICIT_TRANSACTIONS OFF;\nSET NOCOUNT ON;\nDELETE FROM [u]\nOUTPUT 1\nWHERE [id] = 10;\n", 1, DisplayName = "DELETE … OUTPUT 1 WHERE")]
+    [DataRow("SET IMPLICIT_TRANSACTIONS OFF;\nSET NOCOUNT ON;\nMERGE [t] USING (\nVALUES (3, 3, 0),\n(4, 4, 1)) AS i ([id], [v], _Position) ON 1=0\nWHEN NOT MATCHED THEN\nINSERT ([id], [v])\nVALUES (i.[id], i.[v])\nOUTPUT INSERTED.[id], i._Position;\n", 1, DisplayName = "MERGE … OUTPUT INSERTED.[id], i._Position")]
+    public void EfCoresWrites_RunOnTheWalksParse(string text, int writes) => AreEqual(writes, WalkReplays(text));
 
     [TestMethod]
     [DataRow("insert t with (tablock) values (3, 3)", DisplayName = "A table hint")]
     [DataRow("update top (1) t set v = 0", DisplayName = "TOP")]
-    [DataRow("update t set v = 0 output inserted.id", DisplayName = "OUTPUT")]
     [DataRow("update t set v = 0 from t join u on u.t_id = t.id", DisplayName = "A joined UPDATE")]
     [DataRow("delete t from t join u on u.t_id = t.id", DisplayName = "A joined DELETE")]
     [DataRow("insert t select 5, 5", DisplayName = "A FROM-less source, evaluated as it parses")]
@@ -115,9 +141,97 @@ public sealed class WalkPlanTests
     [DataRow("insert vt values (3, 3)", DisplayName = "A view")]
     [DataRow("update vt set v = 0 where id = 1", DisplayName = "A view's UPDATE")]
     [DataRow("delete vt where id = 1", DisplayName = "A view's DELETE")]
-    [DataRow("merge t using u on u.t_id = t.id when matched then delete;", DisplayName = "MERGE")]
     public void AWriteACompileSettlesMore_ParsesAsItRuns(string text) =>
         AreEqual(0, WalkReplays(text, "create function f (@v int) returns int as begin return @v end\ngo\ncreate table #s (a int)\ngo\ncreate procedure p as select 5, 5\ngo\ncreate view vt as select id, v from t"));
+
+    /// <summary>
+    /// An <c>OUTPUT</c> clause the walk can't settle as the run would keeps
+    /// its write parsing as it runs: one writing a table, whose target the
+    /// plan checks for itself, and a client one on a table with a trigger,
+    /// enabled or not, whose parse settles Msg 334 from the trigger's state.
+    /// </summary>
+    [TestMethod]
+    [DataRow("declare @o table (id int); update t set v = 0 output inserted.id into @o", DisplayName = "OUTPUT … INTO a table variable")]
+    [DataRow("insert t output inserted.id, inserted.v into u values (5, 5)", DisplayName = "OUTPUT … INTO a table")]
+    [DataRow("update g set v = 1 output inserted.v", DisplayName = "A client OUTPUT on a table with a disabled trigger")]
+    [DataRow("insert g output inserted.id values (2, 2)", DisplayName = "A client INSERT … OUTPUT on a table with a disabled trigger")]
+    public void AnOutputACompileSettlesMore_ParsesAsItRuns(string text) =>
+        AreEqual(0, WalkReplays(text, "create table g (id int primary key, v int)\ngo\ncreate trigger g_t on g after insert, update as set nocount on\ngo\ndisable trigger g_t on g"));
+
+    /// <summary>
+    /// A <c>MERGE</c> whose parse settles more than binding, or whose route
+    /// the walk can't parse as the run would, parses as it runs: one whose
+    /// <c>INSTEAD OF</c> trigger, enabled or not, settles which actions it
+    /// takes (Msg 5316), one into a view, one reading a function, a view or a
+    /// join, one with <c>TOP</c>, a hint, <c>OUTPUT … INTO</c>, a client
+    /// <c>OUTPUT</c> on a table with a disabled trigger, or <c>$action</c>.
+    /// </summary>
+    [TestMethod]
+    [DataRow("merge io using u on u.id = io.id when not matched then insert values (u.id, u.t_id);", DisplayName = "A target with an INSTEAD OF trigger")]
+    [DataRow("merge io2 using u on u.id = io2.id when not matched then insert values (u.id, u.t_id);", DisplayName = "A target with a disabled INSTEAD OF trigger")]
+    [DataRow("merge vt using u on u.t_id = vt.id when matched then update set v = 0;", DisplayName = "A view")]
+    [DataRow("merge t using (select id from dbo.tf()) as f on f.id = t.id when matched then update set v = 0;", DisplayName = "A function in the source")]
+    [DataRow("merge t using vt as s on s.id = t.id when matched then update set v = s.v;", DisplayName = "A view as the source")]
+    [DataRow("merge t using u join t as t2 on t2.id = u.t_id on u.t_id = t.id when matched then update set v = 1;", DisplayName = "A joined source")]
+    [DataRow("merge top (1) t using u on u.t_id = t.id when matched then update set v = 0;", DisplayName = "TOP")]
+    [DataRow("merge t with (holdlock) using u on u.t_id = t.id when matched then update set v = 0;", DisplayName = "A table hint")]
+    [DataRow("declare @o table (id int); merge t using u on u.t_id = t.id when matched then update set v = 0 output inserted.id into @o;", DisplayName = "OUTPUT … INTO")]
+    [DataRow("merge g using u on u.id = g.id when not matched then insert values (u.id, 0) output inserted.id;", DisplayName = "A client OUTPUT on a table with a disabled trigger")]
+    [DataRow("merge t using u on u.t_id = t.id when matched then update set v = 0 output $action;", DisplayName = "$action")]
+    public void AMergeACompileSettlesMore_ParsesAsItRuns(string text) =>
+        AreEqual(0, WalkReplays(text, """
+            create view vt as select id, v from t
+            go
+            create function tf () returns table as return select 1 as id
+            go
+            create table io (id int primary key, v int)
+            go
+            create trigger io_t on io instead of insert as set nocount on
+            go
+            create table io2 (id int primary key, v int)
+            go
+            create trigger io2_t on io2 instead of insert as set nocount on
+            go
+            disable trigger io2_t on io2
+            go
+            create table g (id int primary key, v int)
+            go
+            create trigger g_t on g after insert, update as set nocount on
+            go
+            disable trigger g_t on g
+            """.ReplaceLineEndings("\n")));
+
+    /// <summary>
+    /// A <c>DROP</c> the walk meets, even in a branch the run never takes,
+    /// keeps every later statement of the batch parsing as it runs, which is
+    /// how <c>DmlPlanReplayTests</c> sets the walk's parse aside to compare
+    /// the run on it with the run on its own.
+    /// </summary>
+    [TestMethod]
+    [DataRow("if 1 = 0 drop table if exists nothing; update t set v = 0 output inserted.id", DisplayName = "UPDATE … OUTPUT")]
+    [DataRow("if 1 = 0 drop table if exists nothing; insert t output inserted.id values (3, 3)", DisplayName = "INSERT … OUTPUT")]
+    [DataRow("if 1 = 0 drop table if exists nothing; merge t using u on u.t_id = t.id when matched then update set v = 0 output inserted.id;", DisplayName = "MERGE … OUTPUT")]
+    public void AWriteBehindDdlTheWalkMet_ParsesAsItRuns(string text) => AreEqual(0, WalkReplays(text));
+
+#if DEBUG
+    /// <summary>
+    /// A write the pre-scan admits whose split point declines its plan — an
+    /// <c>UPDATE</c> assigning a variable — is turned away there, parsing the
+    /// walk's way, and counted.
+    /// </summary>
+    [TestMethod]
+    public void AWriteItsSplitPointDeclines_IsCounted()
+    {
+        var simulation = new Simulation();
+        using var connection = simulation.CreateDbConnection();
+        connection.Open();
+        Execute(connection, Setup);
+        var replays = simulation.WalkPlanReplays;
+        Execute(connection, "declare @x int; update t set @x = v where id = 1");
+        AreEqual(0, simulation.WalkPlanReplays - replays);
+        AreEqual(1, simulation.WalkSplitDeclines.GetValueOrDefault(Parser.Keyword.Update));
+    }
+#endif
 
     /// <summary>
     /// A write the walk parsed for the run reads the session's state as it

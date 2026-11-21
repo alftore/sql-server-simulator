@@ -32,6 +32,16 @@ partial class Simulation
     /// <summary>Test-observable: statements whose run replayed the compile walk's parse of them rather than parsing again.</summary>
     internal long WalkPlanReplays;
 
+#if DEBUG
+    /// <summary>
+    /// Test-observable in a Debug build: writes the compile walk parsed for
+    /// the run whose split point declined the plan, by the statement's
+    /// keyword — a shape <see cref="ParseWriteForRun"/>'s pre-scan admitted
+    /// that then cost an abandoned parse.
+    /// </summary>
+    internal readonly System.Collections.Concurrent.ConcurrentDictionary<Keyword, long> WalkSplitDeclines = new();
+#endif
+
     /// <summary>
     /// Runs one DML statement, from its cached plan when one is
     /// current, otherwise by parsing it — recording the plan the parse builds
@@ -394,7 +404,12 @@ partial class Simulation
         if (batch.WriteParseForRun is { } scope)
         {
             if (recording.Plan is null)
+            {
+#if DEBUG
+                scope.DeclinedAtSplit = true;
+#endif
                 throw new RunParseDeclinedException();
+            }
             scope.Leave(batch);
         }
         return true;
