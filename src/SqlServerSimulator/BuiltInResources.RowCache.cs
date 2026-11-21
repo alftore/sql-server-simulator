@@ -101,6 +101,9 @@ internal static partial class BuiltInResources
             view.SeekColumns = RankSeekColumns(view);
         }
         views["sys.identity_columns"].LiveStamp = IdentityStamp;
+        // A cold read of sys.objects by type skips the system rows the type
+        // can't match (MaySeekSystemRows) instead of building the whole rowset.
+        views["sys.objects"].FilterBeforeCaching = ["type"];
     }
 
     /// <summary>

@@ -75,6 +75,27 @@ internal sealed class CatalogRowCache
     }
 
     /// <summary>
+    /// The live rowset for <paramref name="view"/> over <paramref name="database"/>
+    /// when one exists, else null: the same generation and live-stamp test as
+    /// <see cref="GetOrBuild"/>, without the build.
+    /// </summary>
+    public CatalogRowSet? TryGetLive(CatalogView view, Database database, BatchContext batch, Func<CatalogView, BatchContext, Database, List<byte[]>> generate)
+    {
+        var generation = this.CurrentGeneration(out var stamp);
+        var live = view.LiveStamp?.Invoke(database);
+        if (generation.Version != stamp || !generation.Sets.TryGetValue((view, database), out var cached)
+            || (live is not null && !live.AsSpan().SequenceEqual(cached.LiveStamp)))
+        {
+            return null;
+        }
+        CatalogPushdownDiagnostics.Sink?.Add($"CacheHit({view.Name})");
+#if DEBUG
+        AuditAgainstRegeneration(cached, batch, database, generate);
+#endif
+        return cached;
+    }
+
+    /// <summary>
     /// <paramref name="database"/>'s <see cref="ObjectIdIndex"/>, built on a
     /// miss and kept under the same generation as the rowsets, so the
     /// invalidation that drops a stale <c>sys.objects</c> drops it too.

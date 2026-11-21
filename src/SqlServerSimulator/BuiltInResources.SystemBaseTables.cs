@@ -662,6 +662,50 @@ internal static partial class BuiltInResources
     }
 
     /// <summary>
+    /// The <c>type</c> codes of every row <see cref="SystemTableObjectRows"/>
+    /// yields (<see cref="SystemTableObject.TypeCode"/>'s two and the shipped
+    /// queues'), which <see cref="MaySeekSystemRows"/> keeps a pushed
+    /// <c>type</c> equality from skipping. Debug builds check each yielded row
+    /// against it, so a new kind of system row fails a test instead of
+    /// vanishing from a <c>type</c> query.
+    /// </summary>
+    internal static readonly string[] SystemObjectTypeCodes = ["IT", "S ", "SQ"];
+
+    /// <summary>
+    /// Whether a pushed <c>sys.objects.type = &lt;comparand&gt;</c> may match a
+    /// system table's or shipped queue's row, so those rows must be generated.
+    /// False only for a non-NULL string comparand whose text, trailing spaces
+    /// removed, is one or two ASCII letters that equal none of
+    /// <see cref="SystemObjectTypeCodes"/> ignoring case. Comparing ignoring
+    /// case and only for ASCII keeps the answer conservative under every
+    /// collation the comparison can resolve to (case-sensitive, binary,
+    /// Turkish, an explicit <c>COLLATE</c>), so none is consulted. Anything
+    /// else answers true: a non-string comparand (<c>type = 1</c> must still
+    /// meet the system rows, where the residual raises Msg 245), NULL, an empty
+    /// or longer text, a non-ASCII or non-letter character. The residual
+    /// <c>WHERE</c> still judges every row generated.
+    /// </summary>
+    internal static bool MaySeekSystemRows(CatalogFilter filter)
+    {
+        if (filter.Column is null || filter.Value.IsNull || filter.Value.Type.Category != SqlTypeCategory.String)
+            return true;
+        var text = filter.Value.AsString.AsSpan().TrimEnd(' ');
+        if (text.Length is not (1 or 2))
+            return true;
+        foreach (var c in text)
+        {
+            if (c is not ((>= 'A' and <= 'Z') or (>= 'a' and <= 'z')))
+                return true;
+        }
+        foreach (var code in SystemObjectTypeCodes)
+        {
+            if (text.Equals(code.AsSpan().TrimEnd(' '), StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
     /// The <c>sys.objects</c> rows of <paramref name="database"/>'s system
     /// tables, then its shipped queues', which real lists in <c>dbo</c> beside
     /// the queues <c>CREATE QUEUE</c> makes (probed 2026-10-16 against SQL
@@ -674,6 +718,10 @@ internal static partial class BuiltInResources
         var databaseDate = SqlValue.FromDateTime(SysDatabasesCreateDate);
         foreach (var table in SystemTableObjects(database))
         {
+#if DEBUG
+            if (!SystemObjectTypeCodes.Contains(table.TypeCode))
+                throw new InvalidOperationException($"sys.objects lists a system row of type {table.TypeCode.TrimEnd()}, which SystemObjectTypeCodes does not name.");
+#endif
             yield return [
                 SqlValue.FromInt32(table.ObjectId),
                 SqlValue.FromSystemName(table.Name),

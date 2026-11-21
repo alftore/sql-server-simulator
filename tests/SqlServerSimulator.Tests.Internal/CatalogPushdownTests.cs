@@ -338,4 +338,140 @@ public sealed class CatalogPushdownTests
         DoesNotContain("Seek(", string.Join(",", trace));
         CollectionAssert.AreEqual(new object?[] { "b", "d", "e" }, rows);
     }
+
+    // --- sys.objects by type: a cold read skips the system rows and builds nothing ---
+
+    private static List<string> TraceOn(System.Data.Common.DbConnection connection, string query, out object? first)
+    {
+        CatalogPushdownDiagnostics.Sink = [];
+        try
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = query;
+            first = command.ExecuteScalar();
+            return CatalogPushdownDiagnostics.Sink;
+        }
+        finally
+        {
+            CatalogPushdownDiagnostics.Sink = null;
+        }
+    }
+
+    private static System.Data.Common.DbConnection OpenNew(string? setup = null)
+    {
+        var connection = new Simulation().CreateDbConnection();
+        connection.Open();
+        if (setup is not null)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = setup;
+            _ = command.ExecuteNonQuery();
+        }
+        return connection;
+    }
+
+    [TestMethod]
+    public void ObjectsType_OnAColdCache_ReadsFilteredWithoutBuilding()
+    {
+        var connection = OpenNew("create table t (a int)");
+        var cold = TraceOn(connection, "select count(*) from sys.objects where type = 'U'", out var count);
+        AreEqual(1, count);
+        Contains("Seek(objects.type)", cold);
+        DoesNotContain("CacheBuild(objects)", cold);
+        DoesNotContain("CacheHit(objects)", cold);
+        DoesNotContain("Scan(objects)", cold);
+
+        // A second filtered read still builds nothing.
+        DoesNotContain("CacheBuild(objects)", TraceOn(connection, "select count(*) from sys.objects where type = 'U'", out _));
+
+        // A whole-view read builds, and later type seeks hit it.
+        Contains("CacheBuild(objects)", TraceOn(connection, "select count(*) from sys.objects", out _));
+        var warm = TraceOn(connection, "select count(*) from sys.objects where type = 'U'", out count);
+        AreEqual(1, count);
+        Contains("CacheHit(objects)", warm);
+        Contains("Seek(objects.type)", warm);
+        DoesNotContain("CacheBuild(objects)", warm);
+    }
+
+    [TestMethod]
+    public void ObjectsType_OnAnotherColumnOrAnInList_StillBuildsTheCache()
+    {
+        var connection = OpenNew("create table t (a int)");
+        Contains("CacheBuild(objects)", TraceOn(connection, "select count(*) from sys.objects where name = 't'", out _));
+        connection = OpenNew("create table t (a int)");
+        Contains("CacheBuild(objects)", TraceOn(connection, "select count(*) from sys.objects where type in ('U', 'S')", out _));
+    }
+
+    [TestMethod]
+    public void ObjectsType_ProbeOfEfCore_BuildsNothingAndSeesTheNewTable()
+    {
+        const string Probe = """
+            IF EXISTS
+                (SELECT *
+                 FROM [sys].[objects] o
+                 WHERE [o].[type] = 'U'
+                 AND [o].[is_ms_shipped] = 0
+                 AND [o].[object_id] NOT IN (SELECT [ep].[major_id]
+                    FROM [sys].[extended_properties] AS [ep]
+                    WHERE [ep].[minor_id] = 0
+                        AND [ep].[class] = 1
+                        AND [ep].[name] = N'microsoft_database_tools_support'
+                )
+            )
+            SELECT 1 ELSE SELECT 0
+            """;
+        var connection = OpenNew();
+        var trace = TraceOn(connection, Probe, out var answer);
+        AreEqual(0, answer);
+        DoesNotContain("CacheBuild(objects)", trace);
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "create table t (a int)";
+            _ = command.ExecuteNonQuery();
+        }
+        _ = TraceOn(connection, Probe, out answer);
+        AreEqual(1, answer);
+    }
+
+    [TestMethod]
+    public void ObjectsType_OnMsdb_SeedsBeforeReading()
+    {
+        var connection = OpenNew();
+        var trace = TraceOn(connection, "select count(*) from msdb.sys.objects where type = 'U'", out var count);
+        Contains("Seek(objects.type)", trace);
+        DoesNotContain("CacheBuild(objects)", trace);
+        IsGreaterThan(0, Convert.ToInt32(count, System.Globalization.CultureInfo.InvariantCulture));
+    }
+
+    [TestMethod]
+    [DataRow("U", false)]
+    [DataRow("u", false)]
+    [DataRow("U ", false)]
+    [DataRow("PK", false)]
+    [DataRow("tt", false)]
+    [DataRow("S", true)]
+    [DataRow("s ", true)]
+    [DataRow("IT", true)]
+    [DataRow("it", true)]
+    [DataRow("SQ", true)]
+    [DataRow("sq", true)]
+    [DataRow("", true)]
+    [DataRow(" ", true)]
+    [DataRow("USR", true)]
+    [DataRow("Ü", true)]
+    [DataRow("U\u0000", true)]
+    [DataRow("1", true)]
+    public void MaySeekSystemRows_IsConservative(string comparand, bool expected)
+    {
+        var filter = new Schemas.CatalogFilter("type", Storage.SqlValue.FromNVarchar(comparand));
+        AreEqual(expected, BuiltInResources.MaySeekSystemRows(filter));
+    }
+
+    [TestMethod]
+    public void MaySeekSystemRows_AnswersTrueForNullNonStringAndNoFilter()
+    {
+        IsTrue(BuiltInResources.MaySeekSystemRows(new Schemas.CatalogFilter("type", Storage.SqlValue.Null(Storage.SqlType.Int32))));
+        IsTrue(BuiltInResources.MaySeekSystemRows(new Schemas.CatalogFilter("type", Storage.SqlValue.FromInt32(1))));
+        IsTrue(BuiltInResources.MaySeekSystemRows(Schemas.CatalogFilter.None));
+    }
 }
