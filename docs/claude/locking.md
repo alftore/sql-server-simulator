@@ -680,6 +680,7 @@ Two sources feed the wait (`Simulation.AwaitUncommittedKeyWriters`, called once 
 
 - **A live row carrying the key** under another session's row X, found through the seek cache's `MatchingRows` — the uncommitted insert, or a rewrite *to* the key.
 - **`HeapTable.SupersededKeyImages`**, each session's pre-images of the rows it deleted or rewrote while it still holds their row X (`BatchContext.NoteSupersededRow`, called at every UPDATE / DELETE / MERGE / FK-cascade rewrite site after the row X is taken).
+  Both this map and `Schema.DefinitionLocks` are `CountedDictionary`s: the guard every read asks first, whether anything is held at all (`IsEmptyLockFree`), is one read of a count kept beside the dictionary, raised before an entry is added and lowered after one is removed, so it can read "held" for an instant too long and never "empty" while an entry is present.
   An entry retires with the final release of its row X — `LockResource.RowAddress` tells `LockManager.Release` which — so the registry holds only writes still in flight, and a session's own entries are never consulted by its own checks.
 
 A check whose key has a NULL component scans rather than seeks, and waits on a live row carrying the key the same way; it doesn't consult the delete registry, so a NULL key an uncommitted DELETE took away is free to reuse at once.

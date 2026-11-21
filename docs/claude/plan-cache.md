@@ -1008,6 +1008,19 @@ Measured 2026-10-25 (Release, one batch per fresh simulation, the faster of two 
 | 16,384 `SET`s | 325 ms | 40 ms |
 | 8,192 `SELECT`s | 614 ms | 72 ms |
 
+### A first execution on a fresh simulation
+
+A test class gives every test a new simulation, so each command a test runs is a first execution, and the cache-warm figures above say little of it.
+Four streams of a test's own commands (EF Core's create, seed, query, update and delete shapes, 20 commands each, each on a new `Simulation`) measured 1,080 µs and 923 KB per stream on 2026-11-21 (Release, medians of five alternating rounds, the sum of each command's median).
+
+- **The emptiness guards no longer start an enumerator.**
+  A schema's definition locks are asked "is anything held" before every name resolution, and a table's superseded key images before every read or write that could meet another session's delete: some 330 asks per stream, 160 of them the first and 115 the second, each of which allocated the dictionary's enumerator to see whether it had a first entry.
+  Both dictionaries are `CountedDictionary`s, which keep a count beside the dictionary that the guard reads (`IsEmptyLockFree`); every write goes through the class's own methods, which raise the count before an entry is added and lower it after one is removed, so the count is never below the entries.
+  A guard that reads "held" for an instant too long costs the lookup it guards, which is safe by itself; one that read "empty" while an entry was present would skip a wait, which the order forbids: a session that begins after another's add returned reads the raised count.
+  In Debug every write also runs under a gate and every power-of-two ask compares the count with the dictionary's own.
+  The other hot guards (`Schema.Triggers` and `Database.DdlTriggers`, a tenth of the asks) stay as they were: the DDL undo (`RecordSlotUndo`) writes their dictionaries itself, which a count beside them would have to follow.
+  One stream went from 923 KB to 908 KB (−1.7%) and from 1,080 µs to 1,068 µs (the ranges overlap, 1,065–1,094 against 1,046–1,071).
+
 ## The plan-cache DMVs
 
 `sys.dm_exec_cached_plans`, `sys.dm_exec_query_stats`, `sys.dm_exec_procedure_stats`, `sys.dm_exec_trigger_stats`, `sys.dm_exec_function_stats`, `sys.dm_exec_query_optimizer_info` and the `sys.dm_exec_plan_attributes` / `sys.dm_exec_query_plan` / `sys.dm_exec_text_query_plan` functions read `Simulation.CachedPlans` (`CachedPlans.cs`, hooks in `Simulation.CachedPlans.cs`), a registry of the plans real would hold.
