@@ -83,6 +83,13 @@ public sealed class SimulatedDbDataReader : DbDataReader
             this.pendingFault = null;
             fault.Throw();
         }
+        // Past the end there is nothing to run, so no scope: the client's last
+        // NextResult, after RunAhead has finished the batch, is such an advance.
+        if (this.streamEnded)
+        {
+            outcome = null!;
+            return false;
+        }
         // The outcome stream runs the batch's statements as it advances, so
         // each advance is an entry into the engine; the rows a result set
         // serves were produced before it was yielded.
