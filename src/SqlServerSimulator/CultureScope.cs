@@ -19,7 +19,8 @@ namespace SqlServerSimulator;
 /// code opens <see cref="Engine"/> for its duration rather than each formatting
 /// site naming a provider. A member that returns while engine work is still
 /// pending (the data reader's lazily advanced outcome stream) opens it again
-/// on each call that resumes the work.
+/// on each call that resumes the work, and none for a reader's close once its
+/// batch has ended, since the close then runs no engine code.
 /// </para>
 /// <para>
 /// The culture flows with the <see cref="ExecutionContext"/>, so a task, a
