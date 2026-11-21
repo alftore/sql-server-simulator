@@ -26,7 +26,9 @@ namespace SqlServerSimulator;
 /// inserted — reads the entry and writes nothing that other cores share.
 /// Lookups take no lock; an eviction sweep runs on one thread at a time while
 /// lookups and inserts go on beside it, and an insert finding a sweep under
-/// way leaves the overshoot to the next one.
+/// way leaves the overshoot to it: the sweep judges each entry by the stamp
+/// it read, so hits landing meanwhile can't leave it nothing to evict, and
+/// goes round again while the cache is still over its bound.
 /// </para>
 /// <para>
 /// A full cache admits a new key only on its second arrival, remembered in
@@ -43,14 +45,26 @@ namespace SqlServerSimulator;
 /// for an entry whose loss would change what the simulator reports rather
 /// than what it costs.
 /// </para>
+/// <para>
+/// A cache given a <paramref name="weightCapacity"/> also bounds the summed
+/// weight its inserts declare — the process-wide text tier
+/// (<see cref="SharedTextTier{TKey, TValue}"/>) weighs an entry by its text's
+/// length — and counts as full, and sweeps, past either bound. A sweep over
+/// the weight goes on past the median, oldest first, until at most half the
+/// weight bound is left. Without one, every weight is 0 and the cache behaves
+/// as if weights didn't exist.
+/// </para>
 /// </remarks>
-internal sealed class BoundedCache<TKey, TValue>(int capacity, IEqualityComparer<TKey>? comparer = null)
+internal sealed class BoundedCache<TKey, TValue>(int capacity, IEqualityComparer<TKey>? comparer = null, long weightCapacity = long.MaxValue)
     where TKey : notnull
 {
     private readonly ConcurrentDictionary<TKey, Slot> slots = new(comparer);
 
     /// <summary>The unpinned entries <see cref="slots"/> holds, counted on add and remove, since the dictionary's own count takes every one of its locks.</summary>
     private int count;
+
+    /// <summary>The summed weight of the unpinned entries <see cref="slots"/> holds, kept beside <see cref="count"/>.</summary>
+    private long weight;
 
     /// <summary>The insert clock a hit stamps its entry with.</summary>
     private long epoch;
@@ -72,15 +86,19 @@ internal sealed class BoundedCache<TKey, TValue>(int capacity, IEqualityComparer
     /// <summary>Test-observable: entries the sweeps have evicted.</summary>
     public long Evictions;
 
-    private sealed class Slot(TValue value, long lastUsed, bool pinned)
+    private sealed class Slot(TValue value, long lastUsed, bool pinned, int weight = 0)
     {
         public readonly TValue Value = value;
         public readonly bool Pinned = pinned;
+        public readonly int Weight = weight;
         public long LastUsed = lastUsed;
     }
 
     /// <summary>The unpinned entries held.</summary>
     public int Count => Volatile.Read(ref this.count);
+
+    /// <summary>The summed weight of the unpinned entries held.</summary>
+    public long Weight => Volatile.Read(ref this.weight);
 
     public bool TryGetValue(TKey key, [MaybeNullWhen(false)] out TValue value)
     {
@@ -147,13 +165,14 @@ internal sealed class BoundedCache<TKey, TValue>(int capacity, IEqualityComparer
     /// <summary>
     /// Stores <paramref name="value"/> under <paramref name="key"/> unless an
     /// entry is already there or a full cache refuses the key (see
-    /// <see cref="Admits"/>).
+    /// <see cref="Admits"/>). <paramref name="weight"/> counts toward the
+    /// cache's weight bound while the entry stays.
     /// </summary>
-    public bool TryAdd(TKey key, TValue value, bool pinned = false)
+    public bool TryAdd(TKey key, TValue value, bool pinned = false, int weight = 0)
     {
         if (!pinned && !this.Admits(key))
             return false;
-        var slot = new Slot(value, Interlocked.Increment(ref this.epoch), pinned);
+        var slot = new Slot(value, Interlocked.Increment(ref this.epoch), pinned, weight);
         if (!this.slots.TryAdd(key, slot))
             return false;
         this.Recount(slot, 1);
@@ -162,12 +181,12 @@ internal sealed class BoundedCache<TKey, TValue>(int capacity, IEqualityComparer
 
     /// <summary>
     /// Whether a new <paramref name="key"/> may enter: always while the cache
-    /// is under its capacity, and once it is full on the key's second arrival.
-    /// A refusal remembers the arrival.
+    /// is under its capacity and weight bound, and once it is full on the
+    /// key's second arrival. A refusal remembers the arrival.
     /// </summary>
     private bool Admits(TKey key)
     {
-        if (Volatile.Read(ref this.count) < capacity)
+        if (Volatile.Read(ref this.count) < capacity && Volatile.Read(ref this.weight) < weightCapacity)
             return true;
         // Never 0, the hash an unwritten position holds.
         var hash = this.slots.Comparer.GetHashCode(key) | 1;
@@ -188,7 +207,7 @@ internal sealed class BoundedCache<TKey, TValue>(int capacity, IEqualityComparer
     {
         if (!this.slots.TryGetValue(key, out var existing) || !ReferenceEquals(existing.Value, comparand))
             return false;
-        var slot = new Slot(value, Interlocked.Increment(ref this.epoch), existing.Pinned);
+        var slot = new Slot(value, Interlocked.Increment(ref this.epoch), existing.Pinned, existing.Weight);
         return this.slots.TryUpdate(key, slot, existing);
     }
 
@@ -215,47 +234,92 @@ internal sealed class BoundedCache<TKey, TValue>(int capacity, IEqualityComparer
     {
         if (slot.Pinned)
             return;
-        if (Interlocked.Add(ref this.count, delta) > capacity && delta > 0)
+        var counted = Interlocked.Add(ref this.count, delta);
+        var weighed = slot.Weight == 0 ? Volatile.Read(ref this.weight) : Interlocked.Add(ref this.weight, (long)delta * slot.Weight);
+        if (delta > 0 && (counted > capacity || weighed > weightCapacity))
             this.Sweep();
+    }
+
+    /// <summary>
+    /// Sweeps unless another thread is, and again while the cache is still
+    /// over a bound — the inserts that found this sweep under way left their
+    /// overshoot to it — a few rounds at most.
+    /// </summary>
+    private void Sweep()
+    {
+        for (var round = 0; round < 4; round++)
+        {
+            if (Interlocked.Exchange(ref this.sweeping, 1) != 0)
+                return;
+            try
+            {
+                this.SweepOnce();
+            }
+            finally
+            {
+                Volatile.Write(ref this.sweeping, 0);
+            }
+            if (Volatile.Read(ref this.count) <= capacity && Volatile.Read(ref this.weight) <= weightCapacity)
+                return;
+        }
     }
 
     /// <summary>
     /// Evicts the unpinned entries used less recently than the median one.
     /// Entries stamped alike at the median go too when that alone would free
     /// too little, so a run of entries inserted and never hit can't keep the
-    /// cache over its capacity.
+    /// cache over its capacity. Past the weight bound the oldest entries go
+    /// as well, whatever their number, until at most half of it is left.
+    /// Each entry is judged by the stamp this sweep read, so a hit landing
+    /// while it runs can't leave it with nothing to evict.
     /// </summary>
-    private void Sweep()
+    private void SweepOnce()
     {
-        if (Interlocked.Exchange(ref this.sweeping, 1) != 0)
+        var entries = new List<(TKey Key, Slot Slot, long Stamp)>(capacity + 16);
+        foreach (var (key, slot) in this.slots)
+        {
+            if (!slot.Pinned)
+                entries.Add((key, slot, slot.LastUsed));
+        }
+        var total = 0L;
+        foreach (var (_, slot, _) in entries)
+            total += slot.Weight;
+        var overWeight = total > weightCapacity;
+        if (entries.Count <= capacity && !overWeight)
             return;
-        try
+        entries.Sort(static (a, b) => a.Stamp.CompareTo(b.Stamp));
+
+        // Evicted by count: used before the median, or at it when inclusive.
+        var median = long.MinValue;
+        var inclusive = false;
+        if (entries.Count > capacity)
         {
-            var stamps = new List<long>(capacity + 16);
-            foreach (var (_, slot) in this.slots)
-            {
-                if (!slot.Pinned)
-                    stamps.Add(slot.LastUsed);
-            }
-            if (stamps.Count <= capacity)
-                return;
-            stamps.Sort();
-            var median = stamps[stamps.Count / 2];
-            var inclusive = stamps.IndexOf(median) < stamps.Count / 4;
-            var evicted = 0;
-            foreach (var (key, slot) in this.slots)
-            {
-                if (!slot.Pinned && (slot.LastUsed < median || (inclusive && slot.LastUsed == median)) && this.slots.TryRemove(KeyValuePair.Create(key, slot)))
-                {
-                    _ = Interlocked.Decrement(ref this.count);
-                    evicted++;
-                }
-            }
-            _ = Interlocked.Add(ref this.Evictions, evicted);
+            median = entries[entries.Count / 2].Stamp;
+            inclusive = entries.FindIndex(entry => entry.Stamp == median) < entries.Count / 4;
         }
-        finally
+
+        // Evicted by weight: used at or before the stamp that leaves at most half the bound.
+        var weightCutoff = long.MinValue;
+        for (var i = 0; overWeight && i < entries.Count && total > weightCapacity / 2; i++)
         {
-            Volatile.Write(ref this.sweeping, 0);
+            total -= entries[i].Slot.Weight;
+            weightCutoff = entries[i].Stamp;
         }
+        if (median == long.MinValue && weightCutoff == long.MinValue)
+            return;
+
+        var evicted = 0;
+        foreach (var (key, slot, stamp) in entries)
+        {
+            if ((stamp < median || (inclusive && stamp == median) || stamp <= weightCutoff)
+                && this.slots.TryRemove(KeyValuePair.Create(key, slot)))
+            {
+                _ = Interlocked.Decrement(ref this.count);
+                if (slot.Weight != 0)
+                    _ = Interlocked.Add(ref this.weight, -slot.Weight);
+                evicted++;
+            }
+        }
+        _ = Interlocked.Add(ref this.Evictions, evicted);
     }
 }

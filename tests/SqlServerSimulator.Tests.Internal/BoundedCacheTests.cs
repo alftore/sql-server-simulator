@@ -9,6 +9,8 @@ namespace SqlServerSimulator;
 [TestClass]
 public sealed class BoundedCacheTests
 {
+    public TestContext TestContext { get; set; } = null!;
+
     [TestMethod]
     public void UnderItsCapacity_EveryKeyIsAdmittedOnArrival()
     {
@@ -89,5 +91,40 @@ public sealed class BoundedCacheTests
         IsTrue(cache.ContainsKey(5));
         cache.Clear();
         AreEqual(0, cache.Count);
+    }
+
+    [TestMethod]
+    public void UnderConcurrentHitsAndInserts_ItStaysNearItsCapacity()
+    {
+        // Eight threads hit and insert over far more keys than it holds.
+        // A sweep running while the others hit judges each entry by the
+        // stamp it read, and goes round again while the cache is still over:
+        // a sweep whose median the hits outran once evicted nothing, and the
+        // inserts that met it under way left every key in the cache.
+        const int Keys = 400, Threads = 8;
+        var cache = new BoundedCache<int, string>(32);
+        var cancellation = this.TestContext.CancellationToken;
+        using var start = new Barrier(Threads);
+        var threads = new Thread[Threads];
+        for (var t = 0; t < Threads; t++)
+        {
+            var seed = t;
+            threads[t] = new Thread(() =>
+            {
+                var random = new Random(seed);
+                start.SignalAndWait(cancellation);
+                for (var i = 0; i < 20_000; i++)
+                {
+                    var key = random.Next(Keys);
+                    if (!cache.TryGetValue(key, out _))
+                        _ = cache.TryAdd(key, "v");
+                }
+            });
+            threads[t].Start();
+        }
+        foreach (var thread in threads)
+            thread.Join();
+        IsGreaterThan(0L, cache.Evictions);
+        IsLessThanOrEqualTo(32 + Threads, cache.Count);
     }
 }

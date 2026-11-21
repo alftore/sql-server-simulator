@@ -10,6 +10,9 @@ Two per-`Simulation` reuse layers over a repeated `CommandText`, one stacked on 
   It is what serves the statements that have no plan to cache, it backs the first parse of a text the plan cache will go on to store, and it is what a DML statement plan jumps over.
 
 The two are independent: a plan-cache hit never consults the memo (it doesn't parse at all), and a memo hit says nothing about whether a plan will be stored.
+
+Under the token memo, and under Query Store's statement shapes, sits one more layer that is **process-wide**: what a statement's text alone decides — its token sequence, its shape — is the same in every simulation running the text under the same collation, compatibility level and `QUOTED_IDENTIFIER`, so a sequence or shape one simulation computed serves the next simulation's first execution.
+It holds nothing of any simulation's schema, settings, session or data, so it can't go stale and nothing clears it; each simulation's own layers, and their counters, go on as if it weren't there ([The process-wide tier](#the-process-wide-tier)).
 [Which statement kinds reach which layer](#statement-kind-eligibility-what-can-be-replayed) is the substance of the split.
 
 Neither layer is what `sys.dm_exec_cached_plans` lists: the DMVs read a third structure that keeps what *real* keeps, whatever the simulator found cheap to replay — see [The plan-cache DMVs](#the-plan-cache-dmvs).
@@ -45,7 +48,7 @@ Every bump also invalidates the catalog row cache, which the non-DDL metadata ch
 
 ## Clearing: `DBCC FREEPROCCACHE`
 
-`Simulation.ClearPlanCache` removes entries rather than staling them: `DBCC FREEPROCCACHE` (bare, or naming the `default` pool, which holds every plan here) and `DBCC FREESYSTEMCACHE('ALL' | 'SQL Plans')` empty the plan cache (both kinds of plan), the compiled-batch memo and the token memo, so the next execution of any text tokenizes, compiles and parses afresh.
+`Simulation.ClearPlanCache` removes entries rather than staling them: `DBCC FREEPROCCACHE` (bare, or naming the `default` pool, which holds every plan here) and `DBCC FREESYSTEMCACHE('ALL' | 'SQL Plans')` empty the plan cache (both kinds of plan), the compiled-batch memo and the token memo, so the next execution of any text compiles and parses afresh and misses the token memo; its tokens may still come from the [process-wide tier](#the-process-wide-tier), which no clearing empties, since nothing in it can be stale and nothing observable depends on tokenizing again.
 Given a `sql_handle` (the value `sys.dm_exec_requests.sql_handle` reports), `FREEPROCCACHE` removes the plan cache and compiled-batch entries whose command text hashes to it, and leaves the token memo alone.
 `ALTER DATABASE SCOPED CONFIGURATION CLEAR PROCEDURE_CACHE` removes the plan cache and compiled-batch entries compiled in the session's database, and leaves the token memo alone.
 Each of the three also empties what the [plan-cache DMVs](#the-plan-cache-dmvs) list in the same scope, and a plan handle `sys.dm_exec_cached_plans` reports removes that one plan; the `internal` pool names nothing. `DbccPlanCacheTests` (Tests.Internal) pins each scope of the parse caches.
@@ -273,6 +276,42 @@ Tokens themselves are immutable: `Token` holds `(command, startIndex, length)` r
 Capacity is the plan cache's, with its eviction and admission (see [Capacity](#capacity)).
 A parse whose sequence the memo refuses still collects it: Query Store reads a statement's tokens back from it (`ParserContext.StatementTokens`) rather than tokenizing the text again, and the batch compile walk hands its sequence to the run that follows it, which reads it whether the memo kept it or not — a one-off text is tokenized once, and reaches the memo once, which is what lets the memo's admission tell it from a repeated one.
 
+### The process-wide tier
+
+`TokenMemo.Shared` and `Simulation.SharedQueryStoreShapes` (`SharedTextTier`) sit under every simulation's token memo and statement-shape cache.
+A test suite builds a fresh `Simulation` per test and runs the same application statements in each; before the tier, every one of them tokenized each text again and read each statement's shape again, 6.8% and 4.5% of what a fresh EF Core test allocated (FreshParts, 2026-11-21).
+
+**Keys.** The token tier is keyed by `TokenMemoKey` itself; the shape tier by `QueryStoreShapeKey` — the statement text, the collation, compatibility level and `QUOTED_IDENTIFIER` its tokens were read under, and which tokens: the text's own, tokenized again (`TextTokens`), or the parser's, by the number of the text's first characters they span — looked up through a span (`QueryStoreShapeLookup`), so a hit allocates nothing.
+The token part matters: a `MERGE`'s text holds the `;` it requires and the parser's tokens stop short of it, so the shape read off the parse hashes without the `;` and the one read off the text with it, and a simulation records whichever its own first capture reads — the parse when the `MERGE` completes, the text when a run-time error ends it.
+Keyed by text and inputs alone, a simulation whose first `MERGE` failed would have handed its hash to every other simulation; Debug's audit found it, and `SharedTextTierTests.QueryStoreShape_Merge_KeepsTheHashItsOwnReadingGives` pins it (the per-simulation cache, keyed by the text alone, still records whichever reading came first, as it did before the tier).
+Collations are interned process-wide (`Collation.TryGet`), so the by-reference compare the per-simulation key relies on holds across simulations; a collation that wasn't interned would only miss.
+
+**What goes in, and why it is safe to share.**
+A token sequence goes in where the memo's does (`Publish`), so the tier inherits the four rules above: only a complete, error-free sequence of a text that doesn't change its own tokenizing inputs.
+`Tokenizer.NextToken` is a static function of the text and the three inputs, so the sequence is the same whichever simulation tokenized it.
+Tokens hold `(command, start, length)`, a keyword, a name's value or a literal's `SqlValue` — strings, bytes no one writes, interned types and collations — and the one mutable member is the lazy, idempotent `ContextualKeyword`.
+A token's `command` is the first publisher's string; every reader of it reads characters equal to its own text's, as a per-simulation hit has always read another execution's string.
+A shape is read off a statement's tokens, the text and the database's collation and level (`QueryStoreShape.Read`); it holds strings, flags, the two hash arrays and those inputs, nothing of the simulation that read it.
+Its three lazy fields memoize pure functions — the forced form, the last declared text, the last variable prefix (reused only when the variables resolve to the same names and the same interned types, so the prefix is the one it would build) — each written whole through `Volatile`.
+A shape is shared only when its tokens were read under the inputs it is keyed by: tokenized again under the database's, or the parser's own when `ParserContext.StatementTokensReadUnder` matches the database's collation and level and the `QUOTED_IDENTIFIER` the shape records, and the characters they span begin the text — the tokenizer reads nothing before where it starts, so those tokens are what those characters tokenize to wherever they stand; a statement after a `USE`, whose tokens were bound in another database, reads its shape unshared, as before.
+The hash arrays never reach a client by reference (a result row carries a copy): `SharedTextTierTests.ClientWritingIntoAQueryHash_ChangesNoOtherSimulation` pins it, and `ClientWritingIntoABinaryLiteral_ChangesNoOtherSimulation` does for a token's bytes.
+`ANSI_NULLS`, `DATEFORMAT`, `CONCAT_NULL_YIELDS_NULL` and the other session settings are read by the parse or the run, never by the tokenizer, so they are in the plan cache's key and not this one; a compatibility level or collation changed mid-session is a new key at the next bind.
+
+**The per-simulation layers are unchanged.**
+A simulation asks the tier only on its own memo's miss, after the compile walk's hand-off (`BindTokenMemo`), and counts the miss as before, plus `TokenMemo.SharedHits`.
+The sequence it is served is replayed in place of tokenizing live, and enters its own memo (`TokenMemo.Adopt`) exactly where the live parse would have published it — as `TokenizeAhead` binds, or when the replay reaches the text's end — and is handed to the run a compile walk precedes; a parse abandoned when its inputs move adopts nothing, as a live one publishes nothing.
+So the memo's entries, admissions, evictions, `Hits`, `Misses` and `Count` are what they were without the tier (`SharedTextTierTests.PerSimulationCounters_AreWhatTheyWereWithoutTheTier` runs one stream on two simulations and compares every batch's deltas).
+A shape the tier serves enters the simulation's own cache as a shape read there would (`Simulation.QueryStoreShapeSharedHits` counts them).
+
+**Bounds.** Each tier holds at most its per-simulation counterpart's entries (1024 sequences, 4096 shapes) and 1 Mi characters of key text (`TokenMemo.SharedTextBudget`), whichever is reached first; a text longer than 32,768 characters (`MaxSharedTextLength`) is kept per simulation only, so a seed script or an imported database's batch isn't held for the life of the process.
+They are `BoundedCache`s weighted by text length ([Capacity](#capacity)), with the same recency eviction and second-arrival admission, and not tunable: a miss costs what a fresh simulation paid before the tier existed.
+
+**Concurrency.** Entries are built whole and published by one `TryAdd`; a lookup takes no lock; a sweep runs on one thread at a time beside lookups and inserts.
+Racing first executions each tokenize and the first add wins; the others' sequences are equal and serve their own parse.
+
+**Debug audit.** On the first shared hit of each tier and every power-of-two one after it, `TokenMemo.AuditShared` tokenizes the text again under the key and compares each token's kind, position, length, keyword, name and literal value (type, collation and payload), and `QueryStoreShapeOf` reads the shape again as this simulation would have read it without the tier — off its own parser's tokens or off the text — and compares every field (`QueryStoreShape.DifferenceFrom`); a difference throws naming the text.
+Run on every shared hit rather than sampled, both audits passed all of `Tests`, `Tests.Internal`, `Tests.EFCore`, `Tests.SqlClient` and `Tests.Smo` (2026-11-21).
+
 ## The shared-plan contract: per-execution state lives per execution
 
 A cached `Selection` is **one object executed by many commands, possibly concurrently**.
@@ -386,6 +425,8 @@ The replay path is also where `PlanCacheHits` increments; misses increment in `C
 ## Capacity
 
 The plan cache, the statement plan sets, the compiled-batch memo, the token memo, the statement ends and Query Store's statement shapes share one policy (`BoundedCache`): about 1024 entries (4096 for the shapes), past which an insert evicts the least recently used half.
+The process-wide tier's two caches bound their text as well: an entry weighs its text's length, and past the weight bound a sweep goes on, oldest first, until at most half of it is left.
+A sweep judges each entry by the stamp it read as it began, and goes round again (a few times at most) while the cache is still over a bound: a sweep whose median the other threads' hits outran once evicted nothing, and the inserts that met it under way left every key in the cache (`BoundedCacheTests.UnderConcurrentHitsAndInserts_ItStaysNearItsCapacity`).
 A full cache admits a new key only on its second arrival, so one-off texts never enter it once it has filled; until then every key is admitted on arrival, so a simulation serving one test caches what it repeats from its first repeat.
 Refreshing a known key — a DDL invalidation overwriting under the same key — needs no admission and doesn't grow the cache.
 
@@ -409,6 +450,8 @@ Whether a replay reports what a fresh parse reports is `DmlPlanReplayTests`' and
 
 `Simulation.TokenMemo`'s `Hits` / `Misses` / `Count` back `TokenMemoTests`: a repeated DML batch is served on its second execution, a text carrying every token shape replays identically, each `QUOTED_IDENTIFIER` setting gets its own entry while a text that *flips* it mid-batch is never served, a tokenizer error reports the same message on every execution, the back-and-forth-lookahead shape memoizes what it parsed, a procedure body is served across invocations, and 8 workers share one sequence with no divergence.
 Those tests deliberately use plan-cache-declined shapes: a bare repeated SELECT is served by the plan cache and never reaches the memo at all, which makes a memo-hit assertion over one silently vacuous.
+`TokenMemo.SharedHits` and `Simulation.QueryStoreShapeSharedHits` back `SharedTextTierTests` (Tests.Internal): a second simulation's first execution reads the tier and its second its own memo; the per-simulation counters move as without the tier over writes, an erroring batch, a procedure and a clearing; server and database collations, compatibility levels (one changed mid-session) and `QUOTED_IDENTIFIER` keep their own tokens, while `ANSI_NULLS` and `DATEFORMAT` share one sequence and answer per session; a tokenizer error, a text flipping `QUOTED_IDENTIFIER` and a text past the length bound are never shared; Query Store's texts, hashes and parameterization agree across simulations, keep `QUOTED_IDENTIFIER` apart, and a `MERGE` keeps the hash its own first capture reads; a client writing into a hash or a binary literal it read changes nothing elsewhere; 8 threads, each running EF Core's stream in a fresh simulation for three rounds, answer as a simulation alone does; a small tier past its count, past its text budget and under concurrent reads and evictions stays bounded and consistent; and, in Debug, each audit throws on a sequence or shape that differs.
+Each test runs texts tagged with its own name, since the tier is shared by every test in the process.
 
 ## Performance impact
 

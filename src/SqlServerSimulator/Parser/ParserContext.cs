@@ -97,6 +97,13 @@ internal sealed class ParserContext(SimulatedDbCommand command, BatchContext bat
     private bool memoBound;
 
     /// <summary>
+    /// Whether <see cref="memoTokens"/> came from the process-wide tier and
+    /// the simulation's own memo is yet to adopt it, which it does where a
+    /// live parse of the text would have published (<see cref="AdoptSharedTokens"/>).
+    /// </summary>
+    private bool adoptsSharedTokens;
+
+    /// <summary>
     /// The effective <c>QUOTED_IDENTIFIER</c> setting at the current parse
     /// position: <see langword="true"/> tokenizes <c>"…"</c> as a delimited
     /// identifier, <see langword="false"/> as a varchar string literal.
@@ -1277,20 +1284,54 @@ internal sealed class ParserContext(SimulatedDbCommand command, BatchContext bat
     /// collecting one), so a reader of the statement's tokens needn't
     /// tokenize its text again; null otherwise.
     /// </summary>
-    public List<Token>? StatementTokens(Checkpoint start)
+    public List<Token>? StatementTokens(Checkpoint start) => this.StatementTokenSource(start, out var first, out var end) switch
     {
-        var first = start.MemoPosition - 1;
-        var end = this.Token is null ? this.memoPosition : this.memoPosition - 1;
+        Token[] sequence => [.. sequence.AsSpan(first, end - first)],
+        List<Token> collected => collected.GetRange(first, end - first),
+        _ => null,
+    };
+
+    /// <summary>
+    /// Whether <see cref="StatementTokens"/> would return the statement's
+    /// tokens, without copying them, with the characters they span, from the
+    /// first one's start to the last one's end; when it would, they were read
+    /// under <see cref="StatementTokensReadUnder"/>.
+    /// </summary>
+    public bool HoldsStatementTokens(Checkpoint start, out ReadOnlySpan<char> spanned)
+    {
+        (Token First, Token Last)? ends = this.StatementTokenSource(start, out var first, out var end) switch
+        {
+            Token[] sequence => (sequence[first], sequence[end - 1]),
+            List<Token> collected => (collected[first], collected[end - 1]),
+            _ => null,
+        };
+        spanned = ends is var (from, to) ? from.command.AsSpan(from.StartIndex, to.EndIndex - from.StartIndex) : default;
+        return ends is not null;
+    }
+
+    /// <summary>
+    /// The tokenization inputs every sequence <see cref="StatementTokens"/>
+    /// reads from was read under: the replayed sequence's key, or the inputs
+    /// a collection ran under (a change abandons the collection).
+    /// </summary>
+    public ref readonly TokenMemoKey StatementTokensReadUnder => ref this.memoKey;
+
+    /// <summary>
+    /// The sequence holding the statement from <paramref name="start"/> to
+    /// <see cref="Token"/> — the replayed <c>Token[]</c> or the collected
+    /// <c>List&lt;Token&gt;</c> — with the statement's range in it; null when
+    /// this parse holds none.
+    /// </summary>
+    private object? StatementTokenSource(Checkpoint start, out int first, out int end)
+    {
+        first = start.MemoPosition - 1;
+        end = this.Token is null ? this.memoPosition : this.memoPosition - 1;
         if (start.Token is null || first < 0 || end <= first)
             return null;
         if (this.memoTokens is { } sequence)
-        {
-            if (end > sequence.Length || !ReferenceEquals(sequence[first], start.Token))
-                return null;
-            return [.. sequence.AsSpan(first, end - first)];
-        }
+            return end > sequence.Length || !ReferenceEquals(sequence[first], start.Token) ? null : sequence;
         if ((this.memoCollector ?? this.publishedTokens) is { } collected && end <= collected.Count && ReferenceEquals(collected[first], start.Token))
-            return collected.GetRange(first, end - first);
+            return collected;
         return null;
     }
 
@@ -1477,6 +1518,7 @@ internal sealed class ParserContext(SimulatedDbCommand command, BatchContext bat
             // is published (the sequence would be a splice of two settings).
             this.memoTokens = null;
             this.memoCollector = null;
+            this.adoptsSharedTokens = false;
         }
 
         if (this.memoTokens is { } memo)
@@ -1496,6 +1538,10 @@ internal sealed class ParserContext(SimulatedDbCommand command, BatchContext bat
                 return true;
             }
 
+            // A sequence from the process-wide tier reached its end where a
+            // live parse would have published it.
+            if (this.adoptsSharedTokens)
+                this.AdoptSharedTokens();
             this.index = commandText.Length;
             if (this.Token is { } last)
             {
@@ -1661,11 +1707,38 @@ internal sealed class ParserContext(SimulatedDbCommand command, BatchContext bat
         // statement's tokens back rather than tokenizing its text a second
         // time.
         if (memo.TryGet(this.memoKey) is { } stored)
+        {
             this.memoTokens = stored;
+        }
         else if (this.walkedTokens is { } walked && walked.Key.Equals(this.memoKey))
+        {
             this.memoTokens = walked.Tokens;
+        }
+        else if (memo.TryGetShared(this.memoKey) is { } shared)
+        {
+            // Replayed in place of tokenizing live, and adopted by this
+            // simulation's memo where the live parse would have published.
+            this.memoTokens = shared;
+            this.adoptsSharedTokens = true;
+        }
         else
+        {
             this.memoCollector = [];
+        }
+    }
+
+    /// <summary>
+    /// What a live parse does on completing its sequence, for a sequence the
+    /// process-wide tier served: this simulation's memo stores it, and the
+    /// run a compile walk precedes is handed it.
+    /// </summary>
+    private void AdoptSharedTokens()
+    {
+        this.adoptsSharedTokens = false;
+        var sequence = this.memoTokens!;
+        this.Simulation.TokenMemo.Adopt(this.memoKey, sequence);
+        if (this.Batch.CompiledFor is { } running)
+            running.Parser.walkedTokens = (this.memoKey, sequence);
     }
 
     /// <summary>
@@ -1680,6 +1753,8 @@ internal sealed class ParserContext(SimulatedDbCommand command, BatchContext bat
         if (this.memoBound)
             return;
         this.BindTokenMemo();
+        if (this.adoptsSharedTokens)
+            this.AdoptSharedTokens();
         if (this.memoCollector is null)
             return;
         var database = this.CurrentDatabase;
