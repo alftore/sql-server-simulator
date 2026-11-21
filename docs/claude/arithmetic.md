@@ -219,6 +219,17 @@ Aggregates are covered by the same rule: `SumAggregator.LongSum.Wrap` and `Numer
 The checked path's cost is below measurement noise (300k-row arithmetic scan: 94–140 ms run-to-run on checked and unchecked builds alike, minima 95.3 vs 94.2 ms).
 Oracle: `IntegerArithmeticOverflowTests`.
 
+### The int fast paths
+`int` beside `int` is the dominant pair, and the general path (`IntegerArithmetic` → `PureIntegerArithmetic`) pays for its generality per row: a delegate call, the type promotion, the conversion checks, a `long` round trip.
+`Add.Run` (round 2), `Subtract.Run`, `Multiply.Run`, `Divide.Run` and `Modulus.Run` (round 3) take the pair directly when both operand types are the `SqlType.Int32` instance (a reference check, so `smallint`, `tinyint`, `bigint`, `bit`, strings and binaries never qualify) and neither value is NULL; anything else calls the unchanged general path.
+- **`+ - *`:** computed in `long` and narrowed; a result outside `int` throws `ArithmeticOverflow("int")`, the factory and argument `PureIntegerArithmetic` reaches (`int.MinValue * -1` and `int.MinValue - 1` included).
+- **`/ %`:** a zero divisor throws `DivideByZero()` (Msg 8134); `int.MinValue` over `-1` throws `ArithmeticOverflow("int")` for both operators, as the general path's quotient guard does; otherwise C#'s `/` and `%`, whose truncation toward zero and dividend-signed remainder are T-SQL's (`-7 / 3` is `-2`, `-7 % 3` is `-1`, `7 % -3` is `1`).
+- **Session options:** all five run inside `RunAbsorbing`'s `try`, so `ARITHABORT OFF` with `ANSI_WARNINGS OFF` still answers an overflow or a zero divisor with NULL; `NUMERIC_ROUNDABORT` is decimal-only and not reached. `Subtract.NegateViaZero` keeps calling `AdditiveArithmetic`, so unary minus is unchanged.
+- **Audit:** each class keeps a Debug-only `static long fastPathHits` (never a counter on the node, which a shared plan would share between executions); on a power-of-two hit it runs the general path on the same pair and throws `InvalidOperationException` if the type or value differs. The error paths throw before a value exists, so tests pin them instead.
+
+ColBench (16,000 rows, Release, minimum of three alternating runs, the round 3 planning prototype): `A - B > 0` 2.71–2.81 → 2.29–2.63 ms, `A * B > 0` 2.60–2.90 → 2.35–2.55, `A / 2 > 0` 2.51–2.57 → 2.02–2.15 (−17%), `A % 7 > 0` 2.43–2.61 → 2.07–2.28 (−15%); chains of eight: `/` −40%, `%` −40%, `-` −27%, `*` −30%.
+Oracle: `IntFastPathTests` (every pair of ten edge values through each operator as literals, as columns and through `bigint`; the Msg 8115 and 8134 rows; absorption; the sign rows; the other types' overflow names).
+
 ## Decimal arithmetic precision / scale
 Per-operator decimal scale rules differ from the joint-envelope rule used for non-arithmetic uses (comparison / COALESCE / set ops):
 - `+` / `-`: `p = max(p1-s1, p2-s2) + max(s1, s2) + 1`, `s = max(s1, s2)`
