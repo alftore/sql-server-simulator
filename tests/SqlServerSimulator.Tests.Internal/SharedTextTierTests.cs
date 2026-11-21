@@ -12,14 +12,28 @@ namespace SqlServerSimulator;
 /// simulation is served what another tokenized only under the same text,
 /// collation, compatibility level and <c>QUOTED_IDENTIFIER</c>, answers as it
 /// would alone, and counts its own memo's hits and misses as it did before the
-/// tier. The tier is shared by every test in the process and they run in
-/// parallel, so each test runs texts no other test runs (a tag of its own in a
+/// tier. Each test runs texts no other test runs (a tag of its own in a
 /// comment) and reads the counters of simulations it built itself.
 /// </summary>
+/// <remarks>
+/// The tier is shared by every test in the process, and a full tier admits a
+/// text only on its second arrival, so a test that expects a second
+/// simulation to be served fails whenever the rest of the suite has just
+/// filled it. These tests therefore run alone, after the parallel ones, each
+/// on emptied tiers.
+/// </remarks>
 [TestClass]
+[DoNotParallelize]
 public sealed class SharedTextTierTests
 {
     public TestContext TestContext { get; set; } = null!;
+
+    [TestInitialize]
+    public void EmptyTheTiers()
+    {
+        TokenMemo.Shared.Clear();
+        Simulation.SharedQueryStoreShapes.Clear();
+    }
 
     private static SimulatedDbConnection Open(Simulation sim, string? setup = null)
     {
