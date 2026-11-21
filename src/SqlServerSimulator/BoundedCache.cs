@@ -28,7 +28,7 @@ namespace SqlServerSimulator;
 /// lookups and inserts go on beside it, and an insert finding a sweep under
 /// way leaves the overshoot to it: the sweep judges each entry by the stamp
 /// it read, so hits landing meanwhile can't leave it nothing to evict, and
-/// goes round again while the cache is still over its bound.
+/// goes round again until the cache is within its bound.
 /// </para>
 /// <para>
 /// A full cache admits a new key only on its second arrival, remembered in
@@ -243,11 +243,21 @@ internal sealed class BoundedCache<TKey, TValue>(int capacity, IEqualityComparer
     /// <summary>
     /// Sweeps unless another thread is, and again while the cache is still
     /// over a bound — the inserts that found this sweep under way left their
-    /// overshoot to it — a few rounds at most.
+    /// overshoot to it — until it is within them.
     /// </summary>
+    /// <remarks>
+    /// The rounds have no cap. An insert counts itself in and then looks for
+    /// a sweep; a sweep stops and then reads the counts, both through full
+    /// fences, so either the insert finds no sweep and sweeps itself or the
+    /// sweep sees the insert's count and goes round again. A sweep that gave
+    /// up after a few rounds still over the bound left the cache there for
+    /// good once every key it serves was in, since lookups never sweep. The
+    /// counts are exact (each add and remove moves them once), so the loop
+    /// ends once the inserts beside it stop outrunning it.
+    /// </remarks>
     private void Sweep()
     {
-        for (var round = 0; round < 4; round++)
+        while (true)
         {
             if (Interlocked.Exchange(ref this.sweeping, 1) != 0)
                 return;
@@ -257,7 +267,8 @@ internal sealed class BoundedCache<TKey, TValue>(int capacity, IEqualityComparer
             }
             finally
             {
-                Volatile.Write(ref this.sweeping, 0);
+                // A full fence, so the counts read below can't be read before the stop is seen.
+                _ = Interlocked.Exchange(ref this.sweeping, 0);
             }
             if (Volatile.Read(ref this.count) <= capacity && Volatile.Read(ref this.weight) <= weightCapacity)
                 return;

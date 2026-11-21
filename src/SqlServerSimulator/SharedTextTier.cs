@@ -18,7 +18,8 @@ namespace SqlServerSimulator;
 /// are interned process-wide), the compatibility level and
 /// <c>QUOTED_IDENTIFIER</c> — and the value holds nothing of the simulation
 /// that computed it: no schema object, no setting, no session. So an entry
-/// can't be stale, nothing clears it, and which simulation put it there
+/// can't be stale, nothing needs to clear it (only tests do, to start from
+/// an empty tier), and which simulation put it there
 /// can't be told from what it answers. Each tier's Debug audit computes a
 /// sampled hit again and throws on a difference.
 /// </para>
@@ -57,6 +58,9 @@ internal sealed class SharedTextTier<TKey, TValue>(int capacity, long textBudget
 
     /// <summary>Test-observable: entries the sweeps have evicted.</summary>
     public long Evictions => Volatile.Read(ref this.entries.Evictions);
+
+    /// <summary>Test-only: forgets every entry, so a test starts from an empty tier.</summary>
+    internal void Clear() => this.entries.Clear();
 
     /// <summary>Whether a text of <paramref name="length"/> characters may be kept here.</summary>
     public bool Keeps(int length) => length <= maxTextLength;
