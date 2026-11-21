@@ -119,8 +119,26 @@ public sealed partial class Simulation
 
         public override bool Equals(object? obj) => obj is PlanCacheKey other && this.Equals(other);
 
-        public override int GetHashCode() =>
-            HashCode.Combine(this.CommandText, this.DatabaseName, this.DefaultSchemaName, this.ParameterSignature, this.QuotedIdentifiers, this.DateFormat, this.AnsiNulls, this.ConcatNullYieldsNull);
+        // Computed once as the key is built: a write's key is hashed three times per
+        // command (the plan cache, the statement plan sets and the compile memo), and
+        // each hash walks the whole command text.
+        private readonly int hash = HashCode.Combine(commandText, databaseName, defaultSchemaName, parameterSignature, quotedIdentifiers, dateFormat, ansiNulls, concatNullYieldsNull);
+
+#if DEBUG
+        private static int hashAudits;
+#endif
+
+        public override int GetHashCode()
+        {
+#if DEBUG
+            if (System.Numerics.BitOperations.IsPow2(Interlocked.Increment(ref hashAudits))
+                && this.hash != HashCode.Combine(this.CommandText, this.DatabaseName, this.DefaultSchemaName, this.ParameterSignature, this.QuotedIdentifiers, this.DateFormat, this.AnsiNulls, this.ConcatNullYieldsNull))
+            {
+                throw new InvalidOperationException($"PlanCacheKey's stored hash differs from its fields' for '{this.CommandText}'.");
+            }
+#endif
+            return this.hash;
+        }
     }
 
     /// <summary>Cache entry: the batch's parsed <see cref="Selection"/>s in
@@ -446,7 +464,7 @@ public sealed partial class Simulation
                 // Query Store times a replayed statement as the dispatch loop
                 // does a parsed one, from before the steps its parse took.
                 var queryStore = BeginQueryStoreCapture(batch, io: null);
-                var queryStoreIo = queryStore is not null ? connection.StatementIo = new IoStatistics() : null;
+                var queryStoreIo = queryStore is not null ? connection.StatementIo = connection.RentIo() : null;
                 var rowSecurityMarks = connection.RowSecurityMarks;
                 // The parse this replay skips took these locks and made these
                 // checks; the replaying session takes and makes them now, and
@@ -513,12 +531,18 @@ public sealed partial class Simulation
                             stream.CountsForClauseSourceRows = true;
                     }
                     if (stream is null && queryStore is { } capture)
+                    {
                         EndQueryStoreCapture(batch, capture, queryStoreIo, entry.Spans[statement].Start, entry.Spans[statement].End, 0, rowCount);
+                        connection.ReturnIo(queryStoreIo!);
+                    }
                 }
                 catch (SimulatedSqlException error) when (!selection.IsAssignmentOnly)
                 {
                     if (queryStore is { } capture)
+                    {
                         EndQueryStoreCapture(batch, capture, queryStoreIo, entry.Spans[statement].Start, entry.Spans[statement].End, error.IsAttention ? (byte)3 : (byte)4, 0);
+                        connection.ReturnIo(queryStoreIo!);
+                    }
                     cutShort = error;
                     rowCount = 0;
                     if (refused is null)
@@ -597,7 +621,10 @@ public sealed partial class Simulation
                         executed.ErrorCaught = CaughtByTryFrame(batch, streamed);
                     }
                     if (queryStore is { } streamedCapture)
+                    {
                         EndQueryStoreCapture(batch, streamedCapture, queryStoreIo, entry.Spans[statement].Start, entry.Spans[statement].End, cutShort is null ? (byte)0 : cutShort.IsAttention ? (byte)3 : (byte)4, rowCount);
+                        connection.ReturnIo(queryStoreIo!);
+                    }
                     // The advance that ran the statement to its end returns
                     // here, before anything its ending sends.
                     yield return ResultStream.Marker;

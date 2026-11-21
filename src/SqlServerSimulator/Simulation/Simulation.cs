@@ -2828,7 +2828,10 @@ public sealed partial class Simulation
         var stream = batch.CurrentStatement.StreamingResult;
         batch.CurrentStatement.StreamingResult = null;
         if (stream is null && lifecycle.QueryStore is { } capture && lifecycle.Ending is not (StatementEnding.Deferred or StatementEnding.GatheredBindError))
+        {
             EndFramedQueryStoreCapture(batch, capture, lifecycle.QueryStoreIo, lifecycle.Error, lifecycle.StatementStart);
+            lifecycle.GiveBackIo(batch.Connection);
+        }
 
         switch (lifecycle.Ending)
         {
@@ -2921,7 +2924,10 @@ public sealed partial class Simulation
                 }
             }
             if (lifecycle.QueryStore is { } streamedCapture)
+            {
                 EndFramedQueryStoreCapture(batch, streamedCapture, lifecycle.QueryStoreIo, lifecycle.Error, lifecycle.StatementStart);
+                lifecycle.GiveBackIo(batch.Connection);
+            }
             // The consumer's advance that ran the statement to its end returns
             // here, before anything its ending sends.
             yield return ResultStream.Marker;

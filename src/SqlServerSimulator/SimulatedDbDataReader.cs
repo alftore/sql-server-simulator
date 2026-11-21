@@ -83,6 +83,13 @@ public sealed class SimulatedDbDataReader : DbDataReader
             this.pendingFault = null;
             fault.Throw();
         }
+        // Past the end there is nothing to run, so no scope: the client's last
+        // NextResult, after RunAhead has finished the batch, is such an advance.
+        if (this.streamEnded)
+        {
+            outcome = null!;
+            return false;
+        }
         // The outcome stream runs the batch's statements as it advances, so
         // each advance is an entry into the engine; the rows a result set
         // serves were produced before it was yielded.
@@ -825,6 +832,23 @@ public sealed class SimulatedDbDataReader : DbDataReader
 
         this.closed = true;
         this.connection?.ForgetReader(this);
+        // A batch that has run to its end leaves nothing for the close to run, so it
+        // opens no scope (the rule is that a member that runs engine code does): the
+        // iterator behind the outcomes has finished, and what the current result holds
+        // is either rows already made or a stream that has completed.
+        if (this.NothingLeftToRun())
+        {
+            System.Diagnostics.Debug.Assert(this.pendingOutcome is null && this.pendingFault is null && this.streamEnded);
+            if (this.currentResult is { } finished)
+                PassOver(finished);
+            this.cursor.Dispose();
+            this.outcomes.Dispose();
+            this.Consume();
+            this.cursor = ClosedCursor.Instance;
+            this.AfterClose?.Invoke();
+            return;
+        }
+
         using var culture = CultureScope.Engine();
         if (this.currentResult is { } current)
             PassOver(current);
@@ -856,6 +880,21 @@ public sealed class SimulatedDbDataReader : DbDataReader
         this.cursor = ClosedCursor.Instance;
         this.AfterClose?.Invoke();
     }
+
+    /// <summary>
+    /// Whether closing would run no engine code: the outcome stream has ended
+    /// (so the iterator behind it has run its last statement and its
+    /// <c>finally</c> blocks), no outcome or fault is waiting to be reported,
+    /// and the current result, if any, is rows that were made whole or a stream
+    /// that has completed, neither of which does anything when its cursor is
+    /// disposed.
+    /// </summary>
+    private bool NothingLeftToRun() =>
+        this.streamEnded
+        && this.pendingOutcome is null
+        && this.ranAhead is not { Count: > 0 }
+        && this.pendingFault is null
+        && (this.currentResult is null || this.currentResult is SimulatedSqlResultSet { RowsHoldNothingOpen: true });
 
     /// <summary>
     /// Runs once the batch has been drained on close — how a

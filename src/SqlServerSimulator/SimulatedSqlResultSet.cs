@@ -189,6 +189,15 @@ internal sealed class SimulatedSqlResultSet : SimulatedQueryResult
     internal ResultStream? Stream;
 
     /// <summary>
+    /// Whether disposing a cursor over these rows runs nothing: the rows are
+    /// already made (a list or array), or they come from a stream that has
+    /// completed, whose enumerator then ends with nothing left to produce.
+    /// </summary>
+    internal bool RowsHoldNothingOpen => this.Stream is { } stream
+        ? stream.Complete
+        : (this.rowBytes is null or List<byte[]> or byte[][]) && (this.rowValues is null or List<SqlValue[]> or SqlValue[][]);
+
+    /// <summary>
     /// Produces the rows' first window — what real sends before its client
     /// reads anything — and, when the source ends inside it, keeps them as
     /// <see cref="MaterializeRows"/> would and answers null; otherwise the rows

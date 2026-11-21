@@ -32,6 +32,28 @@ internal sealed class IoStatistics
     private readonly List<IoTableCounts> tables = [];
 
     /// <summary>
+    /// Forgets everything recorded, so the object counts a new statement:
+    /// <see cref="SimulatedDbConnection.RentIo"/> hands a statement a spare
+    /// this way.
+    /// </summary>
+    public void Reset()
+    {
+        this.tables.Clear();
+#if DEBUG
+        this.Returned = false;
+#endif
+    }
+
+#if DEBUG
+    /// <summary>
+    /// Whether <see cref="SimulatedDbConnection.ReturnIo"/> took the object
+    /// back, after which no statement may count into it until it is rented
+    /// again: the counting members assert it.
+    /// </summary>
+    public bool Returned;
+#endif
+
+    /// <summary>
     /// The counts of <paramref name="table"/>, which becomes one of the
     /// statement's lines; null for a table real never lists — a trigger's
     /// <c>inserted</c> / <c>deleted</c> and the system base tables behind the
@@ -40,6 +62,9 @@ internal sealed class IoStatistics
     [MethodImpl(Tiering.OptimizeFirstCall)]
     public IoTableCounts? Touch(HeapTable table)
     {
+#if DEBUG
+        System.Diagnostics.Debug.Assert(!this.Returned, "A statement counted into an IoStatistics that went back to its connection.");
+#endif
         foreach (var counts in this.tables)
         {
             if (ReferenceEquals(counts.Table, table))
@@ -80,6 +105,9 @@ internal sealed class IoStatistics
     [MethodImpl(Tiering.OptimizeFirstCall)]
     private void TouchWork(string name)
     {
+#if DEBUG
+        System.Diagnostics.Debug.Assert(!this.Returned, "A statement counted into an IoStatistics that went back to its connection.");
+#endif
         foreach (var counts in this.tables)
         {
             if (counts.Table is null && counts.Name == name)
@@ -104,7 +132,13 @@ internal sealed class IoStatistics
     }
 
     /// <summary>Forgets everything recorded, once an <c>IF</c> or <c>WHILE</c> condition has reported.</summary>
-    public void Clear() => this.tables.Clear();
+    public void Clear()
+    {
+#if DEBUG
+        System.Diagnostics.Debug.Assert(!this.Returned, "A statement counted into an IoStatistics that went back to its connection.");
+#endif
+        this.tables.Clear();
+    }
 
     /// <summary>The Msg 3615 texts, one per line, in the order real sends them.</summary>
     public IEnumerable<string> Lines()

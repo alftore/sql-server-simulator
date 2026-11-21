@@ -24,6 +24,7 @@ Any of those can affect what the parse produces, so a mismatch demands a fresh p
 Every other session setting is read by the executing batch at run time, which `PlanCacheSessionTests` pins by differential: a replay under `DATEFIRST`, `LANGUAGE`, `ARITHABORT` / `ANSI_WARNINGS`, `NUMERIC_ROUNDABORT`, `TEXTSIZE`, `CONTEXT_INFO`, session context, an open transaction, a `#temp` table or another principal must answer what a fresh parse under that setting answers, in both directions.
 `QUOTED_IDENTIFIER` is in the key because it changes what the *same text* tokenizes to — `"x"` is a delimited identifier when on, a varchar literal when off — so a cached plan from one setting is wrong under the other.
 Backed by `ConcurrentDictionary` with the default ordinal-case-sensitive string comparer.
+The key carries its own hash, computed once as it is built, because a write's key is looked up three times per command (the plan cache, the statement plan sets and the compile memo) and each hash walks the command text.
 
 The parameter signature is built defensively: a TVP whose `Value` is an `IDataReader` causes `SimulatedDbParameter.DbType`'s getter to throw `ArgumentException` (CA1065 — documented at the property), and the signature builder catches it and returns `null` for that command.
 A null signature means "skip the cache for this call" — caching wouldn't help anyway because structured parameters carry session-scoped data the cache doesn't model.
@@ -1052,6 +1053,7 @@ Every one of these needs `VIEW SERVER PERFORMANCE STATE` (Msg 300 then 297), as 
 **Cost.**
 A tight loop of a plan-cached point `SELECT` measured 2.65 µs against 2.55 µs without the registry, and 2.55 µs against 2.30 µs in a database with its store off, which paid nothing for a statement's capture until the registry needed one (measured 2026-10-15, best of five rounds, Release build).
 A replayed SELECT batch remembers its plan on its parse-cache entry (`BatchContext.CachedPlanMemo`), so a repeat skips the lookup — and with it the declaration a parameterized command's key needs.
+The reads a captured statement counts for Query Store go into an `IoStatistics` the connection lends from a one-slot spare (`SimulatedDbConnection.RentIo`) and gets back once the capture has read it (`ReturnIo`), so a statement allocates none of its own; a statement that reports `STATISTICS IO`, a MARS request's parked one, a streamed result's and a caller's each hold the object they took until they end, and a Debug build asserts that nothing counts into one that has gone back (about 110 bytes less per captured statement).
 
 ### Divergences
 
