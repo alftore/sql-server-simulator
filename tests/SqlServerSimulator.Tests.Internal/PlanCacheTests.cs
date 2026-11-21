@@ -44,6 +44,45 @@ public sealed class PlanCacheTests
         return rows;
     }
 
+    [TestMethod]
+    public void DecimalParameter_ChangedPrecisionOrScale_IsANewKeyEachTime()
+    {
+        var (sim, connection) = OpenWithTable();
+        using var command = connection.CreateCommand();
+        command.CommandText = "select val from t where val < @d";
+        var parameter = new SimulatedDbParameter { ParameterName = "@d", DbType = System.Data.DbType.Decimal, Value = 25.5m };
+        _ = command.Parameters.Add(parameter);
+
+        AreEqual(2, RunCount(command));
+        var misses = sim.PlanCacheMisses;
+        var hits = sim.PlanCacheHits;
+        AreEqual(2, RunCount(command));
+        AreEqual(misses, sim.PlanCacheMisses);
+        AreEqual(hits + 1, sim.PlanCacheHits);
+
+        parameter.Precision = 18;
+        parameter.Scale = 2;
+        AreEqual(2, RunCount(command));
+        AreEqual(misses + 1, sim.PlanCacheMisses);
+        AreEqual(2, RunCount(command));
+        AreEqual(misses + 1, sim.PlanCacheMisses);
+
+        parameter.Precision = 0;
+        parameter.Scale = 0;
+        parameter.Value = 25.55m;
+        AreEqual(2, RunCount(command));
+        AreEqual(misses + 2, sim.PlanCacheMisses);
+    }
+
+    private static int RunCount(SimulatedDbCommand command)
+    {
+        using var reader = command.ExecuteReader();
+        var rows = 0;
+        while (reader.Read())
+            rows++;
+        return rows;
+    }
+
     /// <summary>The parameters of each execution in <see cref="ChangedParameterSequence"/>: the command text, then each parameter's name, type (null leaves it to the value), size, direction and value.</summary>
     private static readonly (string Text, (string Name, System.Data.DbType? Type, int Size, System.Data.ParameterDirection Direction, object? Value)[] Parameters)[] ChangedParameterSequence =
     [

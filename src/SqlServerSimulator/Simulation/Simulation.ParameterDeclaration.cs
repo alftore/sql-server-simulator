@@ -188,7 +188,12 @@ partial class Simulation
         10000000000000000000000000000m,
     ];
 
-    internal static ResolvedDecimal ResolveDecimal(SimulatedDbParameter parameter)
+    /// <summary>
+    /// <see cref="SimulatedDbParameter.ResolveDecimal"/>'s computation, which
+    /// every reader goes through that member so one execution resolves a
+    /// parameter once.
+    /// </summary>
+    internal static ResolvedDecimal ResolveDecimalUncached(SimulatedDbParameter parameter)
     {
         var raw = parameter.Value;
         if (raw is Decimal38 wide)
@@ -250,7 +255,7 @@ partial class Simulation
     /// </summary>
     internal static void EffectiveDecimal(SimulatedDbParameter parameter, out byte precision, out byte scale)
     {
-        var resolved = ResolveDecimal(parameter);
+        var resolved = parameter.ResolveDecimal();
         precision = resolved.Precision;
         scale = resolved.Scale;
     }
@@ -262,7 +267,7 @@ partial class Simulation
     /// </summary>
     internal static bool TryBindDecimal(SimulatedDbParameter parameter, out SqlType type, out SqlValue seed)
     {
-        var resolved = ResolveDecimal(parameter);
+        var resolved = parameter.ResolveDecimal();
         if (resolved.Unconvertible)
         {
             type = SqlType.GetByDbType(DbType.Decimal);
@@ -347,7 +352,7 @@ partial class Simulation
             }
             if (dbType != DbType.Decimal)
                 continue;
-            var resolved = ResolveDecimal(parameter);
+            var resolved = parameter.ResolveDecimal();
             if (!resolved.Fits)
                 return string.Create(CultureInfo.InvariantCulture, $"Parameter value '{resolved.Rounded.ToString("F" + resolved.Scale.ToString(CultureInfo.InvariantCulture), CultureInfo.InvariantCulture)}' is out of range.");
         }

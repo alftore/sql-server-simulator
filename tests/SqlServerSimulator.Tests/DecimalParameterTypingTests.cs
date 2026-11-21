@@ -115,6 +115,81 @@ public sealed class DecimalParameterTypingTests
     }
 
     [TestMethod]
+    public void UnsetPrecision_NewValueEachExecution_DeclaresEachValuesType()
+    {
+        using var connection = new Simulation().CreateOpenConnection();
+        using var command = connection.CreateCommand("select sql_variant_property(cast(@d as sql_variant), 'Precision'), sql_variant_property(cast(@d as sql_variant), 'Scale')");
+        var parameter = new SimulatedDbParameter { ParameterName = "@d", DbType = DbType.Decimal };
+        _ = command.Parameters.Add(parameter);
+
+        (object Value, int? Precision, int? Scale)[] runs = [(1.5m, 2, 1), (123.456m, 6, 3), (DBNull.Value, null, null), (1.5m, 2, 1)];
+        foreach (var (value, precision, scale) in runs)
+        {
+            parameter.Value = value;
+            using var reader = command.ExecuteReader();
+            IsTrue(reader.Read());
+            AreEqual((object?)precision ?? DBNull.Value, reader.GetValue(0));
+            AreEqual((object?)scale ?? DBNull.Value, reader.GetValue(1));
+        }
+    }
+
+    [TestMethod]
+    public void SameValue_PrecisionChangedBetweenExecutions_TakesTheNewType()
+    {
+        using var connection = new Simulation().CreateOpenConnection();
+        var parameter = new SimulatedDbParameter { ParameterName = "@d", DbType = DbType.Decimal, Value = 1.239m };
+        using var command = connection.CreateCommand("select sql_variant_property(cast(@d as sql_variant), 'Precision'), sql_variant_property(cast(@d as sql_variant), 'Scale'), convert(nvarchar(50), @d)");
+        _ = command.Parameters.Add(parameter);
+
+        (byte Precision, byte Scale, int ExpectedPrecision, int ExpectedScale, string Text)[] runs =
+            [(0, 0, 4, 3, "1.239"), (18, 2, 18, 2, "1.24"), (0, 0, 4, 3, "1.239"), (10, 0, 10, 3, "1.239"), (9, 5, 9, 5, "1.23900")];
+        foreach (var (precision, scale, expectedPrecision, expectedScale, text) in runs)
+        {
+            parameter.Precision = precision;
+            parameter.Scale = scale;
+            using var reader = command.ExecuteReader();
+            IsTrue(reader.Read());
+            AreEqual(expectedPrecision, Convert.ToInt32(reader.GetValue(0), CultureInfo.InvariantCulture));
+            AreEqual(expectedScale, Convert.ToInt32(reader.GetValue(1), CultureInfo.InvariantCulture));
+            AreEqual(text, reader.GetString(2));
+        }
+    }
+
+    [TestMethod]
+    public void OutOfRange_AfterAGoodValue_StillRefusedBeforeSending()
+    {
+        using var connection = new Simulation().CreateOpenConnection();
+        var parameter = new SimulatedDbParameter { ParameterName = "@d", DbType = DbType.Decimal, Precision = 4, Scale = 2, Value = 12.34m };
+        using var command = connection.CreateCommand("select @d");
+        _ = command.Parameters.Add(parameter);
+        AreEqual(12.34m, command.ExecuteScalar());
+
+        parameter.Value = 123.45m;
+        AreEqual("Parameter value '123.45' is out of range.", Throws<ArgumentException>(() => _ = command.ExecuteScalar()).Message);
+        parameter.Value = 1.5m;
+        AreEqual(1.50m, command.ExecuteScalar());
+        parameter.Precision = 2;
+        AreEqual("Parameter value '1.50' is out of range.", Throws<ArgumentException>(() => _ = command.ExecuteScalar()).Message);
+    }
+
+    [TestMethod]
+    public void UnconvertibleValue_RaisesAsBefore()
+    {
+        using var connection = new Simulation().CreateOpenConnection();
+        var parameter = new SimulatedDbParameter { ParameterName = "@d", DbType = DbType.Decimal, Value = "not a number" };
+        using var command = connection.CreateCommand("select @d");
+        _ = command.Parameters.Add(parameter);
+
+        var first = Throws<Exception>(() => _ = command.ExecuteScalar());
+        var second = Throws<Exception>(() => _ = command.ExecuteScalar());
+        AreEqual(first.GetType(), second.GetType());
+        AreEqual(first.Message, second.Message);
+
+        parameter.Value = 2.5m;
+        AreEqual(2.5m, command.ExecuteScalar());
+    }
+
+    [TestMethod]
     public void RoundedParameter_MatchesTheRoundedRow()
     {
         var sim = new Simulation();

@@ -185,4 +185,58 @@ public sealed class SimulatedDbParameter : DbParameter
 
     /// <inheritdoc/>
     public override void ResetDbType() => this.dbType = null;
+
+    private object? resolvedFrom;
+    private byte resolvedPrecision;
+    private byte resolvedScale;
+    private Simulation.ResolvedDecimal resolved;
+    private bool hasResolved;
+
+#if DEBUG
+    private static int resolvedAudits;
+#endif
+
+    /// <summary>
+    /// The decimal this parameter declares and binds (see
+    /// <see cref="Simulation.ResolveDecimalUncached"/>), kept from the last call
+    /// while its <see cref="Value"/> is the same object and its
+    /// <see cref="Precision"/> and <see cref="Scale"/> are as they were: the
+    /// range check, the plan-cache signature and the variable seed of one
+    /// execution each ask for it. Only a value that can't change in place is
+    /// kept — null, <see cref="DBNull"/>, a boxed <see cref="decimal"/> or a
+    /// <see cref="Storage.Decimal38"/>; any other is resolved on every call.
+    /// A parameter belongs to the one command executing it, as ADO.NET's
+    /// contract has it, so the memo takes no lock.
+    /// </summary>
+    internal Simulation.ResolvedDecimal ResolveDecimal()
+    {
+        var value = this.Value;
+        if (value is not (null or DBNull or decimal or Storage.Decimal38))
+            return Simulation.ResolveDecimalUncached(this);
+        var precision = this.Precision;
+        var scale = this.Scale;
+        if (this.hasResolved && ReferenceEquals(value, this.resolvedFrom) && precision == this.resolvedPrecision && scale == this.resolvedScale)
+        {
+#if DEBUG
+            if (System.Numerics.BitOperations.IsPow2(Interlocked.Increment(ref resolvedAudits)))
+            {
+                var again = Simulation.ResolveDecimalUncached(this);
+                if (again.Precision != this.resolved.Precision || again.Scale != this.resolved.Scale || again.Rounded != this.resolved.Rounded
+                    || !again.Wide.Equals(this.resolved.Wide) || again.HasValue != this.resolved.HasValue || again.Fits != this.resolved.Fits
+                    || again.Unconvertible != this.resolved.Unconvertible)
+                {
+                    throw new InvalidOperationException($"Parameter '{this.ParameterName}' kept a decimal resolution that differs from its value's.");
+                }
+            }
+#endif
+            return this.resolved;
+        }
+        var fresh = Simulation.ResolveDecimalUncached(this);
+        this.resolvedFrom = value;
+        this.resolvedPrecision = precision;
+        this.resolvedScale = scale;
+        this.resolved = fresh;
+        this.hasResolved = true;
+        return fresh;
+    }
 }
