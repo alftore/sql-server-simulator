@@ -588,6 +588,7 @@ Trigger bodies see the post-MERGE state in INSERTED/DELETED.
 ### EF Core reach
 
 EF Core 7+ emits MERGE for SaveChanges batch INSERT (the OUTPUT-INSERTED-id shape).
+A batch's first compile parses that shape, and any MERGE from a `VALUES` list, a plain query or a table into a table with no `INSTEAD OF` trigger, as far as its `;` for the run, which replays that parse rather than parsing it again ([`plan-cache.md`](plan-cache.md#the-compile-walk-against-the-run)).
 Multi-action MERGE through EF requires raw SQL (`FromSqlInterpolated` for the body) — EF's LINQ surface doesn't reach the multi-branch form.
 EF Core's `ExecuteUpdate` / `ExecuteDelete` for batched single-statement DML emits regular `UPDATE FROM` / `DELETE FROM` (the simulator's existing joined-source UPDATE/DELETE paths handle those), not MERGE.
 

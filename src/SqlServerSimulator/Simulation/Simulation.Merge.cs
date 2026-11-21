@@ -80,6 +80,12 @@ partial class Simulation
 
         var target = ParseDmlTarget(context, remoteKind: null);
         var (destinationName, resolvedView) = (target.Name, target.View);
+        // Which way a view's MERGE reads is settled from its INSTEAD OF
+        // triggers' enabled state, and may take a second parse, so one the
+        // compile walk parses for its run goes no further (see
+        // ParseWriteForRun), as RouteViewWrite turns the other verbs away.
+        if (resolvedView is not null && context.Batch.ParsesForRun)
+            throw new RunParseDeclinedException();
 
         // View target (CTE bindings are already shadowed at the source level,
         // not the target). An updatable single-base view routes through its

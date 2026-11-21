@@ -82,8 +82,8 @@ partial class Simulation
     }
 
     /// <summary>
-    /// Parses the <c>INSERT</c>, <c>UPDATE</c> or <c>DELETE</c> statement at
-    /// the compile walk's cursor as the run would, as
+    /// Parses the <c>INSERT</c>, <c>UPDATE</c>, <c>DELETE</c> or <c>MERGE</c>
+    /// statement at the compile walk's cursor as the run would, as
     /// <see cref="TryParseQueryForRun"/> parses a query, inside the mutation
     /// scope the walk's own parse runs in, and files the parse as the
     /// statement's plan for the run to replay. The parse ends at the
@@ -120,6 +120,31 @@ partial class Simulation
     /// triggers' enabled state, which no schema change records, so the plan
     /// declines it (<see cref="BlocksDmlPlan"/>).
     /// </para>
+    /// <para>
+    /// A <c>MERGE</c>'s split point is its required <c>;</c>, ahead of its
+    /// permission checks, which its execution half makes first. What its parse
+    /// does on the way there, route by route: the target's resolution, its
+    /// checks and its table lock (<c>LockWriteTable</c>), the lock logged; a
+    /// view target, which the pre-scan never admits, declines as it resolves;
+    /// the source (<see cref="ParseMergeSource"/>) — a <c>VALUES</c> list
+    /// parses its tuples, which only the execution half evaluates, a query
+    /// (<c>ParseParenthesizedMergeSource</c>) parses as a nested query under
+    /// the same logging, and a table (<c>ParseBareTableMergeSource</c>) notes
+    /// its read for the execution half's check and logs its lock, while a
+    /// view, a joined source and a linked server's table, which the pre-scan
+    /// never admits, are no replayable source and decline at the split; the
+    /// <c>MATCH</c> sources (<see cref="MergeMatchSource"/>), the <c>ON</c>'s
+    /// binding and the <c>WHEN</c> clauses build expressions and run nothing,
+    /// a variable an action assigns found by name as each row runs; which
+    /// actions <c>INSTEAD OF</c> triggers take (<see cref="MergeInsteadOfActions"/>)
+    /// reads their enabled state, so a target carrying any isn't attempted, as
+    /// its plan declines; the <c>OUTPUT</c> clause (<see cref="TryParseMergeOutputClause"/>)
+    /// as above, Msg 334 settled the same way; the write masks are
+    /// definitions; and what the source's columns are read for
+    /// (<see cref="MergeSourceReads"/> and the source's demand) narrows the
+    /// plan's own objects. None of it runs rows, takes a lock outside the log,
+    /// checks a permission or sends a message.
+    /// </para>
     /// </remarks>
     private SimulatedStatementOutcome ParseWriteForRun(ParserContext context, Func<ParserContext, SimulatedStatementOutcome> parse)
     {
@@ -129,9 +154,7 @@ partial class Simulation
         // away as its parse resolved it.
         if (walk.CompiledFor is not { PlanCacheKey: { } key, CachedPlanOrigin: CachedPlanOrigin.ClientBatch } running
             || !ParsesForRunUnder(walk, key)
-            || PlainWriteTarget(context.MemoizedTokensAhead(), out var clientOutput) is not { } target
-            || !walk.TryResolveSchema(target, out var schema) || !schema.HeapTables.TryGetValue(target.Leaf, out var table)
-            || (clientOutput && TableHasAnyTrigger(walk, table)))
+            || !WalkMayParseWrite(walk, context.MemoizedTokensAhead()))
         {
             return RunMutation(context, parse);
         }
@@ -278,6 +301,143 @@ partial class Simulation
         tokens is [ReservedKeyword { Keyword: Keyword.Select }, ..] && ReadsAsPlainClauses(tokens, 0, writes: false, out var readsFrom, out _) && readsFrom;
 
     /// <summary>
+    /// Whether the compile walk may parse the write <paramref name="tokens"/>
+    /// open with for the run: the pre-scan (<see cref="PlainWriteTarget"/>)
+    /// admits its shape, and its target is a table of the walk's — not one
+    /// the batch creates ahead of it, a view or a synonym, which would turn
+    /// the attempt away as its parse resolved it — carrying no trigger at
+    /// all, enabled or not, under a client <c>OUTPUT</c> clause (Msg 334) and
+    /// no <c>INSTEAD OF</c> trigger under a <c>MERGE</c> (Msg 5316), both
+    /// settled while parsing from the triggers' enabled state; a
+    /// <c>MERGE</c>'s table source is a table of the walk's too, a view's
+    /// source being none a plan replays.
+    /// </summary>
+    private static bool WalkMayParseWrite(BatchContext walk, ReadOnlySpan<Token> tokens) =>
+        PlainWriteTarget(tokens, out var clientOutput, out var mergeSource) is { } target
+            && WalkTable(walk, target) is { } table
+            && !(clientOutput && TableHasAnyTrigger(walk, table))
+            && (tokens[0] is not ReservedKeyword { Keyword: Keyword.Merge }
+                || (!Array.Exists(TriggersAttachedTo(walk, table), static trigger => trigger.Timing == Schemas.TriggerTiming.InsteadOf)
+                    && (mergeSource is not { } source || WalkTable(walk, source) is not null)));
+
+    /// <summary>The table <paramref name="name"/> names in the walk's view of the schema, or null.</summary>
+    private static Storage.HeapTable? WalkTable(BatchContext walk, MultiPartName name) =>
+        walk.TryResolveSchema(name, out var schema) && schema.HeapTables.TryGetValue(name.Leaf, out var table) ? table : null;
+
+    /// <summary>
+    /// A one- or two-part name at <paramref name="at"/>, no temporary
+    /// table's, leaving <paramref name="at"/> past it; null for anything else.
+    /// </summary>
+    private static MultiPartName? TwoPartName(ReadOnlySpan<Token> tokens, ref int at)
+    {
+        MultiPartName name = default;
+        for (var parts = 1; ; parts++)
+        {
+            if (at >= tokens.Length || tokens[at] is not Name part || part.Value.StartsWith('#'))
+                return null;
+            name = parts == 1 ? new MultiPartName(part.Value) : name.WithAddedPart(part.Value);
+            if (++at >= tokens.Length || tokens[at] is not Operator { Character: '.' })
+                return name;
+            if (parts == 2)
+                return null;
+            at++;
+        }
+    }
+
+    /// <summary>
+    /// The table the <c>MERGE</c> <paramref name="tokens"/> open with writes,
+    /// named by one or two parts with no <c>TOP</c> or hint, under an optional
+    /// alias, when it reads <c>USING</c> a parenthesized <c>VALUES</c> list or
+    /// a plain query reading a table, or a table named by one or two parts
+    /// with no hint (answered as <paramref name="source"/>), and its <c>ON</c>,
+    /// <c>WHEN</c> clauses and at most one client <c>OUTPUT</c> clause, which
+    /// <paramref name="clientOutput"/> answers, read as a write's plain
+    /// clauses (<see cref="ReadsAsPlainClauses"/>) to the statement's required
+    /// <c>;</c>; null otherwise — a joined source, a rowset function,
+    /// <c>OUTPUT … INTO</c> and <c>$action</c> among the refusals.
+    /// </summary>
+    private static MultiPartName? PlainMergeTarget(ReadOnlySpan<Token> tokens, out bool clientOutput, out MultiPartName? source)
+    {
+        clientOutput = false;
+        source = null;
+        var at = 1;
+        if (at < tokens.Length && tokens[at] is ReservedKeyword { Keyword: Keyword.Into })
+            at++;
+        if (TwoPartName(tokens, ref at) is not { } target || !SkipsAlias(tokens, ref at)
+            || at >= tokens.Length || tokens[at] is not UnquotedString { ContextualKeyword: ContextualKeyword.Using })
+        {
+            return null;
+        }
+        if (++at < tokens.Length && tokens[at] is Operator { Character: '(' })
+        {
+            var open = at;
+            for (var depth = 0; at < tokens.Length; at++)
+            {
+                if (tokens[at] is Operator { Character: '(' })
+                    depth++;
+                else if (tokens[at] is Operator { Character: ')' } && --depth == 0)
+                    break;
+            }
+            if (at >= tokens.Length || open + 1 >= at)
+                return null;
+            var body = tokens[..at];
+            var plain = tokens[open + 1] switch
+            {
+                ReservedKeyword { Keyword: Keyword.Values } => ReadsAsPlainClauses(body, open + 2, writes: false, out _, out _),
+                ReservedKeyword { Keyword: Keyword.Select } => ReadsAsPlainClauses(body, open + 1, writes: false, out var readsFrom, out _) && readsFrom,
+                _ => false,
+            };
+            if (!plain)
+                return null;
+            if (++at < tokens.Length && tokens[at] is ReservedKeyword { Keyword: Keyword.As })
+                at++;
+            if (at >= tokens.Length || tokens[at] is not Name)
+                return null;
+            if (++at < tokens.Length && tokens[at] is Operator { Character: '(' })
+            {
+                do
+                {
+                    if (++at >= tokens.Length || tokens[at] is not Name)
+                        return null;
+                }
+                while (++at < tokens.Length && tokens[at] is Operator { Character: ',' });
+                if (at >= tokens.Length || tokens[at] is not Operator { Character: ')' })
+                    return null;
+                at++;
+            }
+        }
+        else if (TwoPartName(tokens, ref at) is not { } table || !SkipsAlias(tokens, ref at))
+        {
+            return null;
+        }
+        else
+        {
+            source = table;
+        }
+        return at < tokens.Length && tokens[at] is ReservedKeyword { Keyword: Keyword.On }
+            && ReadsAsPlainClauses(tokens, at + 1, writes: true, out _, out clientOutput, takesOutput: true, merge: true)
+            ? target
+            : null;
+    }
+
+    /// <summary>
+    /// Steps <paramref name="at"/> past an optional <c>[AS] alias</c>, one
+    /// that isn't <c>USING</c>; false when an <c>AS</c> names none.
+    /// </summary>
+    private static bool SkipsAlias(ReadOnlySpan<Token> tokens, ref int at)
+    {
+        var named = at < tokens.Length && tokens[at] is ReservedKeyword { Keyword: Keyword.As };
+        if (named)
+            at++;
+        if (at < tokens.Length && tokens[at] is Name and not UnquotedString { ContextualKeyword: ContextualKeyword.Using })
+        {
+            at++;
+            return true;
+        }
+        return !named;
+    }
+
+    /// <summary>
     /// The table or view the statement <paramref name="tokens"/> open with
     /// writes, named by one or two parts, when it writes it with no
     /// <c>TOP</c>, hint, <c>OUTPUT … INTO</c> or <c>FROM</c> clause of its
@@ -289,11 +449,16 @@ partial class Simulation
     /// takes one, which <paramref name="clientOutput"/> answers: an
     /// <c>INSERT</c>'s ahead of its source, an <c>UPDATE</c>'s after its
     /// <c>SET</c> list and a <c>DELETE</c>'s after its target, either ahead
-    /// of its filter. Null for any other statement.
+    /// of its filter. A <c>MERGE</c> answers as <see cref="PlainMergeTarget"/>
+    /// does, its table source as <paramref name="mergeSource"/>. Null for any
+    /// other statement.
     /// </summary>
-    private static MultiPartName? PlainWriteTarget(ReadOnlySpan<Token> tokens, out bool clientOutput)
+    private static MultiPartName? PlainWriteTarget(ReadOnlySpan<Token> tokens, out bool clientOutput, out MultiPartName? mergeSource)
     {
         clientOutput = false;
+        mergeSource = null;
+        if (tokens is [ReservedKeyword { Keyword: Keyword.Merge }, ..])
+            return PlainMergeTarget(tokens, out clientOutput, out mergeSource);
         if (tokens is not [ReservedKeyword { Keyword: Keyword.Insert or Keyword.Update or Keyword.Delete } verb, ..])
             return null;
         var at = 1;
@@ -302,18 +467,8 @@ partial class Simulation
         {
             at++;
         }
-        MultiPartName target = default;
-        for (var parts = 1; ; parts++)
-        {
-            if (at >= tokens.Length || tokens[at] is not Name name || name.Value.StartsWith('#'))
-                return null;
-            target = parts == 1 ? new MultiPartName(name.Value) : target.WithAddedPart(name.Value);
-            if (++at >= tokens.Length || tokens[at] is not Operator { Character: '.' })
-                break;
-            if (parts == 2)
-                return null;
-            at++;
-        }
+        if (TwoPartName(tokens, ref at) is not { } target)
+            return null;
         if (verb.Keyword == Keyword.Insert && at < tokens.Length && tokens[at] is Operator { Character: '(' })
         {
             do
@@ -392,9 +547,13 @@ partial class Simulation
     /// its own, and no <c>OUTPUT</c> clause either unless
     /// <paramref name="takesOutput"/>: then one client <c>OUTPUT</c> clause
     /// ahead of any filter, which <paramref name="clientOutput"/> answers —
-    /// an <c>INTO</c>, never a plain query's keyword, turning it away.
+    /// an <c>INTO</c>, never a plain query's keyword, turning it away. With
+    /// <paramref name="merge"/> they are a <c>MERGE</c>'s from its <c>ON</c>,
+    /// whose <c>WHEN</c> clauses' actions take <c>INSERT</c>, <c>UPDATE</c>,
+    /// <c>DELETE</c>, <c>SET</c> and <c>VALUES</c>, and which end only at the
+    /// statement's required <c>;</c>.
     /// </summary>
-    private static bool ReadsAsPlainClauses(ReadOnlySpan<Token> tokens, int start, bool writes, out bool readsFrom, out bool clientOutput, bool takesOutput = false)
+    private static bool ReadsAsPlainClauses(ReadOnlySpan<Token> tokens, int start, bool writes, out bool readsFrom, out bool clientOutput, bool takesOutput = false, bool merge = false)
     {
         var depth = 0;
         var cases = 0;
@@ -434,10 +593,13 @@ partial class Simulation
                     {
                         return false;
                     }
-                    if (depth == 0 && cases == 0 && i > start && EndsQuery(keyword, previous))
+                    if (!merge && depth == 0 && cases == 0 && i > start && EndsQuery(keyword, previous))
                         return true;
-                    if (!IsPlainQueryKeyword(keyword) && !(writes && keyword == Keyword.Default))
+                    if (!IsPlainQueryKeyword(keyword) && !(writes && keyword == Keyword.Default)
+                        && !(merge && keyword is Keyword.Insert or Keyword.Update or Keyword.Delete or Keyword.Set or Keyword.Values))
+                    {
                         return false;
+                    }
                     if (keyword == Keyword.Case)
                     {
                         cases++;
@@ -470,7 +632,7 @@ partial class Simulation
                     return false;
             }
         }
-        return true;
+        return !merge;
     }
 
     /// <summary>Whether <paramref name="token"/> is a join's type, which a join hint follows.</summary>
