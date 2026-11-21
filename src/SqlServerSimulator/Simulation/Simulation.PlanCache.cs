@@ -122,7 +122,7 @@ public sealed partial class Simulation
         // Computed once as the key is built: a write's key is hashed three times per
         // command (the plan cache, the statement plan sets and the compile memo), and
         // each hash walks the whole command text.
-        private readonly int hash = HashCode.Combine(commandText, databaseName, defaultSchemaName, parameterSignature, quotedIdentifiers, dateFormat, ansiNulls, concatNullYieldsNull);
+        private readonly int hash = HashCode.Combine(TextHash.Of(commandText), databaseName, defaultSchemaName, parameterSignature, quotedIdentifiers, dateFormat, ansiNulls, concatNullYieldsNull);
 
 #if DEBUG
         private static int hashAudits;

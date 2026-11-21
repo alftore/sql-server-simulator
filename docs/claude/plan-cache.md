@@ -1020,6 +1020,12 @@ Four streams of a test's own commands (EF Core's create, seed, query, update and
   In Debug every write also runs under a gate and every power-of-two ask compares the count with the dictionary's own.
   The other hot guards (`Schema.Triggers` and `Database.DdlTriggers`, a tenth of the asks) stay as they were: the DDL undo (`RecordSlotUndo`) writes their dictionaries itself, which a count beside them would have to follow.
   One stream went from 923 KB to 908 KB (−1.7%) and from 1,080 µs to 1,068 µs (the ranges overlap, 1,065–1,094 against 1,046–1,071).
+- **A command text is hashed once.**
+  A first execution hashed its whole text about ten times over, 56,000 characters hashed per stream for 5,300 characters of text (Query Store's 8,700 among them): the token memo's key (four times a command, the process-wide tier's lookup among them), the plan-cache key built for the batch and again for its compile, the plan registry's key on its lookup and add, and the statement ends, each a pass of `string.GetHashCode`.
+  `TextHash.Of` answers a text's own hash from the last two texts the thread asked about, found by reference, so the keys hash through it (`TokenMemoKey`, `PlanCacheKey`, `CachedPlanKey`, and the comparer of the statement-ends cache) and every dictionary sees the hash it saw before.
+  A text under 64 characters or over the token tier's 32,768 is hashed as before, so a thread never keeps more than two long strings alive; a Debug build compares the remembered hash with a fresh one on every power-of-two hit.
+  Query Store's key hashes each statement's own text, which is no instance a batch hashed, and stays.
+  A stream went from 1,052 µs [1,049–1,062] to 1,039 µs [1,039–1,044] (−1.3%, a first set of five rounds overlapped by one round: 1,064 [1,040–1,083] to 1,042 [1,033–1,049]), the same bytes; the warm point `SELECT` by key (a 112-character text) went from 4.85 µs to 4.65 µs.
 
 ## The plan-cache DMVs
 

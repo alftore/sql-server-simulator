@@ -20,7 +20,7 @@ partial class Simulation
     /// save for a text that may carry a secret, which stays: its entry is what
     /// masks the secret wherever the text is reported.
     /// </summary>
-    private readonly BoundedCache<string, StatementEnds> statementEnds = new(PlanCacheCapacity, StringComparer.Ordinal);
+    private readonly BoundedCache<string, StatementEnds> statementEnds = new(PlanCacheCapacity, TextHash.Comparer.Instance);
 
     /// <summary>
     /// Publishes where the statements of a batch the compile walked end,
