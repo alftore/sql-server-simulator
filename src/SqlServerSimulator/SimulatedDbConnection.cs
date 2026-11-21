@@ -487,7 +487,7 @@ public sealed class SimulatedDbConnection : DbConnection
     /// parked with the occupant: never cancelled, and never disposed by the
     /// scope replacing it.
     /// </summary>
-    private static readonly CancellationTokenSource ParkedScope = new();
+    private static readonly ExecutionScope ParkedScope = new();
 
     /// <summary>
     /// Counts a request in: a TDS MARS request as it arrives, an in-process
@@ -1407,7 +1407,7 @@ public sealed class SimulatedDbConnection : DbConnection
     /// parking its own source while another runs
     /// (<see cref="SessionRequest.Cancellation"/>).
     /// </summary>
-    private CancellationTokenSource executionCancellation = new();
+    private ExecutionScope executionCancellation = new();
 
     /// <summary>
     /// Begins a fresh cancellation scope for one top-level command execution,
@@ -1421,17 +1421,18 @@ public sealed class SimulatedDbConnection : DbConnection
     internal void BeginExecutionScope(TimeSpan? timeout = null)
     {
         this.executionTimeout = timeout;
-        var fresh = new CancellationTokenSource();
+        var fresh = new ExecutionScope();
         // A finite CommandTimeout arms the same source the engine already
         // polls, so a timeout aborts through exactly the path a Cancel() or a
         // TDS attention does — no second signal to coordinate. The cause is
         // recovered from executionCancelledByUser rather than a linked source:
         // whoever cancelled sets the flag, so an unflagged cancellation is the
         // timer's. (A cancel racing the deadline reports as a cancel; real has
-        // the same inherent ambiguity.)
-        if (timeout is { } span)
-            fresh.CancelAfter(span);
-        this.executionDeadline = timeout is { } armed ? DeadlineAfter(armed) : 0;
+        // the same inherent ambiguity.) The scope only records its deadline;
+        // the connection's one timer is due by it (EnsureTimerDueBy, below).
+        var deadline = timeout is { } span ? DeadlineAfter(span) : 0;
+        fresh.Deadline = deadline;
+        this.executionDeadline = deadline;
         this.executionCancelledByUser = false;
         this.TransactionIdAtExecutionStart = this.Simulation.LastAllocatedTransactionId;
         this.AttentionEndedWrite = false;
@@ -1444,6 +1445,10 @@ public sealed class SimulatedDbConnection : DbConnection
             Volatile.Write(ref request.Cancellation, fresh);
         if (!ReferenceEquals(previous, ParkedScope))
             previous.Dispose();
+        this.EnsureTimerDueBy(deadline);
+#if DEBUG
+        System.Diagnostics.Debug.Assert(deadline == 0 || this.timerDisposed || Volatile.Read(ref this.timerDue) <= deadline, "The timeout timer is due after the deadline just armed.");
+#endif
         // A KILL landing after the command was counted in but before this
         // scope existed cancelled the previous source; it ends this one. So
         // does an attention that targeted the running wire request before its
@@ -1507,14 +1512,9 @@ public sealed class SimulatedDbConnection : DbConnection
         if (this.executionTimeout is null)
             return;
         Volatile.Write(ref this.executionDeadline, 0);
-        try
-        {
-            Volatile.Read(ref this.executionCancellation).CancelAfter(Timeout.InfiniteTimeSpan);
-        }
-        catch (ObjectDisposedException)
-        {
-            // The scope ended with its connection.
-        }
+        var scope = Volatile.Read(ref this.executionCancellation);
+        if (!ReferenceEquals(scope, ParkedScope))
+            Volatile.Write(ref scope.Deadline, 0);
     }
 
     /// <summary>
@@ -1527,17 +1527,134 @@ public sealed class SimulatedDbConnection : DbConnection
         if (this.executionTimeout is not { } timeout)
             return;
         var source = Volatile.Read(ref this.executionCancellation);
-        try
+        if (source.IsCancellationRequested)
+            return;
+        var deadline = DeadlineAfter(timeout);
+        Volatile.Write(ref this.executionDeadline, deadline);
+        if (ReferenceEquals(source, ParkedScope))
+            return;
+        Volatile.Write(ref source.Deadline, deadline);
+        this.EnsureTimerDueBy(deadline);
+    }
+
+    /// <summary>Guards <see cref="deadlineTimer"/> and <see cref="timerDue"/>, and the scan the timer makes of the scopes in flight.</summary>
+    private readonly Lock timerGate = new();
+
+    /// <summary>
+    /// The one timer behind every <c>CommandTimeout</c> of this connection,
+    /// made on the first finite one. It holds the connection only weakly, so
+    /// an abandoned connection is still reclaimed.
+    /// </summary>
+    private Timer? deadlineTimer;
+
+    /// <summary>
+    /// The <see cref="System.Diagnostics.Stopwatch"/> timestamp the timer is due
+    /// at, or <see cref="long.MaxValue"/> while it isn't armed. Never later than
+    /// the earliest deadline in flight, which is what lets a later deadline leave
+    /// the timer alone. Written under <see cref="timerGate"/>.
+    /// </summary>
+    private long timerDue = long.MaxValue;
+
+    /// <summary>Set once the connection has closed, so the timer isn't made again.</summary>
+    private bool timerDisposed;
+
+    /// <summary>
+    /// Makes the timer due by <paramref name="deadline"/>, if it isn't already:
+    /// a deadline no earlier than the timer's due time needs nothing, for the
+    /// timer will look at its scope when it fires and arm itself again for it.
+    /// </summary>
+    private void EnsureTimerDueBy(long deadline)
+    {
+        if (deadline == 0 || deadline >= Volatile.Read(ref this.timerDue))
+            return;
+        lock (this.timerGate)
         {
-            if (!source.IsCancellationRequested)
+            if (this.timerDisposed || deadline >= this.timerDue)
+                return;
+            this.timerDue = deadline;
+            this.ArmTimer(deadline);
+        }
+    }
+
+    /// <summary>Points the timer at <paramref name="due"/> (or stops it), rounding the wait up so it never fires early. Caller holds <see cref="timerGate"/>.</summary>
+    private void ArmTimer(long due)
+    {
+        var timer = this.deadlineTimer ??= new Timer(static state =>
+        {
+            if (((WeakReference<SimulatedDbConnection>)state!).TryGetTarget(out var connection))
+                connection.FireDeadlines();
+        }, new WeakReference<SimulatedDbConnection>(this), Timeout.Infinite, Timeout.Infinite);
+        if (due == long.MaxValue)
+        {
+            _ = timer.Change(Timeout.Infinite, Timeout.Infinite);
+            return;
+        }
+        var left = due - System.Diagnostics.Stopwatch.GetTimestamp();
+        var milliseconds = left <= 0 ? 0 : (long)Math.Ceiling(left * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+        _ = timer.Change(Math.Min(milliseconds, uint.MaxValue - 1L), Timeout.Infinite);
+    }
+
+    /// <summary>
+    /// What the timer does when it fires: cancels the scope in flight — the
+    /// current one and each pending request's, a parked one's included — that
+    /// has reached its deadline, as the timer of its own <c>CancelAfter</c> did,
+    /// and points itself at the earliest of the rest. A scope that isn't due is
+    /// never touched, so a timer that fires early (a deadline it was due for
+    /// has since passed with its scope, or the clock's tick rounds down) only
+    /// looks again.
+    /// </summary>
+    internal void FireDeadlines()
+    {
+        List<ExecutionScope>? due = null;
+        lock (this.timerGate)
+        {
+            if (this.timerDisposed)
+                return;
+            var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            var next = long.MaxValue;
+            Consider(Volatile.Read(ref this.executionCancellation), now, ref next, ref due);
+            lock (this.requestsGate)
             {
-                Volatile.Write(ref this.executionDeadline, DeadlineAfter(timeout));
-                source.CancelAfter(timeout);
+                foreach (var request in this.pendingRequests)
+                    Consider(Volatile.Read(ref request.Cancellation), now, ref next, ref due);
+            }
+            this.timerDue = next;
+            this.ArmTimer(next);
+        }
+        if (due is null)
+            return;
+        foreach (var scope in due)
+        {
+            try
+            {
+                scope.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // The scope ended with its command.
             }
         }
-        catch (ObjectDisposedException)
+
+        static void Consider(ExecutionScope? scope, long now, ref long next, ref List<ExecutionScope>? due)
         {
-            // The scope ended with its connection.
+            if (scope is null || ReferenceEquals(scope, ParkedScope))
+                return;
+            var deadline = Volatile.Read(ref scope.Deadline);
+            if (deadline == 0)
+                return;
+            if (now < deadline)
+            {
+                next = Math.Min(next, deadline);
+                return;
+            }
+            // The claim: a pause that wrote 0 first keeps the scope.
+            if (Interlocked.CompareExchange(ref scope.Deadline, 0, deadline) == deadline)
+            {
+#if DEBUG
+                System.Diagnostics.Debug.Assert(deadline != 0 && now >= deadline, "The timeout timer cancelled a scope that wasn't due.");
+#endif
+                (due ??= []).Add(scope);
+            }
         }
     }
 
@@ -3230,6 +3347,12 @@ public sealed class SimulatedDbConnection : DbConnection
             }
             if (!ReferenceEquals(this.executionCancellation, ParkedScope))
                 this.executionCancellation.Dispose();
+            lock (this.timerGate)
+            {
+                this.timerDisposed = true;
+                this.deadlineTimer?.Dispose();
+                this.deadlineTimer = null;
+            }
             // Local temp tables auto-drop at session close. Clearing the dict
             // releases each table's Heap and LOB pages for GC; nothing else
             // holds long-lived references to them after the connection ends.

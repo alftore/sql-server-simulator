@@ -336,4 +336,83 @@ public sealed class StatementCancellationTests
         AreEqual(-2, timeout.Number);
         AreEqual(0, Scalar(connection, "select count(*) from logt where v = 1"));
     }
+
+    private const string CpuLoop = "declare @i bigint = 0; while 1 = 1 set @i += 1";
+
+    [TestMethod]
+    public void Timeout_NeverFiresBeforeItsDeadline()
+    {
+        using var connection = Open();
+        var elapsed = Stopwatch.StartNew();
+
+        var timeout = Throws<SimulatedSqlException>(() => Run(connection, CpuLoop, timeout: 1));
+        elapsed.Stop();
+
+        AreEqual(-2, timeout.Number);
+        IsGreaterThanOrEqualTo(1000.0, elapsed.Elapsed.TotalMilliseconds);
+    }
+
+    [TestMethod]
+    public void ShorterTimeoutAfterLonger_FiresOnTime()
+    {
+        using var connection = Open();
+        Run(connection, "select 1", timeout: 30);
+        var elapsed = Stopwatch.StartNew();
+
+        var timeout = Throws<SimulatedSqlException>(() => Run(connection, CpuLoop, timeout: 1));
+        elapsed.Stop();
+
+        AreEqual(-2, timeout.Number);
+        IsLessThan(3000.0, elapsed.Elapsed.TotalMilliseconds);
+    }
+
+    [TestMethod]
+    [DataRow(0)]
+    [DataRow(30)]
+    public void EarlierCommandsDeadline_DoesNotCancelTheNext(int nextTimeout)
+    {
+        using var connection = Open();
+        Run(connection, "select 1", timeout: 1);
+
+        Run(connection, "waitfor delay '00:00:01.500'", timeout: nextTimeout);
+        AreEqual(1, Scalar(connection, "select 1"));
+    }
+
+    [TestMethod]
+    public void ManyQuickCommands_ThenALongOne()
+    {
+        using var connection = Open();
+        for (var i = 0; i < 1000; i++)
+            Run(connection, "select 1");
+        var elapsed = Stopwatch.StartNew();
+
+        var timeout = Throws<SimulatedSqlException>(() => Run(connection, CpuLoop, timeout: 1));
+        elapsed.Stop();
+
+        AreEqual(-2, timeout.Number);
+        IsGreaterThanOrEqualTo(1000.0, elapsed.Elapsed.TotalMilliseconds);
+        IsLessThan(3000.0, elapsed.Elapsed.TotalMilliseconds);
+    }
+
+    [TestMethod]
+    public void MarsParkedRequest_WaitingOnItsClient_IsNotTimedOut()
+    {
+        using var connection = Open();
+        Run(connection, "create table wide (k int primary key, v char(2000) not null); insert wide select value, 'x' from generate_series(1, 2000)");
+        using var first = connection.CreateCommand();
+        first.CommandText = "select k, v from wide";
+        first.CommandTimeout = 1;
+        using var reader = first.ExecuteReader();
+        for (var i = 0; i < 10; i++)
+            IsTrue(reader.Read());
+
+        // Its statement waits on its client, so another request runs past its timeout
+        // while it is parked, and the time it waited is not its own.
+        Run(connection, "waitfor delay '00:00:01.500'", timeout: 0);
+        var read = 10;
+        while (reader.Read())
+            read++;
+        AreEqual(2000, read);
+        IsFalse(reader.NextResult());
+    }
 }

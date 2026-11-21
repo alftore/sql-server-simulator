@@ -124,7 +124,7 @@ internal sealed class SessionRequest(bool inProcess, bool consumed)
     /// cancel targeting the request reaches wherever it is parked; null until
     /// one opens.
     /// </summary>
-    public CancellationTokenSource? Cancellation;
+    public ExecutionScope? Cancellation;
 
     /// <summary>Set once a cancel or a client attention has targeted the request, so a scope it opens afterwards starts cancelled.</summary>
     public volatile bool AttentionReceived;

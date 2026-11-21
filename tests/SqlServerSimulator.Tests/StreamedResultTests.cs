@@ -717,6 +717,31 @@ public sealed class StreamedResultTests
     }
 
     /// <summary>
+    /// The time a client spends between reads never counts against the
+    /// <c>CommandTimeout</c>, however often it pauses: each call has the whole
+    /// timeout to itself.
+    /// </summary>
+    [TestMethod]
+    public void SlowReads_ClientTimeIsNotCounted()
+    {
+        var sim = Big();
+        using var connection = sim.CreateOpenConnection();
+        using var command = connection.CreateCommand("select * from big");
+        command.CommandTimeout = 1;
+        using var rows = command.ExecuteReader();
+        var read = 0;
+        var elapsed = System.Diagnostics.Stopwatch.StartNew();
+        while (rows.Read())
+        {
+            read++;
+            if (read % 150 == 0 && elapsed.Elapsed.TotalSeconds < 2.5)
+                Thread.Sleep(300);
+        }
+        AreEqual(Rows, read);
+        IsGreaterThan(2.0, elapsed.Elapsed.TotalSeconds);
+    }
+
+    /// <summary>
     /// A reader waiting on the writer's row reads it once the writer commits,
     /// as the committed row it then is.
     /// </summary>
