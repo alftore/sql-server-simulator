@@ -24,6 +24,22 @@ partial class Simulation
     private readonly BoundedCache<string, QueryStoreShape> queryStoreShapes = new(PlanCacheCapacity * 4, StringComparer.Ordinal);
 
     /// <summary>
+    /// Every simulation's statement shapes, under the one asked on a miss of
+    /// <see cref="queryStoreShapes"/>: keyed by the text, the three inputs
+    /// its tokens were read under and which tokens were read
+    /// (<see cref="QueryStoreShapeKey"/>), of which a shape is a pure
+    /// function — it holds strings, flags, the hashes and those inputs,
+    /// nothing of the simulation that read it (see
+    /// <see cref="SharedTextTier{TKey, TValue}"/>).
+    /// Bounded as the token memo's tier is, at the shape cache's count.
+    /// </summary>
+    internal static readonly SharedTextTier<QueryStoreShapeKey, QueryStoreShape> SharedQueryStoreShapes =
+        new(PlanCacheCapacity * 4, TokenMemo.SharedTextBudget, TokenMemo.MaxSharedTextLength, QueryStoreShapeKey.Comparer);
+
+    /// <summary>Test-observable: misses of this simulation's statement shapes the process-wide tier served.</summary>
+    internal long QueryStoreShapeSharedHits;
+
+    /// <summary>
     /// Where a statement's capture started: its clock, the session's
     /// <c>WAITFOR</c> time by then (which is no CPU), and the logical reads
     /// its statistics had already counted — and whether the execution goes to
@@ -794,17 +810,65 @@ partial class Simulation
 
     /// <summary>
     /// The shape of the statement <paramref name="text"/> spells, from the
-    /// cache or read now. The database supplies the tokenizer's collation and
-    /// compatibility level.
+    /// cache, the process-wide tier or read now. The database supplies the
+    /// tokenizer's collation and compatibility level.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The tier serves and keeps a shape under everything it was read from:
+    /// the text, the collation, compatibility level and
+    /// <c>QUOTED_IDENTIFIER</c> its tokens were read under, and which tokens
+    /// — the text's own, tokenized again (<see cref="QueryStoreShapeKey.TextTokens"/>),
+    /// or the parser's, which span the text's first so many characters. The
+    /// two can differ: a <c>MERGE</c>'s text holds the <c>;</c> it requires
+    /// and the parser's tokens stop short of it, so the query hash of one
+    /// read hashes the <c>;</c> and of the other doesn't, and a simulation
+    /// reads whichever its own first capture of the text reads.
+    /// </para>
+    /// <para>
+    /// The parser's tokens are shared only when they were read under the
+    /// database's collation and level and the <c>QUOTED_IDENTIFIER</c> the
+    /// shape records (a statement after a <c>USE</c> bound its tokens in
+    /// another database), and when the characters they span begin the text:
+    /// the tokenizer reads nothing before where it starts, so those tokens
+    /// are the ones those characters tokenize to wherever they stand.
+    /// </para>
+    /// </remarks>
     private QueryStoreShape QueryStoreShapeOf(ReadOnlySpan<char> text, Database database, ParserContext? parser, ParserContext.Checkpoint? tokensFrom)
     {
         if (this.queryStoreShapes.TryGetValue(text, out var cached))
             return cached;
-        var parsed = tokensFrom is { } start && parser is not null ? parser.StatementTokens(start) : null;
-        var shape = QueryStoreShape.Read(new string(text), parsed, parsed is null || parser!.QuotedIdentifiers, database);
+        var spanned = ReadOnlySpan<char>.Empty;
+        var fromParser = tokensFrom is { } start && parser is not null && parser.HoldsStatementTokens(start, out spanned);
+        var quotedIdentifiers = !fromParser || parser!.QuotedIdentifiers;
+        var tokensSpan = fromParser ? spanned.Length : QueryStoreShapeKey.TextTokens;
+        var shares = SharedQueryStoreShapes.Keeps(text.Length)
+            && (!fromParser || (text.StartsWith(spanned, StringComparison.Ordinal) && ReadUnderDatabase(parser!.StatementTokensReadUnder, database, quotedIdentifiers)));
+        if (shares && SharedQueryStoreShapes.TryGetValue(new QueryStoreShapeLookup(text, database.Collation, database.CompatibilityLevel, quotedIdentifiers, tokensSpan), out var shared))
+        {
+            _ = Interlocked.Increment(ref this.QueryStoreShapeSharedHits);
+#if DEBUG
+            // Read as this simulation would have read it without the tier.
+            if (SharedQueryStoreShapes.AuditsThisHit()
+                && QueryStoreShape.Read(new string(text), fromParser ? parser!.StatementTokens(tokensFrom!.Value) : null, quotedIdentifiers, database).DifferenceFrom(shared) is { } difference)
+            {
+                throw new InvalidOperationException($"The shared statement-shape tier's {difference} differs from reading the shape again, for: {shared.Text}");
+            }
+#endif
+            _ = this.queryStoreShapes.TryAdd(shared.Text, shared);
+            return shared;
+        }
+        var parsed = fromParser ? parser!.StatementTokens(tokensFrom!.Value) : null;
+        var shape = QueryStoreShape.Read(new string(text), parsed, quotedIdentifiers, database);
         _ = this.queryStoreShapes.TryAdd(shape.Text, shape);
+        if (shares)
+            _ = SharedQueryStoreShapes.TryAdd(new QueryStoreShapeKey(shape.Text, database.Collation, database.CompatibilityLevel, quotedIdentifiers, tokensSpan), shape.Text.Length, shape);
         return shape;
+
+        static bool ReadUnderDatabase(in TokenMemoKey readUnder, Database database, bool quotedIdentifiers) =>
+            ReferenceEquals(readUnder.Collation, database.Collation)
+            && readUnder.CompatibilityLevel == database.CompatibilityLevel
+            && readUnder.QuotedIdentifiers == quotedIdentifiers;
     }
 
     /// <summary>Forgets every statement shape, with the plan cache: <c>DBCC FREEPROCCACHE</c>.</summary>
@@ -955,6 +1019,35 @@ internal sealed class QueryStoreShape
         this.QueryHash = hash[..8];
         this.QueryPlanHash = hash[8..16];
     }
+
+#if DEBUG
+    /// <summary>
+    /// The first field in which <paramref name="other"/> differs from this
+    /// shape, or null when every field read off the tokens agrees — the
+    /// process-wide tier's audit. Renders both forced forms, which the shapes
+    /// would each render alike on their first ask anyway.
+    /// </summary>
+    internal string? DifferenceFrom(QueryStoreShape other) =>
+        !string.Equals(this.Text, other.Text, StringComparison.Ordinal) ? nameof(this.Text)
+        : this.Captured != other.Captured ? nameof(this.Captured)
+        : this.CapturedWhenCallingFunction != other.CapturedWhenCallingFunction ? nameof(this.CapturedWhenCallingFunction)
+        : !string.Equals(this.Parameterized, other.Parameterized, StringComparison.Ordinal) ? nameof(this.Parameterized)
+        : !string.Equals(this.PreparedText, other.PreparedText, StringComparison.Ordinal) ? nameof(this.PreparedText)
+        : this.ParameterizedPrefixLength != other.ParameterizedPrefixLength ? nameof(this.ParameterizedPrefixLength)
+        : !this.Variables.AsSpan().SequenceEqual(other.Variables) ? nameof(this.Variables)
+        : this.IsConditionOrReturn != other.IsConditionOrReturn ? nameof(this.IsConditionOrReturn)
+        : this.UsesDefaultSchema != other.UsesDefaultSchema ? nameof(this.UsesDefaultSchema)
+        : this.IsTrivial != other.IsTrivial ? nameof(this.IsTrivial)
+        : !string.Equals(this.StatementType, other.StatementType, StringComparison.Ordinal) ? nameof(this.StatementType)
+        : !this.QueryHash.AsSpan().SequenceEqual(other.QueryHash) ? nameof(this.QueryHash)
+        : !this.QueryPlanHash.AsSpan().SequenceEqual(other.QueryPlanHash) ? nameof(this.QueryPlanHash)
+        : !ReferenceEquals(this.tokenCollation, other.tokenCollation) ? nameof(this.tokenCollation)
+        : this.tokenCompatibilityLevel != other.tokenCompatibilityLevel ? nameof(this.tokenCompatibilityLevel)
+        : this.tokenQuotedIdentifiers != other.tokenQuotedIdentifiers ? nameof(this.tokenQuotedIdentifiers)
+        : !string.Equals(this.Forced, other.Forced, StringComparison.Ordinal) ? nameof(this.Forced)
+        : this.ForcedPrefixLength != other.ForcedPrefixLength ? nameof(this.ForcedPrefixLength)
+        : null;
+#endif
 
     private static int DeclarationLength(string parameterized)
     {
@@ -1271,4 +1364,77 @@ internal sealed class QueryStorePrefix(string[] declaredNames, SqlType[] types, 
     public readonly SqlType[] Types = types;
     public readonly bool[] SpelledNumeric = spelledNumeric;
     public readonly string Prefix = prefix;
+}
+
+/// <summary>
+/// Identity of a <see cref="QueryStoreShape"/> in the process-wide tier
+/// (<see cref="Simulation.SharedQueryStoreShapes"/>): the statement text, the
+/// inputs its tokens were read under and which tokens were read — everything
+/// <see cref="QueryStoreShape.Read"/> reads. The collation is compared by
+/// reference, as <see cref="TokenMemoKey"/>'s is.
+/// </summary>
+internal readonly struct QueryStoreShapeKey(string text, Collation collation, CompatibilityLevel compatibilityLevel, bool quotedIdentifiers, int tokensSpan)
+    : IEquatable<QueryStoreShapeKey>
+{
+    /// <summary>The <see cref="TokensSpan"/> of a shape read off the whole text, tokenized again.</summary>
+    public const int TextTokens = -1;
+
+    /// <summary>Compares keys, and a <see cref="QueryStoreShapeLookup"/> with one, so a lookup needs no string.</summary>
+    public static readonly KeyComparer Comparer = new();
+
+    public readonly string Text = text;
+    public readonly Collation Collation = collation;
+    public readonly CompatibilityLevel CompatibilityLevel = compatibilityLevel;
+    public readonly bool QuotedIdentifiers = quotedIdentifiers;
+
+    /// <summary>
+    /// <see cref="TextTokens"/>, or the number of the text's first characters
+    /// the parser's tokens the shape was read off span.
+    /// </summary>
+    public readonly int TokensSpan = tokensSpan;
+
+    public bool Equals(QueryStoreShapeKey other) =>
+        this.QuotedIdentifiers == other.QuotedIdentifiers
+        && this.TokensSpan == other.TokensSpan
+        && this.CompatibilityLevel == other.CompatibilityLevel
+        && ReferenceEquals(this.Collation, other.Collation)
+        && string.Equals(this.Text, other.Text, StringComparison.Ordinal);
+
+    public override bool Equals(object? obj) => obj is QueryStoreShapeKey other && this.Equals(other);
+
+    public override int GetHashCode() => HashOf(this.Text, this.Collation, this.CompatibilityLevel, this.QuotedIdentifiers, this.TokensSpan);
+
+    /// <summary>The one hash a key and a lookup over the same characters share.</summary>
+    internal static int HashOf(ReadOnlySpan<char> text, Collation collation, CompatibilityLevel compatibilityLevel, bool quotedIdentifiers, int tokensSpan) =>
+        HashCode.Combine(string.GetHashCode(text, StringComparison.Ordinal), System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(collation), compatibilityLevel, quotedIdentifiers, tokensSpan);
+
+    internal sealed class KeyComparer : IEqualityComparer<QueryStoreShapeKey>, IAlternateEqualityComparer<QueryStoreShapeLookup, QueryStoreShapeKey>
+    {
+        public bool Equals(QueryStoreShapeKey x, QueryStoreShapeKey y) => x.Equals(y);
+
+        public int GetHashCode(QueryStoreShapeKey key) => key.GetHashCode();
+
+        public bool Equals(QueryStoreShapeLookup alternate, QueryStoreShapeKey other) =>
+            alternate.QuotedIdentifiers == other.QuotedIdentifiers
+            && alternate.TokensSpan == other.TokensSpan
+            && alternate.CompatibilityLevel == other.CompatibilityLevel
+            && ReferenceEquals(alternate.Collation, other.Collation)
+            && alternate.Text.SequenceEqual(other.Text);
+
+        public int GetHashCode(QueryStoreShapeLookup alternate) =>
+            HashOf(alternate.Text, alternate.Collation, alternate.CompatibilityLevel, alternate.QuotedIdentifiers, alternate.TokensSpan);
+
+        public QueryStoreShapeKey Create(QueryStoreShapeLookup alternate) =>
+            new(new string(alternate.Text), alternate.Collation, alternate.CompatibilityLevel, alternate.QuotedIdentifiers, alternate.TokensSpan);
+    }
+}
+
+/// <summary>A <see cref="QueryStoreShapeKey"/> over a span of the batch text, for a lookup that allocates nothing.</summary>
+internal readonly ref struct QueryStoreShapeLookup(ReadOnlySpan<char> text, Collation collation, CompatibilityLevel compatibilityLevel, bool quotedIdentifiers, int tokensSpan)
+{
+    public readonly ReadOnlySpan<char> Text = text;
+    public readonly Collation Collation = collation;
+    public readonly CompatibilityLevel CompatibilityLevel = compatibilityLevel;
+    public readonly bool QuotedIdentifiers = quotedIdentifiers;
+    public readonly int TokensSpan = tokensSpan;
 }
