@@ -149,6 +149,23 @@ partial class Simulation
         /// <summary>The reads the Query Store capture counts.</summary>
         public IoStatistics? QueryStoreIo;
 
+        /// <summary>Whether <see cref="QueryStoreIo"/> is one this statement rented from its connection, rather than its caller's or <c>STATISTICS IO</c>'s.</summary>
+        private bool rentedIo;
+
+        /// <summary>
+        /// Gives <see cref="QueryStoreIo"/> back to the connection once the
+        /// capture has read it, when the statement rented it: it has left, so
+        /// the connection's <c>StatementIo</c> is its caller's again.
+        /// </summary>
+        public void GiveBackIo(SimulatedDbConnection connection)
+        {
+            if (!this.rentedIo)
+                return;
+            this.rentedIo = false;
+            connection.ReturnIo(this.QueryStoreIo!);
+            this.QueryStoreIo = null;
+        }
+
         /// <summary>How the statement ended; set by <see cref="Run"/>.</summary>
         public StatementEnding Ending;
 
@@ -356,7 +373,23 @@ partial class Simulation
             this.QueryStore = IsQueryStoreCandidate(batch.Parser.Token) ? BeginQueryStoreCapture(batch, io: null) : null;
             this.enclosingIo = connection.StatementIo;
             if (this.ReportsStatistics)
-                connection.StatementIo = connection.StatisticsIo || this.QueryStore is not null ? new IoStatistics() : null;
+            {
+                // With STATISTICS IO on, the object is the statement's report, which the
+                // messages read; otherwise only the capture reads it, and it is rented.
+                if (connection.StatisticsIo)
+                {
+                    connection.StatementIo = new IoStatistics();
+                }
+                else if (this.QueryStore is not null)
+                {
+                    connection.StatementIo = connection.RentIo();
+                    this.rentedIo = true;
+                }
+                else
+                {
+                    connection.StatementIo = null;
+                }
+            }
             this.StatementIo = this.ReportsStatistics && connection.StatisticsIo ? connection.StatementIo : null;
             this.QueryStoreIo = this.QueryStore is not null ? connection.StatementIo : null;
             // Function body-shape recording (Msg 455 / 444 / 443) — active only

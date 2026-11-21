@@ -1053,6 +1053,7 @@ Every one of these needs `VIEW SERVER PERFORMANCE STATE` (Msg 300 then 297), as 
 **Cost.**
 A tight loop of a plan-cached point `SELECT` measured 2.65 µs against 2.55 µs without the registry, and 2.55 µs against 2.30 µs in a database with its store off, which paid nothing for a statement's capture until the registry needed one (measured 2026-10-15, best of five rounds, Release build).
 A replayed SELECT batch remembers its plan on its parse-cache entry (`BatchContext.CachedPlanMemo`), so a repeat skips the lookup — and with it the declaration a parameterized command's key needs.
+The reads a captured statement counts for Query Store go into an `IoStatistics` the connection lends from a one-slot spare (`SimulatedDbConnection.RentIo`) and gets back once the capture has read it (`ReturnIo`), so a statement allocates none of its own; a statement that reports `STATISTICS IO`, a MARS request's parked one, a streamed result's and a caller's each hold the object they took until they end, and a Debug build asserts that nothing counts into one that has gone back (about 110 bytes less per captured statement).
 
 ### Divergences
 

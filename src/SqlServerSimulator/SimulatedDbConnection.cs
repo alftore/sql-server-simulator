@@ -311,6 +311,49 @@ public sealed class SimulatedDbConnection : DbConnection
     /// </summary>
     internal Parser.IoStatistics? StatementIo;
 
+    /// <summary>The <see cref="Parser.IoStatistics"/> a finished statement gave back for the next to count into, if one did.</summary>
+    private Parser.IoStatistics? spareIo;
+
+    /// <summary>
+    /// The <see cref="Parser.IoStatistics"/> a statement counts its reads into
+    /// for Query Store: the spare a statement gave back (see
+    /// <see cref="ReturnIo"/>), made empty, or a new one. A statement of this
+    /// session takes it out of the slot, so two statements never share one — a
+    /// MARS request parks its statement's on the request
+    /// (<c>statement.Io</c>), a streamed result keeps its across the advances,
+    /// and a nested statement puts its caller's aside (<c>enclosingIo</c>),
+    /// each of which holds the object it took until it ends.
+    /// </summary>
+    /// <remarks>
+    /// Read wherever one is held: <c>StatementIo</c> by the scans, seeks and
+    /// writes counting into it, its Query Store copy (<c>QueryStoreIo</c>)
+    /// by <c>EndFramedQueryStoreCapture</c> and the replay's
+    /// <c>EndQueryStoreCapture</c> calls, and the request's parked
+    /// <c>statement.Io</c> when the connection steps between requests; the
+    /// object goes back only once its capture has read it.
+    /// </remarks>
+    internal Parser.IoStatistics RentIo()
+    {
+        if (this.spareIo is not { } io)
+            return new Parser.IoStatistics();
+        this.spareIo = null;
+        io.Reset();
+        return io;
+    }
+
+    /// <summary>
+    /// Gives <paramref name="io"/> back once nothing holds it: the statement
+    /// that rented it has ended and its capture has read it. Kept only when
+    /// the slot is empty.
+    /// </summary>
+    internal void ReturnIo(Parser.IoStatistics io)
+    {
+#if DEBUG
+        io.Returned = true;
+#endif
+        this.spareIo ??= io;
+    }
+
     /// <summary>
     /// The time this session has spent in <c>WAITFOR</c>, in
     /// <see cref="TimeSpan"/> ticks, which <c>STATISTICS TIME</c> takes out of

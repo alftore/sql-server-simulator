@@ -801,4 +801,120 @@ public sealed class QueryStoreCaptureTests
             "(@x int,@m int)|(@y int,@w int,@h int,@m int)|(@z int,@y int,@x int)|(@w int,@x int,@y int,@n int,@m int)|(@w int,@x int,@y int,@n int)|(@z int,@n int,@x int)|(@w int,@x int,@y int,@z int)",
             string.Join("|", prefixes));
     }
+
+    private static void Run(DbConnection connection, string sql, params ReadOnlySpan<(string Name, object Value)> parameters)
+    {
+        using var command = connection.CreateCommand(sql, parameters);
+        _ = command.ExecuteNonQuery();
+    }
+
+    private static void RunReading(DbConnection connection, string sql, params ReadOnlySpan<(string Name, object Value)> parameters)
+    {
+        using var command = connection.CreateCommand(sql, parameters);
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+        }
+    }
+
+    private static Simulation TwoSizedTables()
+    {
+        var sim = new Simulation();
+        _ = sim.ExecuteNonQuery(CaptureAll);
+        _ = sim.ExecuteNonQuery("create table big (id int primary key, v int not null, pad char(2000) not null default 'x'); insert big (id, v) select value, 1 from generate_series(1, 200)");
+        _ = sim.ExecuteNonQuery("create table small (id int primary key, v int not null, pad char(2000) not null default 'x'); insert small (id, v) select value, 1 from generate_series(1, 20)");
+        return sim;
+    }
+
+    /// <summary>The logical reads Query Store holds for the captured queries whose text starts with <paramref name="prefix"/>, summed over their executions.</summary>
+    private static double StoreReads(Simulation sim, string prefix, string objectFilter = "q.object_id = 0") => Convert.ToDouble(
+        sim.ExecuteScalar($"""
+            select isnull(sum(rs.avg_logical_io_reads * rs.count_executions), 0)
+            from sys.query_store_query q
+            join sys.query_store_query_text qt on qt.query_text_id = q.query_text_id
+            join sys.query_store_plan p on p.query_id = q.query_id
+            join sys.query_store_runtime_stats rs on rs.plan_id = p.plan_id
+            where qt.query_sql_text like '{prefix}%' and {objectFilter}
+            """),
+        System.Globalization.CultureInfo.InvariantCulture);
+
+    [TestMethod]
+    public void MarsInterleavedReaders_EachStatementCountsItsOwnReads()
+    {
+        var alone = TwoSizedTables();
+        using (var connection = alone.CreateOpenConnection())
+        {
+            RunReading(connection, "select id, pad from big where id > @lo order by id", ("@lo", 0));
+            RunReading(connection, "select id, pad from small where id > @lo order by id", ("@lo", 0));
+        }
+        var bigAlone = StoreReads(alone, "(@lo int)select id, pad from big");
+        var smallAlone = StoreReads(alone, "(@lo int)select id, pad from small");
+        IsGreaterThan(smallAlone, bigAlone);
+        IsGreaterThan(0.0, smallAlone);
+
+        var together = TwoSizedTables();
+        using (var connection = together.CreateOpenConnection())
+        {
+            using var bigCommand = connection.CreateCommand("select id, pad from big where id > @lo order by id", ("@lo", 0));
+            using var smallCommand = connection.CreateCommand("select id, pad from small where id > @lo order by id", ("@lo", 0));
+            using var bigReader = bigCommand.ExecuteReader();
+            using var smallReader = smallCommand.ExecuteReader();
+            var more = true;
+            while (more)
+            {
+                more = false;
+                for (var i = 0; i < 3 && bigReader.Read(); i++)
+                    more = true;
+                if (smallReader.Read())
+                    more = true;
+            }
+        }
+
+        AreEqual(bigAlone, StoreReads(together, "(@lo int)select id, pad from big"));
+        AreEqual(smallAlone, StoreReads(together, "(@lo int)select id, pad from small"));
+    }
+
+    [TestMethod]
+    public void NestedProcedureStatements_CountTheirOwnReads()
+    {
+        var sim = TwoSizedTables();
+        _ = sim.ExecuteNonQuery("create procedure p as begin select sum(v) from big; select sum(v) from small; end");
+        for (var i = 0; i < 3; i++)
+            _ = sim.ExecuteNonQuery("exec p");
+        _ = sim.ExecuteScalar("select sum(v) from big");
+        _ = sim.ExecuteScalar("select sum(v) from small");
+
+        var bigAlone = StoreReads(sim, "select sum(v) from big", "q.object_id = 0");
+        var smallAlone = StoreReads(sim, "select sum(v) from small", "q.object_id = 0");
+        IsGreaterThan(smallAlone, bigAlone);
+        IsGreaterThan(0.0, smallAlone);
+        AreEqual(3 * bigAlone, StoreReads(sim, "select sum(v) from big", "q.object_id <> 0"));
+        AreEqual(3 * smallAlone, StoreReads(sim, "select sum(v) from small", "q.object_id <> 0"));
+    }
+
+    [TestMethod]
+    public void StatisticsIoOn_MessagesUnchanged()
+    {
+        var sim = TwoSizedTables();
+        using var connection = (SimulatedDbConnection)sim.CreateOpenConnection();
+        var messages = new List<string>();
+        connection.InfoMessage += (_, e) =>
+        {
+            foreach (var error in e.Errors)
+                messages.Add(error.Message);
+        };
+        Run(connection, "set statistics io on");
+        for (var i = 0; i < 3; i++)
+        {
+            messages.Clear();
+            RunReading(connection, "select sum(v) from small");
+            HasCount(1, messages);
+            StartsWith("Table 'small'. Scan count 1, logical reads ", messages[0]);
+        }
+
+        var reads = long.Parse(messages[0]["Table 'small'. Scan count 1, logical reads ".Length..].Split(',')[0], System.Globalization.CultureInfo.InvariantCulture);
+        IsGreaterThan(0L, reads);
+        Run(connection, "set statistics io off");
+        AreEqual(3 * (double)reads, StoreReads(sim, "select sum(v) from small"));
+    }
 }
