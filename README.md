@@ -64,6 +64,31 @@ sealed class SimulatedContext(Simulation simulation) : DbContext
 The companion `SqlServerSimulator.EFCore` package adds `UseSqlServerSimulator(...)` for entities that use CLR/store-type pairs whose EF default mappings downcast to `SqlParameter` (`DateOnly`/`DateTime`→`date`/`smalldatetime`, `TimeOnly`/`TimeSpan`→`time(N)`, `decimal`→`money`/`smallmoney`). Without it, those mappings throw at SaveChanges. The base-ADO.NET types in the example above don't need it.
 -->
 
+## Test projects
+
+In a test process the simulator's code mostly runs unoptimized.
+With dynamic profile-guided optimization (the default), each method is recompiled twice on the way to optimized code, and both recompiles wait until no method has been compiled for 100 ms, which EF Core's per-query compilation rarely allows.
+Setting `TieredPGO` to `false` in the test project skips the instrumented step:
+
+```xml
+<PropertyGroup>
+  <TieredPGO>false</TieredPGO>
+</PropertyGroup>
+```
+
+On an EF Core 10 test-class stand-in (300 tests, a new `Simulation` each) this took 7.7 s to 5.6 s; on one or two CPUs, as CI runners have, it still saved 12% to 26%.
+On EF Core's own functional test classes, a class that spends most of its time in the simulator went from 23.5 s to 17.9 s.
+The setting changes the whole test process, which suits short-lived test runs; it isn't advice for a production host.
+
+The package can write the same setting for you: set `SqlServerSimulatorDisableTieredPgo` to `true` in the test project.
+It does nothing unless you set it, and a `TieredPGO` value you set yourself wins.
+
+```xml
+<PropertyGroup>
+  <SqlServerSimulatorDisableTieredPgo>true</SqlServerSimulatorDisableTieredPgo>
+</PropertyGroup>
+```
+
 ## Network endpoint
 
 A simulation can optionally listen on a real TDS endpoint over loopback TCP with TLS, so genuine SQL Server clients connect to it exactly as they would to a real server:

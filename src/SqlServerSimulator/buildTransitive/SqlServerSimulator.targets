@@ -1,0 +1,6 @@
+<Project>
+  <!-- Opt-in: a test project sets SqlServerSimulatorDisableTieredPgo to true. See the README's "Test projects". -->
+  <PropertyGroup Condition="'$(SqlServerSimulatorDisableTieredPgo)' == 'true' and '$(TieredPGO)' == ''">
+    <TieredPGO>false</TieredPGO>
+  </PropertyGroup>
+</Project>
