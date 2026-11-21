@@ -17,6 +17,8 @@ EF Core's SqlServer provider keeps emitting SQL-Server-flavored SQL; the adapter
 
 **Packaging:** only `SqlServerSimulator` publishes — the root `Directory.Build.props` defaults every project to `IsPackable=false` and the package project alone opts back in.
 The adapter stays in-repo-but-unpublished as a deliberate demand signal, so don't pitch publishing it without a user request.
+The package ships one opt-in MSBuild file, `buildTransitive/SqlServerSimulator.targets`, which sets `TieredPGO=false` for a consumer that sets `SqlServerSimulatorDisableTieredPgo` to `true` (and sets no `TieredPGO` itself); it's a `.targets` because a package's `.props` is imported before the project body and can't read the project's property.
+`tools/package-check/check.sh` packs the package into a local folder and checks four throwaway consumers' `runtimeconfig.json`; run it whenever the targets file or the packing lines change (it isn't part of `dotnet test`).
 
 ## Operating goal
 

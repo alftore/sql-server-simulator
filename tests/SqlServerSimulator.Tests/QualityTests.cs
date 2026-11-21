@@ -653,6 +653,32 @@ public partial class QualityTests
     [GeneratedRegex(@"\bMsg \*{0,2}(\d{3,5})\b")]
     private static partial Regex CitationPattern { get; }
 
+    [TestMethod]
+    [Description("The package's MSBuild file changes nothing for a consumer that doesn't opt in, and never overrides a TieredPGO the consumer set.")]
+    public void PackageTargets_AreOptIn()
+    {
+        var repoRoot = FindRepoRoot();
+        var targets = XDocument.Load(Path.Combine(repoRoot, "src", "SqlServerSimulator", "buildTransitive", "SqlServerSimulator.targets"));
+
+        Assert.AreEqual("Project", targets.Root!.Name.LocalName);
+        Assert.IsEmpty(targets.Root.Elements().Where(e => e.Name.LocalName is not "PropertyGroup"), "The file may only hold the one property group.");
+
+        var group = targets.Root.Elements().Single();
+        Assert.AreEqual(
+            "'$(SqlServerSimulatorDisableTieredPgo)' == 'true' and '$(TieredPGO)' == ''",
+            (string?)group.Attribute("Condition"));
+
+        var property = group.Elements().Single();
+        Assert.AreEqual("TieredPGO", property.Name.LocalName);
+        Assert.AreEqual("false", property.Value);
+        Assert.IsNull(property.Attribute("Condition"));
+
+        // Packed under buildTransitive only: a second copy under build would import twice (MSB4011).
+        var project = File.ReadAllText(Path.Combine(repoRoot, "src", "SqlServerSimulator", "SqlServerSimulator.csproj"));
+        Assert.Contains("Include=\"buildTransitive/SqlServerSimulator.targets\" Pack=\"true\" PackagePath=\"buildTransitive/\"", project);
+        Assert.IsFalse(Directory.Exists(Path.Combine(repoRoot, "src", "SqlServerSimulator", "build")));
+    }
+
     /// <summary>
     /// Walks up from the test assembly to the directory holding the solution,
     /// so the check runs the same from a `dotnet test` of the csproj and from a
