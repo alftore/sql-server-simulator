@@ -24,7 +24,8 @@ namespace SqlServerSimulator.Schemas;
 /// (column names + types) and the updatable-DML metadata
 /// (<see cref="BaseTable"/>, <see cref="BaseColumnOrdinals"/>,
 /// <see cref="RejectionReason"/>, <see cref="VisibilityCheck"/>,
-/// <see cref="CheckOptionCheck"/>). INSERT/UPDATE/DELETE through the view
+/// <see cref="CheckOptionCheck"/>), which follows the body's objects as they
+/// change (<see cref="SettledSchemaVersion"/>). INSERT/UPDATE/DELETE through the view
 /// route to <see cref="BaseTable"/> with the projection's column-to-base
 /// mapping; non-updatable shapes surface <strong>Msg 4403</strong> /
 /// <strong>Msg 4405</strong> / <strong>Msg 4406</strong> at the DML site.
@@ -168,7 +169,7 @@ internal sealed class View(
     /// (<see cref="BaseColumnOrdinals"/>); null routes to
     /// <see cref="RejectionReason"/> → Msg 4403 / 4405.
     /// </summary>
-    public readonly HeapTable? BaseTable = baseTable;
+    public HeapTable? BaseTable = baseTable;
 
     /// <summary>
     /// Per-output-column mapping to <see cref="BaseTable"/>'s
@@ -179,7 +180,18 @@ internal sealed class View(
     /// <see cref="BaseTable"/> is null. Computed by composing per-level
     /// projection maps up the view-on-view chain.
     /// </summary>
-    public readonly int[] BaseColumnOrdinals = baseColumnOrdinals;
+    public int[] BaseColumnOrdinals = baseColumnOrdinals;
+
+    /// <summary>
+    /// The <see cref="Simulation.SchemaVersion"/> under which the body was last
+    /// analyzed for what a write through the view reaches
+    /// (<c>Simulation.SettleViewWrites</c>): that names base columns by position,
+    /// so a later version has the next statement naming the view analyze it
+    /// again. <c>-1</c> for a view whose metadata never moves — one the server
+    /// ships, and a CTE's or derived table's, which lives as long as its
+    /// statement.
+    /// </summary>
+    public long SettledSchemaVersion = -1;
 
     /// <summary>
     /// Non-<see cref="ViewUpdatabilityRejection.None"/> reason explaining
@@ -188,7 +200,7 @@ internal sealed class View(
     /// → Msg 4403; <c>MultipleSources</c> → Msg 4405; <c>UnsupportedShape</c>
     /// → Msg 4403 (closest available message).
     /// </summary>
-    public readonly ViewUpdatabilityRejection RejectionReason = rejectionReason;
+    public ViewUpdatabilityRejection RejectionReason = rejectionReason;
 
     /// <summary>
     /// For a view refused as an aggregate / DISTINCT / GROUP BY shape (or one
@@ -314,7 +326,7 @@ internal sealed class View(
     /// sources is accepted, and this flag is what routes it to the
     /// join-view path instead of Msg 4405.
     /// </summary>
-    public readonly bool IsJoinUpdatable = isJoinUpdatable;
+    public bool IsJoinUpdatable = isJoinUpdatable;
 
     /// <summary>
     /// Pre-bound closure that evaluates the AND of every WHERE clause up
@@ -327,7 +339,7 @@ internal sealed class View(
     /// unless <c>WITH CHECK OPTION</c> is set — that's
     /// <see cref="CheckOptionCheck"/>).
     /// </summary>
-    public readonly Func<SqlValue[], BatchContext, bool>? VisibilityCheck = visibilityCheck;
+    public Func<SqlValue[], BatchContext, bool>? VisibilityCheck = visibilityCheck;
 
     /// <summary>
     /// Pre-bound closure that returns <c>true</c> iff a base-table row
@@ -340,5 +352,5 @@ internal sealed class View(
     /// OPTION freely accepts INSERTs that produce rows outside its WHERE,
     /// and UPDATEs that move rows out of view (probe-confirmed).
     /// </summary>
-    public readonly Func<SqlValue[], BatchContext, bool>? CheckOptionCheck = checkOptionCheck;
+    public Func<SqlValue[], BatchContext, bool>? CheckOptionCheck = checkOptionCheck;
 }

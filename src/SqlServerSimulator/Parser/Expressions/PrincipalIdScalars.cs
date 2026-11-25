@@ -199,10 +199,10 @@ internal sealed class Permissions : Expression
         if (columnValue.IsNull || ColumnsOf(target) is not { } columns)
             return SqlValue.Null(SqlType.Int32);
         var columnName = columnValue.CoerceTo(SqlType.NVarchar).AsString;
-        var ordinal = Array.FindIndex(columns, column => database.Collation.Equals(column.Name, columnName)) + 1;
-        if (ordinal == 0)
+        var ordinal = Array.FindIndex(columns, column => database.Collation.Equals(column.Name, columnName));
+        if (ordinal < 0)
             return SqlValue.Null(SqlType.Int32);
-        return SqlValue.FromInt32(isDbo ? ColumnMask : ColumnBitmap(database, PermissionChecker.BuildPrincipalClosure(database, principalId), target, ordinal, server));
+        return SqlValue.FromInt32(isDbo ? ColumnMask : ColumnBitmap(database, PermissionChecker.BuildPrincipalClosure(database, principalId), target, HeapColumn.IdAt(columns, ordinal), server));
     }
 
     /// <summary>
@@ -298,12 +298,13 @@ internal sealed class Permissions : Expression
         foreach (var (permission, all, any) in (ReadOnlySpan<(Permission, int, int)>)[(Permission.Select, 1, 0x1000), (Permission.Update, 2, 0x2000), (Permission.References, 4, 0x4000)])
         {
             int held = 0, grantable = 0;
-            for (var ordinal = 1; ordinal <= columns.Length; ordinal++)
+            for (var ordinal = 0; ordinal < columns.Length; ordinal++)
             {
-                if (!PermissionChecker.IsColumnGranted(database, closure, permission, objectId, schemaId, ordinal, server, target))
+                var columnId = HeapColumn.IdAt(columns, ordinal);
+                if (!PermissionChecker.IsColumnGranted(database, closure, permission, objectId, schemaId, columnId, server, target))
                     continue;
                 held++;
-                if (control || PermissionChecker.IsGrantable(database, closure, permission.CanonicalName, PermissionChecker.ClassObject, objectId, schemaId, ordinal))
+                if (control || PermissionChecker.IsGrantable(database, closure, permission.CanonicalName, PermissionChecker.ClassObject, objectId, schemaId, columnId))
                     grantable++;
             }
             var heldBits = (held == columns.Length && held > 0 ? all : 0) | (held > 0 ? any : 0);
@@ -317,17 +318,17 @@ internal sealed class Permissions : Expression
         return (bitmap & 0xFFFF) != 0 ? bitmap | 0x4000000 : bitmap;
     }
 
-    private static int ColumnBitmap(Database database, HashSet<int> closure, SchemaObject target, int ordinal, ServerLoginRights server)
+    private static int ColumnBitmap(Database database, HashSet<int> closure, SchemaObject target, int columnId, ServerLoginRights server)
     {
         var (objectId, schemaId) = (target.ObjectId, target.SchemaId);
         var control = PermissionChecker.IsGrantedInClosure(database, closure, Permission.Control, PermissionChecker.ClassObject, objectId, schemaId, server, target);
         var bitmap = 0;
         foreach (var (permission, bit) in (ReadOnlySpan<(Permission, int)>)[(Permission.Select, 1), (Permission.Update, 2), (Permission.References, 4)])
         {
-            if (!PermissionChecker.IsColumnGranted(database, closure, permission, objectId, schemaId, ordinal, server, target))
+            if (!PermissionChecker.IsColumnGranted(database, closure, permission, objectId, schemaId, columnId, server, target))
                 continue;
             bitmap |= bit;
-            if (control || PermissionChecker.IsGrantable(database, closure, permission.CanonicalName, PermissionChecker.ClassObject, objectId, schemaId, ordinal))
+            if (control || PermissionChecker.IsGrantable(database, closure, permission.CanonicalName, PermissionChecker.ClassObject, objectId, schemaId, columnId))
                 bitmap |= bit << 16;
         }
         if ((bitmap & 1) != 0)
@@ -549,14 +550,14 @@ internal sealed class HasPermsByName : Expression
         {
             if (columns is null)
                 return SqlValue.Null(SqlType.Int32);
-            var ordinal = Array.FindIndex(columns, c => BuiltInToken.Comparer.Equals(c.Name, column)) + 1;
-            return SqlValue.FromInt32(ordinal > 0 && PermissionChecker.IsColumnGranted(database, principalId, enumPermission, majorId, schemaId, ordinal, server) ? 1 : 0);
+            var ordinal = Array.FindIndex(columns, c => BuiltInToken.Comparer.Equals(c.Name, column));
+            return SqlValue.FromInt32(ordinal >= 0 && PermissionChecker.IsColumnGranted(database, principalId, enumPermission, majorId, schemaId, HeapColumn.IdAt(columns, ordinal), server) ? 1 : 0);
         }
         if (columns is not null && enumPermission is Permission.Select or Permission.Update or Permission.References or Permission.Unmask)
         {
-            for (var ordinal = 1; ordinal <= columns.Length; ordinal++)
+            for (var ordinal = 0; ordinal < columns.Length; ordinal++)
             {
-                if (!PermissionChecker.IsColumnGranted(database, principalId, enumPermission, majorId, schemaId, ordinal, server))
+                if (!PermissionChecker.IsColumnGranted(database, principalId, enumPermission, majorId, schemaId, HeapColumn.IdAt(columns, ordinal), server))
                     return SqlValue.FromInt32(0);
             }
             return SqlValue.FromInt32(1);

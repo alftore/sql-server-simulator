@@ -39,7 +39,7 @@ internal sealed class DataMask(MaskingFunction function, MaskSource[] sources)
     {
         var column = table.Columns[columnIndex];
         if (column.MaskingFunction is { } function)
-            return table.Name.StartsWith('#') ? null : new(function, [new(table, columnIndex + 1)]);
+            return table.Name.StartsWith('#') ? null : new(function, [new(table, column.ColumnId)]);
 
         // A computed column over masked columns reads as default() of its own
         // type, persisted or not.
@@ -51,7 +51,7 @@ internal sealed class DataMask(MaskingFunction function, MaskSource[] sources)
             for (var i = 0; i < table.Columns.Length; i++)
             {
                 if (table.Columns[i].MaskingFunction is not null && Collation.Baseline.Equals(table.Columns[i].Name, name.Leaf))
-                    (sources ??= []).Add(new(table, i + 1));
+                    (sources ??= []).Add(new(table, table.Columns[i].ColumnId));
             }
         });
         return sources is null ? null : new(MaskingFunction.Default, [.. sources]);
@@ -278,12 +278,12 @@ internal sealed class DataMask(MaskingFunction function, MaskSource[] sources)
 
 /// <summary>
 /// One masked table column an output column reads: the table and the column's
-/// 1-based position, the <c>minor_id</c> a column-level <c>UNMASK</c> grant
+/// <c>column_id</c>, the <c>minor_id</c> a column-level <c>UNMASK</c> grant
 /// names. A table variable's column is checked at database scope alone.
 /// </summary>
-internal readonly struct MaskSource(HeapTable table, int columnOrdinal)
+internal readonly struct MaskSource(HeapTable table, int columnId)
 {
     public readonly HeapTable Table = table;
 
-    public readonly int ColumnOrdinal = columnOrdinal;
+    public readonly int ColumnId = columnId;
 }

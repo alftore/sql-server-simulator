@@ -238,7 +238,7 @@ partial class Selection
                 return (name, className, dbo ? objectGranted : permission => PermissionChecker.AppliesTo(obj, permission) && objectGranted(permission),
                     columns is null ? null : (columns, dbo
                         ? static (_, _) => true
-                        : (permission, ordinal) => PermissionChecker.IsColumnGranted(database, principalId, permission, obj.ObjectId, obj.SchemaId, ordinal, server)));
+                        : (permission, ordinal) => PermissionChecker.IsColumnGranted(database, principalId, permission, obj.ObjectId, obj.SchemaId, Storage.HeapColumn.IdAt(columns, ordinal - 1), server)));
             case "SCHEMA":
                 return name is not null && database.Schemas.TryGetValue(name, out var schema)
                     ? (name, className, Granted(PermissionChecker.ClassSchema, schema.SchemaId, 0), null)

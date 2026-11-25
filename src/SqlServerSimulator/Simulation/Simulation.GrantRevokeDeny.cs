@@ -610,7 +610,7 @@ partial class Simulation
                     continue;
                 }
                 // Column-level grant: one row per named column, minor_id =
-                // 1-based column ordinal (sys.columns.column_id).
+                // its sys.columns.column_id.
                 foreach (var columnName in columns)
                 {
                     var minorId = ResolveColumnMinorId(securableObject, columnName);
@@ -870,8 +870,8 @@ partial class Simulation
     }
 
     /// <summary>
-    /// Resolves a column name to its 1-based ordinal (<c>sys.columns.column_id</c>,
-    /// the <c>minor_id</c> a column-level grant stores) on the securable object;
+    /// Resolves a column name to its <c>sys.columns.column_id</c> (the
+    /// <c>minor_id</c> a column-level grant stores) on the securable object;
     /// raises Msg 4615 when the object has no such column. Tables and views are
     /// supported (the only column-bearing securables the grant grammar reaches).
     /// </summary>
@@ -888,7 +888,7 @@ partial class Simulation
             for (var i = 0; i < columns.Length; i++)
             {
                 if (BuiltInToken.Comparer.Equals(columns[i].Name, columnName))
-                    return i + 1;
+                    return Storage.HeapColumn.IdAt(columns, i);
             }
         }
         throw SimulatedSqlException.GrantInvalidColumnName(columnName);

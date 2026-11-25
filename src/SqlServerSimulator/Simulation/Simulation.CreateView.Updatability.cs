@@ -192,6 +192,99 @@ partial class Simulation
     }
 
     /// <summary>
+    /// Records on a stored view what a write through it reaches, as
+    /// <paramref name="body"/>, its body bound at
+    /// <paramref name="schemaVersion"/>, shows it: at <c>CREATE</c>, and again
+    /// once the definitions the body reads may have moved. The body's columns
+    /// map onto the view's by position, and one that has grown keeps the
+    /// columns the view recorded.
+    /// </summary>
+    /// <remarks>
+    /// A session executing a write through the view holds the base table's
+    /// Sch-S, under which another's analysis answers the same, so the fields
+    /// are assigned in place; of two analyses, the later version's stands.
+    /// </remarks>
+    private static void SettleViewWrites(View view, Selection body, long schemaVersion)
+    {
+        var collation = view.Schema.Database.Collation;
+        var width = view.OutputColumns.Length;
+        var (baseTable, baseColumnOrdinals, rejection, visibilityCheck, checkOptionCheck, isJoinUpdatable, partitionedBase) = AnalyzeViewUpdatability(collation, body, view.WithCheckOption);
+        // A stored UNION ALL view whose every branch reads one table plainly
+        // is a partitioned view: a write through it routes to its members.
+        if (IsPartitionedViewShape(body))
+        {
+            partitionedBase = view;
+            baseColumnOrdinals = new int[width];
+            for (var i = 0; i < width; i++)
+                baseColumnOrdinals[i] = i;
+        }
+        var (upstream, upstreamOrdinals) = baseTable is null ? (null, []) : UpstreamLinkOf(collation, body);
+        lock (view)
+        {
+            if (schemaVersion < view.SettledSchemaVersion)
+                return;
+            view.BaseTable = baseTable;
+            view.BaseColumnOrdinals = Leading(baseColumnOrdinals, width);
+            view.RejectionReason = rejection;
+            view.VisibilityCheck = visibilityCheck;
+            view.CheckOptionCheck = checkOptionCheck;
+            view.IsJoinUpdatable = isJoinUpdatable;
+            view.DerivedOutputColumns = DerivedOutputColumnsFor(body, baseTable, rejection, width) is { } derived ? Leading(derived, width) : null;
+            view.UnionOwnerName = UnionOwnerNameOf(body, rejection);
+            view.UnionLeadsWithJoin = UnionLeadsWithJoinOf(body, rejection);
+            view.IsRowLimited = IsRowLimitedBody(body);
+            view.IsWindowed = IsWindowedBody(body);
+            view.VolatileColumns = body.VolatileColumns;
+            view.UpstreamView = upstream;
+            view.UpstreamColumnOrdinals = Leading(upstreamOrdinals, width);
+            view.PartitionedBase = partitionedBase;
+            Volatile.Write(ref view.SettledSchemaVersion, schemaVersion);
+        }
+
+        static T[] Leading<T>(T[] values, int width) => values.Length > width ? values[..width] : values;
+    }
+
+    /// <summary>
+    /// Binds a stored view a statement writes through to its sources as they
+    /// stand, holding its base table's Sch-S for the statement so that they
+    /// stay so: a body that no longer binds is the read's own error (Msg 4413
+    /// after the body's, or Msg 4502), as on real (probed 2026-11-25 against
+    /// SQL Server 2019). A no-op, past the lock, while no definition has moved.
+    /// </summary>
+    private static void BindWrittenView(BatchContext batch, View view, MultiPartName writtenName)
+    {
+        var simulation = batch.Connection.Simulation;
+        HeapTable? held = null;
+        while (Volatile.Read(ref view.SettledSchemaVersion) >= 0)
+        {
+            // Waits out a transaction changing the table, whose outcome the
+            // version then shows.
+            if (view.BaseTable is { } table && !ReferenceEquals(table, held))
+            {
+                batch.AcquireStatementLock(table.SchemaLock, LockMode.SchemaStability);
+                held = table;
+            }
+            if (Volatile.Read(ref view.SettledSchemaVersion) == Volatile.Read(ref simulation.SchemaVersion))
+                return;
+            // The statement inlines the calls of what it reads through the
+            // view, which its own parse of the body records.
+            var inlinedCalls = batch.InlinedCalls;
+            batch.InlinedCalls = null;
+            Selection? body;
+            try
+            {
+                _ = simulation.BindViewColumns(batch, view, writtenName, out body);
+            }
+            finally
+            {
+                batch.InlinedCalls = inlinedCalls;
+            }
+            if (body is null || ReferenceEquals(view.BaseTable, held))
+                return;
+        }
+    }
+
+    /// <summary>
     /// The view a single-source updatable view reads, and each of its output
     /// columns' ordinal in that view's own output (<c>-1</c> for a derived
     /// column) — the per-level link the ownership chain walks, since

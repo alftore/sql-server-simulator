@@ -483,6 +483,8 @@ Procedures and triggers aren't schema bound (Msg 10796 outside native compilatio
 ## Updatable views (DML through views)
 INSERT / UPDATE / DELETE through a view route to the view's eventual base `HeapTable` with view-aware column-name translation, visibility filtering, and (optional) WITH CHECK OPTION enforcement.
 Captured at CREATE VIEW time via `AnalyzeViewUpdatability` (in `Simulation.CreateView.Updatability.cs`) onto six `View` fields: `BaseTable` / `BaseColumnOrdinals` / `RejectionReason` / `IsJoinUpdatable` / `VisibilityCheck` / `CheckOptionCheck`.
+They name base columns by position, so `SettleViewWrites` settles them again from the re-bound body the first time a statement reads or writes the view after a definition moved (`View.SettledSchemaVersion`); a write binds the body as a read does, so one naming a column that has gone is Msg 4413 and a `SELECT *` body left short Msg 4502 (probed 2026-11-25 against SQL Server 2019).
+A write holds the base table's Sch-S from before it compares versions, so it can't run on positions another session is changing.
 Probed against SQL Server 2025.
 
 **Eligible shape** (each level in a view-on-view chain must satisfy all):

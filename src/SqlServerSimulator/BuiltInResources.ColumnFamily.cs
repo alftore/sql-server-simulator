@@ -15,8 +15,7 @@ internal static partial class BuiltInResources
         // sibling for the FOR SYSTEM_TIME query machinery, but real SQL Server
         // only surfaces the base table's period). The only period_type SQL
         // Server defines is SYSTEM_TIME (1 / SYSTEM_TIME_PERIOD); the period
-        // name is always 'SYSTEM_TIME'. start_/end_column_id are the 1-based
-        // column ordinals of the ROW START / ROW END columns.
+        // name is always 'SYSTEM_TIME'.
         var systemTimeName = SqlValue.FromSystemName("SYSTEM_TIME");
         var periodTypeSystemTime = SqlValue.FromByte(1);
         var periodTypeDescSystemTime = SqlValue.FromString(nvarchar60Catalog, "SYSTEM_TIME_PERIOD");
@@ -39,8 +38,8 @@ internal static partial class BuiltInResources
                     periodTypeSystemTime,
                     periodTypeDescSystemTime,
                     SqlValue.FromInt32(t.ObjectId),
-                    SqlValue.FromInt32(t.PeriodColumns!.Value.StartOrdinal + 1),
-                    SqlValue.FromInt32(t.PeriodColumns.Value.EndOrdinal + 1),
+                    SqlValue.FromInt32(t.Columns[t.PeriodColumns!.Value.StartOrdinal].ColumnId),
+                    SqlValue.FromInt32(t.Columns[t.PeriodColumns.Value.EndOrdinal].ColumnId),
                 }));
 
         // sys.change_tracking_tables: one row per tracked table of the

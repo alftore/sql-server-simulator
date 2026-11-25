@@ -67,7 +67,10 @@ internal sealed class ColumnReadTarget(Schemas.SchemaObject securable, Storage.H
     /// <summary>The securable's columns in ordinal order — a table's columns or a view's projection columns.</summary>
     public readonly Storage.HeapColumn[] Columns = columns;
 
-    /// <summary>The 1-based ordinals touched so far (<c>sys.columns.column_id</c>).</summary>
+    /// <summary>
+    /// The 1-based positions in <see cref="Columns"/> touched so far, which are
+    /// the columns' ids only until one is dropped (<see cref="Storage.HeapColumn.IdAt"/>).
+    /// </summary>
     public readonly HashSet<int> Ordinals = [];
 
     public ColumnReadTarget(Storage.HeapTable table)
@@ -100,7 +103,7 @@ internal sealed class ColumnReadTarget(Schemas.SchemaObject securable, Storage.H
     }
 
     /// <summary>
-    /// The ordinals a check must visit, ascending — the recorded set, or every
+    /// The positions a check must visit, ascending — the recorded set, or every
     /// column when nothing was named (the <c>COUNT(*)</c> shape).
     /// </summary>
     public int[] OrdinalsToCheck()
@@ -1004,7 +1007,7 @@ internal static class PermissionEnforcement
         List<SimulatedSqlException>? denied = null;
         foreach (var ordinal in target.OrdinalsToCheck())
         {
-            if (!PermissionChecker.IsColumnGranted(database, closure, permission, securable.ObjectId, securable.SchemaId, ordinal, server, securable))
+            if (!PermissionChecker.IsColumnGranted(database, closure, permission, securable.ObjectId, securable.SchemaId, Storage.HeapColumn.IdAt(target.Columns, ordinal - 1), server, securable))
                 (denied ??= []).Add(SimulatedSqlException.ColumnPermissionDenied(permission.CanonicalName, target.Columns[ordinal - 1].Name, securable.Name, database.Name, SchemaNameFor(database, securable.SchemaId)));
         }
         return denied is null ? null : ReadFirstInCatch(SimulatedSqlException.Aggregate(denied));
@@ -1471,7 +1474,7 @@ internal static class PermissionChecker
     internal static bool CanReadCatalogView(Database database, int principalId, int viewId, int schemaId)
     {
         var closure = BuildClosure(database, principalId);
-        var satisfiers = BuildSatisfiers(database, Permission.Select, ClassObject, viewId, schemaId, columnOrdinal: 0);
+        var satisfiers = BuildSatisfiers(database, Permission.Select, ClassObject, viewId, schemaId, columnId: 0);
         // A database-scope DENY SELECT doesn't reach the INFORMATION_SCHEMA
         // views (probed 2026-10-04 against SQL Server 2025).
         if (schemaId == Database.InformationSchemaId)
@@ -1518,7 +1521,7 @@ internal static class PermissionChecker
     {
         if (OwnsSecurable(database, closure, securableClass, majorId, schemaId, securable))
             return true;
-        var satisfiers = BuildSatisfiers(database, permissionName, securableClass, majorId, schemaId, columnOrdinal: 0);
+        var satisfiers = BuildSatisfiers(database, permissionName, securableClass, majorId, schemaId, columnId: 0);
 
         // DENY binds first — explicit D rows, then the deny roles.
         if (HasMatchingRow(database, closure, satisfiers, deny: true) || FixedRolesMatch(closure, satisfiers, deny: true))
@@ -1658,7 +1661,7 @@ internal static class PermissionChecker
 
     /// <summary>
     /// Whether the effective principal may read / write column
-    /// <paramref name="columnOrdinal"/> (1-based, matching
+    /// <paramref name="columnId"/> (1-based, matching
     /// <c>sys.columns.column_id</c>) of the object. A column-level row decides
     /// for its own grantee ahead of that grantee's object-level row — a column
     /// <c>GRANT</c> admits the column under the same principal's table
@@ -1668,18 +1671,18 @@ internal static class PermissionChecker
     /// database <c>DENY</c>, another principal's <c>DENY</c> and the deny roles
     /// still bind (probed 2026-10-04 against SQL Server 2025).
     /// </summary>
-    internal static bool IsColumnGranted(Database database, int principalId, Permission permission, int objectId, int schemaId, int columnOrdinal, ServerLoginRights server = default, Schemas.SchemaObject? securable = null) =>
-        IsColumnGranted(database, BuildClosure(database, principalId), permission, objectId, schemaId, columnOrdinal, server, securable);
+    internal static bool IsColumnGranted(Database database, int principalId, Permission permission, int objectId, int schemaId, int columnId, ServerLoginRights server = default, Schemas.SchemaObject? securable = null) =>
+        IsColumnGranted(database, BuildClosure(database, principalId), permission, objectId, schemaId, columnId, server, securable);
 
     /// <summary><see cref="IsColumnGranted(Database, int, Permission, int, int, int, ServerLoginRights, Schemas.SchemaObject)"/> over a closure the caller built once for several columns.</summary>
-    internal static bool IsColumnGranted(Database database, HashSet<int> closure, Permission permission, int objectId, int schemaId, int columnOrdinal, ServerLoginRights server = default, Schemas.SchemaObject? securable = null)
+    internal static bool IsColumnGranted(Database database, HashSet<int> closure, Permission permission, int objectId, int schemaId, int columnId, ServerLoginRights server = default, Schemas.SchemaObject? securable = null)
     {
         if (permission == Permission.Other)
             return false;
 
         if (OwnsSecurable(database, closure, ClassObject, objectId, schemaId, securable))
             return true;
-        var satisfiers = BuildSatisfiers(database, permission.CanonicalName, ClassObject, objectId, schemaId, columnOrdinal);
+        var satisfiers = BuildSatisfiers(database, permission.CanonicalName, ClassObject, objectId, schemaId, columnId);
 
         foreach (var s in satisfiers)
         {
@@ -1688,7 +1691,7 @@ internal static class PermissionChecker
                 if (row.State != PermissionState.Deny || !Matches(row, s) || !closure.Contains(row.GranteePrincipalId))
                     continue;
                 if (row.Class == ClassObject && row.MinorId == 0
-                    && HasColumnRow(database, row.GranteePrincipalId, objectId, columnOrdinal, satisfiers, grant: true))
+                    && HasColumnRow(database, row.GranteePrincipalId, objectId, columnId, satisfiers, grant: true))
                 {
                     continue;
                 }
@@ -1707,7 +1710,7 @@ internal static class PermissionChecker
                 {
                     continue;
                 }
-                if (row.MinorId == 0 && HasColumnRow(database, row.GranteePrincipalId, objectId, columnOrdinal, satisfiers, grant: false))
+                if (row.MinorId == 0 && HasColumnRow(database, row.GranteePrincipalId, objectId, columnId, satisfiers, grant: false))
                     continue;
                 return true;
             }
@@ -1718,15 +1721,15 @@ internal static class PermissionChecker
 
     /// <summary>
     /// Whether <paramref name="granteeId"/> holds a column-level row on
-    /// <paramref name="columnOrdinal"/> of the object for one of the request's
+    /// <paramref name="columnId"/> of the object for one of the request's
     /// object-class permissions — a <c>G</c> / <c>W</c> row when
     /// <paramref name="grant"/>, else an <c>R</c> row.
     /// </summary>
-    private static bool HasColumnRow(Database database, int granteeId, int objectId, int columnOrdinal, Satisfiers satisfiers, bool grant)
+    private static bool HasColumnRow(Database database, int granteeId, int objectId, int columnId, Satisfiers satisfiers, bool grant)
     {
         foreach (var row in database.Permissions.On(ClassObject, objectId))
         {
-            if (row.GranteePrincipalId != granteeId || row.MinorId != columnOrdinal)
+            if (row.GranteePrincipalId != granteeId || row.MinorId != columnId)
                 continue;
             var stateMatches = grant ? row.State is PermissionState.Grant or PermissionState.GrantWithGrantOption : row.State == PermissionState.Revoke;
             if (stateMatches && Matches(row, satisfiers))
@@ -2139,11 +2142,11 @@ internal static class PermissionChecker
     /// <summary>
     /// Whether the closure holds <paramref name="permissionName"/> on the
     /// securable <c>WITH GRANT OPTION</c> — a <c>W</c> row on it or on a scope
-    /// covering it, for column <paramref name="columnOrdinal"/> when non-zero.
+    /// covering it, for column <paramref name="columnId"/> when non-zero.
     /// </summary>
-    internal static bool IsGrantable(Database database, HashSet<int> closure, string permissionName, byte securableClass, int majorId, int schemaId, int columnOrdinal = 0)
+    internal static bool IsGrantable(Database database, HashSet<int> closure, string permissionName, byte securableClass, int majorId, int schemaId, int columnId = 0)
     {
-        var satisfiers = BuildSatisfiers(database, permissionName, securableClass, majorId, schemaId, columnOrdinal);
+        var satisfiers = BuildSatisfiers(database, permissionName, securableClass, majorId, schemaId, columnId);
         foreach (var s in satisfiers)
         {
             foreach (var row in database.Permissions.On(s.Class, s.MajorId))
@@ -2162,7 +2165,7 @@ internal static class PermissionChecker
     /// <summary>Whether a <c>DENY</c> reaches <paramref name="permissionName"/> on the securable — an explicit row or a deny role.</summary>
     private static bool IsDenied(Database database, HashSet<int> closure, string permissionName, byte securableClass, int majorId, int schemaId)
     {
-        var satisfiers = BuildSatisfiers(database, permissionName, securableClass, majorId, schemaId, columnOrdinal: 0);
+        var satisfiers = BuildSatisfiers(database, permissionName, securableClass, majorId, schemaId, columnId: 0);
         return HasMatchingRow(database, closure, satisfiers, deny: true) || FixedRolesMatch(closure, satisfiers, deny: true);
     }
 
@@ -2315,36 +2318,36 @@ internal static class PermissionChecker
         return false;
     }
 
-    private static Satisfiers BuildSatisfiers(Database database, Permission permission, byte securableClass, int majorId, int schemaId, int columnOrdinal) =>
-        BuildSatisfiers(database, permission.CanonicalName, securableClass, majorId, schemaId, columnOrdinal);
+    private static Satisfiers BuildSatisfiers(Database database, Permission permission, byte securableClass, int majorId, int schemaId, int columnId) =>
+        BuildSatisfiers(database, permission.CanonicalName, securableClass, majorId, schemaId, columnId);
 
     /// <summary>
     /// The (class, major_id, minor_id, permission) tuples a row could carry that
     /// would satisfy (or deny) the request — every pair
     /// <see cref="PermissionGraph"/> says implies it, placed on the securable
     /// itself, its schema or the database. An object-scope link carries
-    /// <c>minor_id 0</c>, and when <paramref name="columnOrdinal"/> is non-zero
+    /// <c>minor_id 0</c>, and when <paramref name="columnId"/> is non-zero
     /// also that column's <c>minor_id</c>, so an object-grain request is never
     /// satisfied by a column-scoped row.
     /// </summary>
-    private static Satisfiers BuildSatisfiers(Database database, string permissionName, byte securableClass, int majorId, int schemaId, int columnOrdinal) =>
-        new(PermissionGraph.Implying(ClassDescription(database, securableClass, majorId), permissionName), securableClass, majorId, schemaId, columnOrdinal, withDatabase: true);
+    private static Satisfiers BuildSatisfiers(Database database, string permissionName, byte securableClass, int majorId, int schemaId, int columnId) =>
+        new(PermissionGraph.Implying(ClassDescription(database, securableClass, majorId), permissionName), securableClass, majorId, schemaId, columnId, withDatabase: true);
 
     /// <summary>
     /// The satisfiers of one request, produced from its graph links as they're
     /// enumerated — every check builds them, so they're never materialized.
     /// </summary>
-    private readonly struct Satisfiers(PermissionGraph.Link[] links, byte securableClass, int majorId, int schemaId, int columnOrdinal, bool withDatabase)
+    private readonly struct Satisfiers(PermissionGraph.Link[] links, byte securableClass, int majorId, int schemaId, int columnId, bool withDatabase)
     {
         private readonly PermissionGraph.Link[] links = links;
         private readonly byte securableClass = securableClass;
         private readonly int majorId = majorId;
         private readonly int schemaId = schemaId;
-        private readonly int columnOrdinal = columnOrdinal;
+        private readonly int columnId = columnId;
         private readonly bool withDatabase = withDatabase;
 
         /// <summary>These satisfiers less the database-scope ones.</summary>
-        public Satisfiers WithoutDatabase() => new(this.links, this.securableClass, this.majorId, this.schemaId, this.columnOrdinal, withDatabase: false);
+        public Satisfiers WithoutDatabase() => new(this.links, this.securableClass, this.majorId, this.schemaId, this.columnId, withDatabase: false);
 
         public Enumerator GetEnumerator() => new(this);
 
@@ -2365,7 +2368,7 @@ internal static class PermissionChecker
                 {
                     // An object-scope link's column-scoped twin follows it.
                     this.columnPending = false;
-                    this.Current = new(this.Current.Class, this.Current.MajorId, s.columnOrdinal, this.Current.Name);
+                    this.Current = new(this.Current.Class, this.Current.MajorId, s.columnId, this.Current.Name);
                     return true;
                 }
                 while (this.next < s.links.Length)
@@ -2378,7 +2381,7 @@ internal static class PermissionChecker
                         : link.Class == ClassDatabase ? 0
                         : s.majorId;
                     this.Current = new(link.Class, linkMajor, 0, link.Name);
-                    this.columnPending = s.columnOrdinal != 0 && link.Class == ClassObject;
+                    this.columnPending = s.columnId != 0 && link.Class == ClassObject;
                     return true;
                 }
                 return false;
