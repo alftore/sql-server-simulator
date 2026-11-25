@@ -100,6 +100,10 @@ partial class Simulation
     /// statement compiles; any other failure returns the recorded columns
     /// unchanged, so the body's own error surfaces at execution.
     /// <para>
+    /// What a write through the view reaches is settled with it, when a
+    /// definition has moved since it last was (<see cref="SettleViewWrites"/>).
+    /// </para>
+    /// <para>
     /// When a browse statement flattens the body (<c>browseFlatten</c>), the
     /// body comes back carrying its base tables' hidden browse columns, which
     /// the returned columns don't include — and so does a body asked to carry
@@ -112,6 +116,11 @@ partial class Simulation
     {
         body = null;
         Selection plan;
+        // Read ahead of the parse, so a definition moving during it has the
+        // next bind settle the view again.
+        var schemaVersion = Volatile.Read(ref this.SchemaVersion);
+        var resettles = Volatile.Read(ref view.SettledSchemaVersion) is >= 0 and var settled && settled != schemaVersion;
+        Selection? plain = null;
         // A FOR SYSTEM_TIME on the reference binds with the body, so a table
         // of it carrying its own is refused here (Msg 13590), and a body that
         // reads no system-versioned table at all is Msg 13544 naming the view
@@ -127,6 +136,8 @@ partial class Simulation
             using var principalIndependent = PlanCacheCaptureAudit.SuspendPrincipalWatch();
 #endif
             plan = ParseViewBodyPlan(outerBatch, view, releaseStatementSchemaLocks: true, inherited, browseFlatten, graphIdentity, carriesDeferredReads);
+            if (resettles)
+                plain = inherited is null && !browseFlatten && !graphIdentity && !carriesDeferredReads ? plan : ParseViewBodyPlan(outerBatch, view, releaseStatementSchemaLocks: true, recordsInlinedCalls: false);
         }
         catch (SimulatedSqlException error) when (error.Number is 207 or 208 or 4104 or 15281 or 13590)
         {
@@ -144,6 +155,8 @@ partial class Simulation
         var bound = plan.Schema;
         if (bound.Length < recorded.Length)
             throw SimulatedSqlException.ViewHasMoreColumnNamesThanColumns($"{view.Schema.Name}.{view.Name}");
+        if (plain is not null)
+            SettleViewWrites(view, plain, schemaVersion);
 
         var nullability = plan.ColumnNullability;
         // A column over a masked one masks as the body projects it, which
@@ -209,7 +222,7 @@ partial class Simulation
     internal Selection ParseViewBodyPlan(BatchContext outerBatch, View view) =>
         view.UnstoredBody ?? ParseViewBodyPlan(outerBatch, view, releaseStatementSchemaLocks: false);
 
-    private Selection ParseViewBodyPlan(BatchContext outerBatch, View view, bool releaseStatementSchemaLocks, InheritedSystemTime? systemTime = null, bool browseFlatten = false, bool graphIdentity = false, bool carriesDeferredReads = false)
+    private Selection ParseViewBodyPlan(BatchContext outerBatch, View view, bool releaseStatementSchemaLocks, InheritedSystemTime? systemTime = null, bool browseFlatten = false, bool graphIdentity = false, bool carriesDeferredReads = false, bool recordsInlinedCalls = true)
     {
         var connection = outerBatch.Connection;
         if (connection.NestingLevel >= SimulatedDbConnection.MaxNestingLevel)
@@ -228,7 +241,7 @@ partial class Simulation
         connection.QuotedIdentifiers = view.UsesQuotedIdentifier;
         var savedAnsiNulls = connection.AnsiNulls;
         connection.AnsiNulls = view.UsesAnsiNulls;
-        var innerBatch = new BatchContext(bodyCommand, variables, new UdfFrame(SqlType.Int32)) { SuppressDiagnosticsResolution = true, BindsModuleDefinition = true, InlinedCalls = outerBatch.InlinedCalls, InheritedSystemTime = systemTime, ModuleSchema = view.Schema, LineOffset = view.BodyLineOffset };
+        var innerBatch = new BatchContext(bodyCommand, variables, new UdfFrame(SqlType.Int32)) { SuppressDiagnosticsResolution = true, BindsModuleDefinition = true, InlinedCalls = recordsInlinedCalls ? outerBatch.InlinedCalls : null, InheritedSystemTime = systemTime, ModuleSchema = view.Schema, LineOffset = view.BodyLineOffset };
         innerBatch.AdoptStatementFreezeFrom(outerBatch);
         innerBatch.InheritCallerTriggerFrame(outerBatch);
         connection.NestingLevel++;

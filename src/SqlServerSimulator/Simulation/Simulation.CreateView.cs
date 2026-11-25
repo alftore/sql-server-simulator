@@ -228,19 +228,6 @@ partial class Simulation
 
         var outputColumns = ComputeViewOutputColumns(context.CurrentDatabase.Collation, bodySelection, renameList, viewName.Leaf);
 
-        var (baseTable, baseColumnOrdinals, rejectionReason, visibilityCheck, checkOptionCheck, isJoinUpdatable, partitionedBase) =
-            AnalyzeViewUpdatability(context.CurrentDatabase.Collation, bodySelection, withCheckOption);
-        // A stored UNION ALL view whose every branch reads one table plainly
-        // is a partitioned view: a write through it routes to its members.
-        var isPartitioned = IsPartitionedViewShape(bodySelection);
-        if (isPartitioned)
-        {
-            baseColumnOrdinals = new int[outputColumns.Length];
-            for (var i = 0; i < baseColumnOrdinals.Length; i++)
-                baseColumnOrdinals[i] = i;
-        }
-
-        var (upstreamView, upstreamOrdinals) = baseTable is null ? (null, []) : UpstreamLinkOf(context.CurrentDatabase.Collation, bodySelection);
         var view = new View(
             schema,
             viewName.Leaf,
@@ -250,31 +237,21 @@ partial class Simulation
             withCheckOption,
             isSchemaBound,
             createDate: replaced?.CreateDate ?? context.Batch.CurrentStatement.UtcNow,
-            baseTable: baseTable,
-            baseColumnOrdinals: baseColumnOrdinals,
-            rejectionReason: rejectionReason,
-            visibilityCheck: visibilityCheck,
-            checkOptionCheck: checkOptionCheck,
-            isJoinUpdatable: isJoinUpdatable)
+            baseTable: null,
+            baseColumnOrdinals: [],
+            rejectionReason: ViewUpdatabilityRejection.None,
+            visibilityCheck: null,
+            checkOptionCheck: null,
+            isJoinUpdatable: false)
         {
             DefinitionText = options.Encryption ? null : BuildModuleDefinition(commandText, context.Batch.CurrentStatement.StartIndex, isAlter, createOrAlter),
             HasViewMetadata = options.ViewMetadata,
             BodyLineOffset = CountNewlines(commandText, 0, bodyStart),
             UsesQuotedIdentifier = context.QuotedIdentifiers,
             UsesAnsiNulls = context.Batch.Connection.AnsiNulls,
-            DerivedOutputColumns = DerivedOutputColumnsFor(bodySelection, baseTable, rejectionReason, outputColumns.Length),
-            UnionOwnerName = UnionOwnerNameOf(bodySelection, rejectionReason),
-            UnionLeadsWithJoin = UnionLeadsWithJoinOf(bodySelection, rejectionReason),
-            IsRowLimited = IsRowLimitedBody(bodySelection),
             HiddenGraphColumns = ViewGraphColumns(bodySelection, viewName.Leaf),
-            IsWindowed = IsWindowedBody(bodySelection),
-            VolatileColumns = bodySelection.VolatileColumns,
-            UpstreamView = upstreamView,
-            UpstreamColumnOrdinals = upstreamOrdinals,
-            PartitionedBase = partitionedBase,
         };
-        if (isPartitioned)
-            view.PartitionedBase = view;
+        SettleViewWrites(view, bodySelection, Volatile.Read(ref context.Simulation.SchemaVersion));
         var replacedBases = replaced?.ReferencedBaseTables;
         if (replaced is not null)
         {

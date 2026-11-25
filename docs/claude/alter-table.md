@@ -429,6 +429,9 @@ Two kinds of structure do:
   A key column without a storage slot (a non-persisted computed one) keeps its `-1`.
 - **Some name the column by `HeapColumn.ColumnId`**, which a drop leaves alone: the full-text, XML and spatial indexes.
   `ColumnId` is not `position + 1` once a column has been dropped, so convert with `HeapTable.OrdinalOfColumnId`.
+  So do column-level permissions and data masks (`HeapColumn.IdAt`), and a drop removes the column's permissions.
+
+A view holds positions into its base table but isn't remapped: it is analyzed again when a definition has moved (see [`programmable.md`](programmable.md#updatable-views-dml-through-views)).
 
 What is cached over positions goes with the layout: `RecomputeStorageProjections` drops the key-lock groups when the stored layout changes (and only then: `CREATE INDEX` can run beside another session's key locks), and the seek cache goes with the heap, which a drop replaces even when it holds no rows.
 

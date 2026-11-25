@@ -124,9 +124,9 @@ DENY <perm_list> [ON <securable>] TO <principal_list> [AS <grantor>]
 - `GRANT ALL` expands to the permissions real's deprecated `ALL` names for the securable's class and sends the Msg 4628 class-0 deprecation notice; `DENY … CASCADE` denies and removes the grantee's delegations, and a `DENY` over a grantable row without it is Msg 4611.
 - A permission name no class carries is Msg 102 near the first word no permission name continues with, as written and at its own line, or near the name's first word when it stops short of a whole name (`alter any database scoped`), and `ALTER ANY DATABASE SCOPED CREDENTIAL`, which real's grammar reads through, reports that way too (probed 2026-10-21 against SQL Server 2025).
 - A permission name the class doesn't take (checked against `sys.fn_builtin_permissions` through `PermissionGraph.IsPermissionOf`) is Msg 102 near the name at line 0, and server and database permissions in one statement without an `ON` are Msg 4620; these and the unknown name are refused while the batch compiles, so none of the batch runs; `RECEIVE` on a non-queue object Msg 4606; an `INFORMATION_SCHEMA` view or a `sys.sp_*` procedure outside `master` Msg 4629; a three-part object in another database Msg 4610.
-- A **column list** after a permission name — `GRANT SELECT (a, b) ON t TO u`, `DENY SELECT (c) ON t TO u`, `GRANT UPDATE (b) ON t TO u`, `REFERENCES (col)` — stores **one row per column** at `minor_id` = the column's 1-based ordinal (`sys.columns.column_id`); an unknown column raises **Msg 4615** (`Invalid column name '<col>'.`).
+- A **column list** after a permission name — `GRANT SELECT (a, b) ON t TO u`, `DENY SELECT (c) ON t TO u`, `GRANT UPDATE (b) ON t TO u`, `REFERENCES (col)` — stores **one row per column** at `minor_id` = the column's `sys.columns.column_id`; an unknown column raises **Msg 4615** (`Invalid column name '<col>'.`).
   The list may sit after the permission (`SELECT (a, b) ON t`) or after the object name (`SELECT ON t (a, b)`); the two placements can't combine (**Msg 1019**), and a list on a non-object scope — or on a **synonym**, which is entity-level — raises **Msg 1020** — see [Column-level grants](#column-level-grants).
-  Tables and views both carry column ordinals (a view's are its projection's).
+  Tables and views both take a column list (a view's column ids are its projection's positions).
   A table-level (`minor_id 0`) GRANT / REVOKE of the same permission subsumes the grantee's column rows for it (probe-confirmed: a later `GRANT SELECT ON t` collapses the prior `GRANT SELECT (col)` rows); a column-level apply keys on its own `minor_id`.
   See [Column-level grants](#column-level-grants).
 - `WITH GRANT OPTION` stores a **single `W` row** (not `G`+`W`).
@@ -252,9 +252,10 @@ The gates route through the same `PermissionEnforcement` seam as the DML checks,
 
 ### Column-level grants
 
-`GRANT` / `DENY SELECT | UPDATE | REFERENCES | UNMASK (col, …)` store one `DatabasePermission` row per column at `minor_id` = the column's 1-based ordinal (`sys.columns.column_id`); `sys.database_permissions` surfaces the `minor_id`, and `COL_NAME(major_id, minor_id)` resolves it.
+`GRANT` / `DENY SELECT | UPDATE | REFERENCES | UNMASK (col, …)` store one `DatabasePermission` row per column at `minor_id` = the column's `sys.columns.column_id`; `sys.database_permissions` surfaces the `minor_id`, and `COL_NAME(major_id, minor_id)` resolves it.
 Enforcement is probe-confirmed against SQL Server 2025.
 
+An id is not a position once a column has been dropped, so a check that walks columns by position converts each with `HeapColumn.IdAt`; `DROP COLUMN` takes the column's rows with it, and rolling it back restores them (probed 2026-11-25 against SQL Server 2019).
 The column list has two accepted placements (both probe-confirmed): after the permission (`GRANT SELECT (a, b) ON t TO u`) or after the object name (`GRANT SELECT ON t (a, b) TO u`), the latter applying its columns to every permission in the statement.
 The two can't combine — `GRANT SELECT (a) ON t (b)` raises **Msg 1019** (`Invalid column list after object name in GRANT/REVOKE statement.`) — and a column list on a non-object scope (`GRANT SELECT ON SCHEMA::s (c)`) raises **Msg 1020** (`Sub-entity lists (such as column or security expressions) cannot be specified for entity-level permissions.`).
 

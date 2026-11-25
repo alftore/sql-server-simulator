@@ -41,6 +41,25 @@ internal sealed class HeapColumn(string name, SqlType type, int? maxLength, bool
     /// </summary>
     public int ColumnId;
 
+    /// <summary>
+    /// The <c>column_id</c> of the column at <paramref name="ordinal"/> of an
+    /// object's columns: its own where it joined a table, and otherwise — a
+    /// view's or function's — its 1-based position.
+    /// </summary>
+    public static int IdAt(HeapColumn[] columns, int ordinal) =>
+        columns[ordinal].ColumnId is var id and not 0 ? id : ordinal + 1;
+
+    /// <summary>The position in <paramref name="columns"/> of the column <paramref name="columnId"/> names as <see cref="IdAt"/> answers it, or <c>-1</c> when there is none.</summary>
+    public static int OrdinalOfId(HeapColumn[] columns, int columnId)
+    {
+        for (var i = 0; i < columns.Length; i++)
+        {
+            if (IdAt(columns, i) == columnId)
+                return i;
+        }
+        return -1;
+    }
+
     public readonly SqlType Type = type;
 
     public readonly int? MaxLength = maxLength;

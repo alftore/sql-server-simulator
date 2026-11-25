@@ -1230,9 +1230,10 @@ internal static partial class BuiltInResources
             string? columnName = null;
             if (columnLevel)
             {
-                columnName = Array.Find(target.Columns, column => column.ColumnId == permission.MinorId)?.Name;
-                if (columnName is null)
+                var ordinal = HeapColumn.OrdinalOfId(target.Columns, permission.MinorId);
+                if (ordinal < 0)
                     continue;
+                columnName = target.Columns[ordinal].Name;
             }
             SqlValue Name(int principalId) =>
                 names.TryGetValue(principalId, out var name) ? SqlValue.FromSystemName(name) : SqlValue.Null(SqlType.SystemName);

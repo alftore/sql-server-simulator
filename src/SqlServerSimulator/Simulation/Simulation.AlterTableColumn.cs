@@ -777,10 +777,12 @@ partial class Simulation
                 throw SimulatedSqlException.DropColumnLeavesNoDataColumn(table.Columns[ordinal].Name, table.Name);
         }
 
+        DropColumnPermissions(context, table, toDropOrdinals);
         DropColumnsAt(table, toDropOrdinals);
         if (history is not null)
         {
             RecordTableDdlUndo(context, history);
+            DropColumnPermissions(context, history, historyOrdinals!);
             DropColumnsAt(history, historyOrdinals!);
         }
         return true;
@@ -819,6 +821,23 @@ partial class Simulation
         }
         foreach (var ordinal in toDropOrdinals)
             DropAutoStatisticsOn(table, ordinal);
+    }
+
+    /// <summary>
+    /// Drops the column-level permissions on the columns at
+    /// <paramref name="ordinals"/>, which go with them (probed 2026-11-25
+    /// against SQL Server 2019).
+    /// </summary>
+    private static void DropColumnPermissions(ParserContext context, HeapTable table, List<int> ordinals)
+    {
+        var database = context.Batch.DatabaseFor(table);
+        bool IsDropped(DatabasePermission row) =>
+            row.Class == PermissionChecker.ClassObject && row.MajorId == table.ObjectId && row.MinorId != 0
+            && ordinals.Exists(ordinal => table.Columns[ordinal].ColumnId == row.MinorId);
+        if (!database.Permissions.Exists(IsDropped))
+            return;
+        RecordSecurityUndo(context, database);
+        _ = database.Permissions.RemoveAll(IsDropped);
     }
 
     /// <summary>

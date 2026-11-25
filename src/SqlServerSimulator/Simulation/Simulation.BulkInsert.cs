@@ -102,6 +102,7 @@ partial class Simulation
         View? insteadOfView = null;
         if (batch.TryResolveView(name, out var view))
         {
+            BindWrittenView(batch, view, name);
             // A partitioned view, or a view over one, takes no bulk load once
             // its members qualify (Msg 4437), which real settles as it compiles
             // the statement, a file it can't read deferring that (probed

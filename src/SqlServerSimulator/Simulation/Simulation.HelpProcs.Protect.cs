@@ -297,10 +297,11 @@ partial class Simulation
             var columns = target.Columns;
             if (columns is null || !HelpProtectHasColumnPeer(database, permission, columnId: null))
                 continue;
-            for (var columnId = 1; columnId <= columns.Length; columnId++)
+            for (var i = 0; i < columns.Length; i++)
             {
+                var columnId = HeapColumn.IdAt(columns, i);
                 if (!HelpProtectHasColumnPeer(database, permission, columnId))
-                    expanded.Add(new HelpProtectRow(database, permission, target, columnId, columns[columnId - 1].Name));
+                    expanded.Add(new HelpProtectRow(database, permission, target, columnId, columns[i].Name));
             }
         }
 
@@ -444,20 +445,16 @@ partial class Simulation
         public readonly bool IsTable = isTable;
 
         /// <summary>
-        /// The columns a column-level grant addresses, in the 1-based ordinal
-        /// order <c>minor_id</c> stores (<c>Simulation.ResolveColumnMinorId</c>'s
-        /// convention), or null for an object that carries none.
+        /// The columns a column-level grant addresses by the <c>column_id</c> its
+        /// <c>minor_id</c> stores, or null for an object that carries none.
         /// </summary>
         public readonly HeapColumn[]? Columns = columns;
 
         /// <summary>The name at a stored <c>minor_id</c>, or real's <c>.</c> placeholder when it doesn't resolve.</summary>
-        public string ColumnName(int columnId)
-        {
-            var columns = this.Columns;
-            return columns is not null && columnId >= 1 && columnId <= columns.Length
-                ? columns[columnId - 1].Name
+        public string ColumnName(int columnId) =>
+            this.Columns is { } columns && HeapColumn.OrdinalOfId(columns, columnId) is var ordinal and >= 0
+                ? columns[ordinal].Name
                 : ".";
-        }
     }
 
     /// <summary>

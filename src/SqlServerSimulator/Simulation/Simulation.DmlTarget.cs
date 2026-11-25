@@ -137,11 +137,15 @@ partial class Simulation
     /// </summary>
     private static DmlTarget ResolveDmlTarget(ParserContext context, MultiPartName name, RemoteWriteKind? remoteKind)
     {
-        if (TryResolveCteTarget(context, name, out var view) || context.Batch.TryResolveView(name, out view)
-            || TryResolveFunctionWriteTarget(context, name, out view))
+        if (TryResolveCteTarget(context, name, out var view))
+            return DmlTarget.ForView(name, view);
+        if (context.Batch.TryResolveView(name, out view))
         {
+            BindWrittenView(context.Batch, view, name);
             return DmlTarget.ForView(name, view);
         }
+        if (TryResolveFunctionWriteTarget(context, name, out view))
+            return DmlTarget.ForView(name, view);
         _ = context.Batch.TryResolveTable(name, out var table);
         if (table is null && name.Count == 1 && remoteKind is { } aliasKind and (RemoteWriteKind.Update or RemoteWriteKind.Delete))
         {
