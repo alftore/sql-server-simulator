@@ -811,7 +811,7 @@ partial class Simulation
             var col = table.Columns[ordinal];
             // A full-text-indexed column refuses the drop on its own
             // (probed 2026-10-05 against SQL Server 2025).
-            if (table.FullTextIndex?.Columns.Exists(column => column.ColumnId == ordinal + 1) == true)
+            if (table.FullTextIndex?.Columns.Exists(column => column.ColumnId == col.ColumnId) == true)
                 throw SimulatedSqlException.FullTextColumnDropped(col.Name);
             var blockers = CollectColumnBlockers(context.Batch.CurrentDatabase, table, ordinal, col, includeCheckAndDefault: true, includeIndexes: true, includeStatistics: true, includeFilterIndexes: true);
             if (blockers.Count > 0)
@@ -870,30 +870,9 @@ partial class Simulation
 
         // Remap surviving constraint/index/FK ordinals in place.
         foreach (var kc in table.KeyConstraints)
-        {
-            for (var i = 0; i < kc.StorageOrdinals.Length; i++)
-                kc.StorageOrdinals[i] = oldStorageToNew[kc.StorageOrdinals[i]];
-        }
+            kc.RemapOrdinals(oldStorageToNew, oldFullToNew);
         foreach (var ix in table.Indexes)
-        {
-            // Non-persisted computed columns carry storage ordinal -1
-            // (no row-storage slot) — pass those through unmapped.
-            for (var i = 0; i < ix.KeyColumns.Length; i++)
-            {
-                var keyCol = ix.KeyColumns[i];
-                var storageOrdinal = keyCol.StorageOrdinal < 0 ? keyCol.StorageOrdinal : oldStorageToNew[keyCol.StorageOrdinal];
-                ix.KeyColumns[i] = new IndexKeyColumn(storageOrdinal, oldFullToNew[keyCol.ColumnOrdinal], keyCol.IsDescending);
-                // The projected copy the seek path reads moves in lockstep — it
-                // is the same ordinal, materialized once at construction.
-                ix.KeyStorageOrdinals[i] = storageOrdinal;
-            }
-            for (var i = 0; i < ix.IncludedColumns.Length; i++)
-            {
-                if (ix.IncludedColumns[i] >= 0)
-                    ix.IncludedColumns[i] = oldStorageToNew[ix.IncludedColumns[i]];
-                ix.IncludedColumnOrdinals[i] = oldFullToNew[ix.IncludedColumnOrdinals[i]];
-            }
-        }
+            ix.RemapOrdinals(oldStorageToNew, oldFullToNew);
         foreach (var jsonIndex in table.JsonIndexes)
             jsonIndex.ColumnOrdinal = oldFullToNew[jsonIndex.ColumnOrdinal];
         foreach (var vectorIndex in table.VectorIndexes)
@@ -923,6 +902,7 @@ partial class Simulation
             if (keep[i])
                 newColumns[c2++] = table.Columns[i];
         }
+        table.MoveColumnCounters(table.Columns, newColumns);
         table.Columns = newColumns;
         table.RecomputeStorageProjections();
         if (table.PeriodColumns is { } period && oldFullToNew[period.StartOrdinal] >= 0 && oldFullToNew[period.EndOrdinal] >= 0)
@@ -1393,14 +1373,14 @@ partial class Simulation
         if (ReferenceEquals(table.Partitioning?.Column, col))
             blockers.Add((table.Name, objectKind, 4, int.MinValue));
         // So does a full-text index's TYPE COLUMN (probed 2026-10-05).
-        if (table.FullTextIndex?.Columns.Exists(column => column.TypeColumnId == ordinal + 1) == true)
+        if (table.FullTextIndex?.Columns.Exists(column => column.TypeColumnId == col.ColumnId) == true)
             blockers.Add((table.Name, objectKind, 4, int.MinValue));
         foreach (var kc in table.KeyConstraints)
         {
             var keyCounts = kc.Kind == KeyConstraintKind.PrimaryKey ? includePrimaryKey : includeUniqueKeys;
             // The full-text index's key is named as the index it is (probed
             // 2026-10-21 against SQL Server 2025).
-            if ((keyCounts && storageOrdinal >= 0 && Array.IndexOf(kc.StorageOrdinals, storageOrdinal) >= 0) || ReferenceEquals(kc.Partitioning?.Column, col))
+            if ((keyCounts && Array.IndexOf(kc.FullOrdinals, ordinal) >= 0) || ReferenceEquals(kc.Partitioning?.Column, col))
             {
                 var keysFullText = table.FullTextIndex is { } fullText && collation.Equals(kc.Name, fullText.KeyIndexName);
                 blockers.Add((kc.Name, keysFullText ? SimulatedSqlException.AlterColumnBlockerKind.Index : objectKind, 4, kc.ObjectId));
@@ -1410,14 +1390,21 @@ partial class Simulation
         // 2026-10-05 against SQL Server 2025).
         foreach (var spatial in table.SpatialIndexes)
         {
-            if (includeIndexes && spatial.ColumnOrdinal == ordinal + 1)
+            if (includeIndexes && spatial.ColumnId == col.ColumnId)
                 blockers.Add((spatial.Name, SimulatedSqlException.AlterColumnBlockerKind.Index, 5, spatial.ObjectId));
         }
-        if (includeIndexes && storageOrdinal >= 0)
+        // So does an XML index (probed 2026-11-25 against SQL Server 2019).
+        foreach (var xml in table.XmlIndexes)
         {
+            if (includeIndexes && xml.ColumnId == col.ColumnId)
+                blockers.Add((xml.Name, SimulatedSqlException.AlterColumnBlockerKind.Index, 5, xml.IndexId));
+        }
+        if (includeIndexes)
+        {
+            // By position, which a computed column without a storage slot has too.
             foreach (var ix in table.Indexes)
             {
-                if (ix.KeyColumns.Any(k => k.StorageOrdinal == storageOrdinal) || (includedColumnsBlock && Array.IndexOf(ix.IncludedColumns, storageOrdinal) >= 0))
+                if (Array.IndexOf(ix.KeyFullOrdinals, ordinal) >= 0 || (includedColumnsBlock && Array.IndexOf(ix.IncludedColumnOrdinals, ordinal) >= 0))
                     blockers.Add((ix.Name, SimulatedSqlException.AlterColumnBlockerKind.Index, 5, ix.ObjectId));
             }
         }
@@ -1661,11 +1648,11 @@ partial class Simulation
 
     private static void RewriteHeapForDropColumns(HeapTable table, HeapColumn[] oldStoredColumns, int[] oldStorageToNew, int newStoredCount)
     {
-        // A heap holding only deleted rows' slots is rewritten too: those
-        // slots keep the layout they were written under (RecomputeStorageProjections).
-        if (table.Heap.RowCount == 0)
-            return;
-
+        // A heap holding no rows, or only deleted rows' slots, is replaced too:
+        // the slots keep the layout they were written under
+        // (RecomputeStorageProjections), and what is cached per heap (the seek
+        // cache, its journal, the clustered order) names columns by the slots
+        // the drop renumbers.
         var newStoredColumns = new HeapColumn[newStoredCount];
         for (var i = 0; i < oldStoredColumns.Length; i++)
         {

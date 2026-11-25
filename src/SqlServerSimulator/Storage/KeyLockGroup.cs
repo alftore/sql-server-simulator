@@ -107,8 +107,13 @@ internal sealed class KeyLockGroup
     /// </summary>
     public int Holds;
 
-    private KeyLockGroup(HeapTable table, object owner, int[] ordinals, int keyLength, bool isRowGroup, bool isUnique, bool[]? carried, KeyLockUniquifier uniquifier, bool carriesRid = false)
+    // The clustered key a nonclustered index's row locator came from, null for
+    // a heap's; see IsCurrent.
+    private readonly object? clusteredOwner;
+
+    private KeyLockGroup(HeapTable table, object owner, int[] ordinals, int keyLength, bool isRowGroup, bool isUnique, bool[]? carried, KeyLockUniquifier uniquifier, bool carriesRid = false, object? clusteredOwner = null)
     {
+        this.clusteredOwner = clusteredOwner;
         this.uniquifier = uniquifier;
         this.CarriesRid = carriesRid;
         this.Table = table;
@@ -185,12 +190,28 @@ internal sealed class KeyLockGroup
     /// </summary>
     public static KeyLockGroup? For(HeapTable table, object owner)
     {
-        if (table.KeyLockGroups.TryGetValue(owner, out var existing))
-            return existing;
-        if (Create(table, owner) is not { } created)
-            return null;
-        return table.KeyLockGroups.GetOrAdd(owner, created);
+        while (true)
+        {
+            var found = table.KeyLockGroups.TryGetValue(owner, out var existing);
+            if (found && existing!.IsCurrent(table))
+                return existing;
+            if (Create(table, owner) is not { } created)
+                return null;
+            if (!found)
+                return table.KeyLockGroups.GetOrAdd(owner, created);
+            if (table.KeyLockGroups.TryUpdate(owner, created, existing!))
+                return created;
+        }
     }
+
+    // A nonclustered index's anchors end in the clustered key, so they go when
+    // the table gains, loses or exchanges one. That takes Sch-M, so a lock held
+    // in the group replaced is the changing session's own.
+    private bool IsCurrent(HeapTable table) =>
+        this.IsRowGroup || (ReferenceEquals(this.clusteredOwner, ClusteredOwner(table)) && this.CarriesRid == CarriesRidOver(table, this.IsUnique, this.clusteredOwner));
+
+    private static bool CarriesRidOver(HeapTable table, bool isUnique, object? clusteredOwner) =>
+        !isUnique && clusteredOwner is null && !table.Indexes.Exists(static index => index.IsClustered);
 
     /// <summary>The group of <paramref name="table"/>'s clustered key, or null for a heap.</summary>
     public static KeyLockGroup? RowGroupOf(HeapTable table) =>
@@ -283,6 +304,6 @@ internal sealed class KeyLockGroup
 
         return new KeyLockGroup(table, owner, [.. ordinals], keyOrdinals.Length, isRowGroup: false, isUnique, carried,
             !isUnique && clusteredOwner is Index { IsUnique: false } ? KeyLockUniquifier.Last : KeyLockUniquifier.None,
-            carriesRid: !isUnique && clusteredOwner is null && !table.Indexes.Exists(static index => index.IsClustered));
+            CarriesRidOver(table, isUnique, clusteredOwner), clusteredOwner);
     }
 }

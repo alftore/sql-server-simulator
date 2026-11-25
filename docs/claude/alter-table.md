@@ -412,7 +412,7 @@ Probe-confirmed: dropping a column referenced by ANY of the following raises one
 - `CHECK` constraint (inline `InlineColumn` match OR table-level predicate walked structurally for column refs by name)
 - `DEFAULT` constraint attached to the column
 - A `WITH SCHEMABINDING` view or function whose body names the column (see [`programmable.md`](programmable.md#schema-binding-with-schemabinding))
-- `INDEX` (`CREATE INDEX`-declared — either KEY column or INCLUDE column)
+- `INDEX` (`CREATE INDEX`-declared — either KEY column or INCLUDE column, a non-persisted computed column included), and an XML index on the column (probed 2026-11-25 against SQL Server 2019)
 - A computed column whose expression names it (`The column 'X' …`)
 
 Each blocker emits its line with the appropriate prefix: `The object 'X' is dependent on column 'col'.` for constraints and schema-bound modules, `The index 'X' is dependent on column 'col'.` for indexes.
@@ -422,17 +422,18 @@ Real orders them by kind — the DEFAULT, computed columns, CHECKs, schema-bound
 
 ### Storage rewrite
 
-DROP COLUMN walks every surviving `KeyConstraint` / `Index` / `ForeignKey` (outgoing + incoming) and in-place remaps their storage / full ordinals through an `oldStorageToNew[]` / `oldFullToNew[]` map.
-The mutation patterns:
+A drop renumbers the later columns, so whatever names a column by position has to follow it, and back again on a rollback.
+Two kinds of structure do:
 
-- `KeyConstraint.StorageOrdinals[i]` — array element reassignment
-- `Index.KeyColumns[i]` — slot replacement with new `IndexKeyColumn(newOrdinal, oldDescending)`
-- `Index.IncludedColumns[i]` — array element reassignment
-- `ForeignKey.ChildColumnOrdinals[i]` — array element reassignment (outgoing)
-- `ForeignKey.ReferencedColumnOrdinals[i]` — array element reassignment (incoming, since this table is the referenced side)
+- **Some hold positions**, and have a place in both `DropColumnsAt` (the remap) and `HeapTableSnapshot` (the rollback): `KeyConstraint.RemapOrdinals`, `Index.RemapOrdinals`, both ends of a `ForeignKey`, `UserStatistic`, the JSON and vector indexes, the period pair and the per-column modification counters.
+  A key column without a storage slot (a non-persisted computed one) keeps its `-1`.
+- **Some name the column by `HeapColumn.ColumnId`**, which a drop leaves alone: the full-text, XML and spatial indexes.
+  `ColumnId` is not `position + 1` once a column has been dropped, so convert with `HeapTable.OrdinalOfColumnId`.
+
+What is cached over positions goes with the layout: `RecomputeStorageProjections` drops the key-lock groups when the stored layout changes (and only then: `CREATE INDEX` can run beside another session's key locks), and the seek cache goes with the heap, which a drop replaces even when it holds no rows.
 
 The heap is re-encoded: each row is decoded under the old `StoredColumns` layout, projected through the surviving ordinals, and re-encoded against the new `StoredColumns`.
-The old `Heap` is replaced wholesale (via the mutable `HeapTable.Heap` field).
+The old `Heap` is replaced wholesale (via the mutable `HeapTable.Heap` field), its modification counters carried on by `Heap.ContinueCounters`.
 
 ### Fidelity gaps — Column ops
 

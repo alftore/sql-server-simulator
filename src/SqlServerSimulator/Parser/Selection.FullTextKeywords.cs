@@ -190,12 +190,12 @@ partial class Selection
             var endedAny = false;
             foreach (var column in columns)
             {
-                var ordinal = column.ColumnId - 1;
-                if (ordinal < 0 || ordinal >= table.Columns.Length || !table.Columns[ordinal].IsStored)
+                var ordinal = table.OrdinalOfColumnId(column.ColumnId);
+                if (ordinal < 0 || !table.Columns[ordinal].IsStored)
                     continue;
                 var value = RowDecoder.DecodeColumn(table.StoredColumns, bytes, table.StorageOrdinals[ordinal], table.Heap);
-                var extension = column.TypeColumnId is int typeColumnId && typeColumnId - 1 < table.Columns.Length && table.Columns[typeColumnId - 1].IsStored
-                    ? RowDecoder.DecodeColumn(table.StoredColumns, bytes, table.StorageOrdinals[typeColumnId - 1], table.Heap)
+                var extension = column.TypeColumnId is int typeColumnId && table.OrdinalOfColumnId(typeColumnId) is >= 0 and var typeOrdinal && table.Columns[typeOrdinal].IsStored
+                    ? RowDecoder.DecodeColumn(table.StoredColumns, bytes, table.StorageOrdinals[typeOrdinal], table.Heap)
                     : (SqlValue?)null;
                 if (FullTextBinding.TextOf(value, extension) is not { Length: > 0 } text)
                     continue;

@@ -130,8 +130,9 @@ internal enum FullTextChangeTracking
 }
 
 /// <summary>
-/// One column entry inside a <see cref="FullTextIndex"/>. Carries the column
-/// ordinal (1-based, matching real SQL Server's <c>column_id</c>), the
+/// One column entry inside a <see cref="FullTextIndex"/>. Carries the column's
+/// <c>column_id</c> (<see cref="Storage.HeapColumn.ColumnId"/>, never a
+/// position, which a column drop moves), the
 /// language LCID for tokenizer/stemmer selection, and an optional
 /// <c>TYPE COLUMN</c> id for varbinary/image columns that pair with a
 /// separate column carrying the document extension (e.g. <c>'.docx'</c>).

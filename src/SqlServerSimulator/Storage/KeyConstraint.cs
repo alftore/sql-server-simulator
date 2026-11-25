@@ -63,6 +63,21 @@ internal sealed class KeyConstraint(KeyConstraintKind kind, string name, int[] s
     public readonly int[] FullOrdinals = fullOrdinals;
 
     /// <summary>
+    /// Moves every position this key holds through the two maps, as a column
+    /// drop renumbers the columns; a key column without a storage slot keeps
+    /// its <c>-1</c>.
+    /// </summary>
+    public void RemapOrdinals(int[] storageMap, int[] fullMap)
+    {
+        for (var i = 0; i < this.StorageOrdinals.Length; i++)
+        {
+            if (this.StorageOrdinals[i] >= 0)
+                this.StorageOrdinals[i] = storageMap[this.StorageOrdinals[i]];
+            this.FullOrdinals[i] = fullMap[this.FullOrdinals[i]];
+        }
+    }
+
+    /// <summary>
     /// True when every key column has a storage slot, which is what the seek
     /// path reads keys through. False only for a key naming a non-persisted
     /// computed column, whose enforcement scans and evaluates instead.

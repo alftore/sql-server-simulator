@@ -364,7 +364,7 @@ partial class Simulation
         // Change tracking can't follow WRITETEXT / UPDATETEXT into a legacy
         // LOB column, which real warns about as the index is created.
         if (options.ChangeTracking != FullTextChangeTracking.Off
-            && columns.Exists(column => table.Columns[column.ColumnId - 1].Type is TextSqlType or NTextSqlType or ImageSqlType))
+            && columns.Exists(column => table.Columns[table.OrdinalOfColumnId(column.ColumnId)].Type is TextSqlType or NTextSqlType or ImageSqlType))
         {
             context.Connection.PendingMessages.Enqueue(SimulatedSqlException.FullTextLegacyLobTrackingMessage(context.Batch, tableName.ToString()));
         }
@@ -518,7 +518,7 @@ partial class Simulation
         foreach (var spec in specs)
         {
             var ordinal = ResolveColumnOrdinalForFullText(collation, table, spec.ColumnName, missingState);
-            var column = table.Columns[ordinal - 1];
+            var column = table.Columns[ordinal];
             var type = column.Type;
             var isDocument = type is ImageSqlType || (type is VarbinarySqlType && column.MaxLength == SqlType.MaxLengthSentinel);
             if (!isDocument && !(SqlType.IsCollatedString(type) || type is XmlSqlType))
@@ -527,21 +527,20 @@ partial class Simulation
                 throw SimulatedSqlException.FullTextTypeColumnRequired();
             if (!isDocument && spec.TypeColumnName is not null)
                 throw SimulatedSqlException.FullTextTypeColumnNotAllowed();
-            if (columns.Exists(c => c.ColumnId == ordinal) || existing.Exists(c => c.ColumnId == ordinal))
+            if (columns.Exists(c => c.ColumnId == column.ColumnId) || existing.Exists(c => c.ColumnId == column.ColumnId))
                 throw SimulatedSqlException.FullTextDuplicateColumn(column.Name);
             if (spec.StatisticalSemantics)
                 throw SimulatedSqlException.SemanticDatabaseNotRegistered();
             // A type column names a document's extension: a character column
             // of at most 260 characters (Msg 7671), its own name missing at the
             // next state up (probed 2026-10-05 against SQL Server 2025).
-            int? typeColumnId = spec.TypeColumnName is null ? null : ResolveColumnOrdinalForFullText(collation, table, spec.TypeColumnName, (byte)(missingState + 1));
-            if (typeColumnId is int typeOrdinal
-                && table.Columns[typeOrdinal - 1] is var typeColumn
+            var typeColumn = spec.TypeColumnName is null ? null : table.Columns[ResolveColumnOrdinalForFullText(collation, table, spec.TypeColumnName, (byte)(missingState + 1))];
+            if (typeColumn is not null
                 && (!SqlType.IsCollatedString(typeColumn.Type) || typeColumn.MaxLength is not (> 0 and <= 260)))
             {
                 throw SimulatedSqlException.FullTextTypeColumnInvalid(typeColumn.Name);
             }
-            columns.Add(new FullTextIndexColumn(ordinal, spec.LanguageId, typeColumnId));
+            columns.Add(new FullTextIndexColumn(column.ColumnId, spec.LanguageId, typeColumn?.ColumnId));
         }
         return columns;
     }
@@ -551,7 +550,7 @@ partial class Simulation
         for (var i = 0; i < table.Columns.Length; i++)
         {
             if (collation.Equals(table.Columns[i].Name, columnName))
-                return i + 1;
+                return i;
         }
         throw SimulatedSqlException.IndexColumnMissing(columnName, missingState);
     }
