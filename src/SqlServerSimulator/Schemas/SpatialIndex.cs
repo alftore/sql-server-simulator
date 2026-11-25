@@ -17,7 +17,7 @@ internal sealed class SpatialIndex(
     int objectId,
     string name,
     int indexId,
-    int columnOrdinal,
+    int columnId,
     SpatialIndexKind kind,
     string tessellationScheme,
     double? boundingBoxXmin,
@@ -36,8 +36,8 @@ internal sealed class SpatialIndex(
     public readonly string Name = name;
     public readonly int IndexId = indexId;
 
-    /// <summary>1-based column ordinal (matches real SQL Server's <c>column_id</c>).</summary>
-    public readonly int ColumnOrdinal = columnOrdinal;
+    /// <summary>The indexed column's <c>column_id</c> (<see cref="Storage.HeapColumn.ColumnId"/>), which a column drop leaves alone.</summary>
+    public readonly int ColumnId = columnId;
 
     /// <summary>
     /// Discriminator that picks geography-vs-geometry tessellation. Real SQL

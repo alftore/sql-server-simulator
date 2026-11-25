@@ -192,7 +192,7 @@ partial class Selection
         var spatial = table.SpatialIndexes.Find(candidate => arguments.Exists(argument => argument.Name is { } name ? collation.Equals(candidate.Name, name) : argument.Id == candidate.IndexId));
         if (spatial is null)
             return null;
-        var probe = new ForceSeekProbe(batch, source, index, sources, [spatial.ColumnOrdinal - 1]);
+        var probe = new ForceSeekProbe(batch, source, index, sources, [table.OrdinalOfColumnId(spatial.ColumnId)]);
         byte? refusal = null;
         foreach (var conjunct in conjuncts)
         {
@@ -223,7 +223,7 @@ partial class Selection
         {
             if (!NamedByIndexHint(batch, hints, spatial.Name, spatial.IndexId))
                 continue;
-            var probe = new ForceSeekProbe(batch, source, index, sources, [spatial.ColumnOrdinal - 1]);
+            var probe = new ForceSeekProbe(batch, source, index, sources, [table.OrdinalOfColumnId(spatial.ColumnId)]);
             if (conjuncts.Exists(conjunct => SpatialConjunctVerdict(conjunct, probe) == 0))
                 return true;
         }

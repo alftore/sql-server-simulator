@@ -302,6 +302,21 @@ internal sealed class Heap(bool sessionPrivate = false)
     public long LastRowCountChangeGeneration;
 
     /// <summary>
+    /// Takes the counters up where <paramref name="replaced"/>'s stand, this
+    /// heap holding its rows rewritten, or as they stood before a rewrite that
+    /// rolled back: the statistics of the table compare what they saved of one
+    /// heap's counters with the next one's. The generation still moves, for
+    /// whoever asks whether the rows did.
+    /// </summary>
+    public void ContinueCounters(Heap replaced)
+    {
+        using var latch = this.EnterLatch();
+        this.MutationGeneration = Math.Max(this.MutationGeneration, replaced.MutationGeneration) + 1;
+        this.LastRowCountChangeGeneration = replaced.LastRowCountChangeGeneration;
+        this.RowModifications = replaced.RowModifications;
+    }
+
+    /// <summary>
     /// Every visible row inserted or deleted, the half of a statistic's
     /// modification count every column shares (see
     /// <see cref="HeapTable.ModificationCount"/>). Advanced under the latch;

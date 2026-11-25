@@ -276,10 +276,10 @@ partial class Simulation
         var ids = new HashSet<int>();
         foreach (var name in names)
         {
-            var ordinal = ResolveColumnOrdinalForFullText(context.Batch.CurrentDatabase.Collation, table, name, missingState: 5);
-            if (!index.Columns.Exists(c => c.ColumnId == ordinal))
-                throw SimulatedSqlException.FullTextDdlColumnNotIndexed(table.Columns[ordinal - 1].Name);
-            _ = ids.Add(ordinal);
+            var column = table.Columns[ResolveColumnOrdinalForFullText(context.Batch.CurrentDatabase.Collation, table, name, missingState: 5)];
+            if (!index.Columns.Exists(c => c.ColumnId == column.ColumnId))
+                throw SimulatedSqlException.FullTextDdlColumnNotIndexed(column.Name);
+            _ = ids.Add(column.ColumnId);
         }
         return ids;
     }

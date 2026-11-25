@@ -73,9 +73,9 @@ internal sealed class Index(
     /// Materialized once here so the per-row uniqueness seek doesn't rebuild it
     /// out of <see cref="KeyColumns"/> on every inserted or updated row.
     /// Mutable for the same reason <c>KeyConstraint.StorageOrdinals</c> is:
-    /// <c>ALTER TABLE … DROP COLUMN</c> shifts every later storage slot down and
-    /// remaps both in place, in one loop, so this can't drift from
-    /// <see cref="KeyColumns"/>.
+    /// <c>ALTER TABLE … DROP COLUMN</c> shifts every later storage slot down,
+    /// and <see cref="RemapOrdinals"/> moves every array here in place, so none
+    /// can drift from <see cref="KeyColumns"/>.
     /// </summary>
     public readonly int[] KeyStorageOrdinals = BuildKeyStorageOrdinals(keyColumns);
 
@@ -298,6 +298,59 @@ internal sealed class Index(
     /// which a rebuild may change — <c>sys.partitions.data_compression</c>.
     /// </summary>
     public bool ColumnstoreArchive = options.ColumnstoreArchive ?? false;
+
+    /// <summary>
+    /// Moves every position this index holds through the two maps, as a column
+    /// drop renumbers the columns; a column without a storage slot keeps its
+    /// <c>-1</c>.
+    /// </summary>
+    public void RemapOrdinals(int[] storageMap, int[] fullMap)
+    {
+        for (var i = 0; i < this.KeyColumns.Length; i++)
+        {
+            var key = this.KeyColumns[i];
+            var storageOrdinal = key.StorageOrdinal < 0 ? key.StorageOrdinal : storageMap[key.StorageOrdinal];
+            var columnOrdinal = fullMap[key.ColumnOrdinal];
+            this.KeyColumns[i] = new IndexKeyColumn(storageOrdinal, columnOrdinal, key.IsDescending);
+            this.KeyStorageOrdinals[i] = storageOrdinal;
+            this.KeyFullOrdinals[i] = columnOrdinal;
+        }
+        for (var i = 0; i < this.IncludedColumns.Length; i++)
+        {
+            if (this.IncludedColumns[i] >= 0)
+                this.IncludedColumns[i] = storageMap[this.IncludedColumns[i]];
+            this.IncludedColumnOrdinals[i] = fullMap[this.IncludedColumnOrdinals[i]];
+        }
+        for (var i = 0; i < this.ColumnstoreOrder.Length; i++)
+            this.ColumnstoreOrder[i] = fullMap[this.ColumnstoreOrder[i]];
+    }
+
+    /// <summary>A copy of every position this index holds, for <see cref="RestoreOrdinals"/>.</summary>
+    public SavedOrdinals SaveOrdinals() => new(
+        [.. this.KeyColumns], [.. this.IncludedColumns], [.. this.IncludedColumnOrdinals], [.. this.ColumnstoreOrder]);
+
+    /// <summary>Puts back the positions <paramref name="saved"/> copied, as a rolled-back column drop does.</summary>
+    public void RestoreOrdinals(SavedOrdinals saved)
+    {
+        saved.KeyColumns.CopyTo(this.KeyColumns, 0);
+        for (var i = 0; i < saved.KeyColumns.Length; i++)
+        {
+            this.KeyStorageOrdinals[i] = saved.KeyColumns[i].StorageOrdinal;
+            this.KeyFullOrdinals[i] = saved.KeyColumns[i].ColumnOrdinal;
+        }
+        saved.IncludedColumns.CopyTo(this.IncludedColumns, 0);
+        saved.IncludedColumnOrdinals.CopyTo(this.IncludedColumnOrdinals, 0);
+        saved.ColumnstoreOrder.CopyTo(this.ColumnstoreOrder, 0);
+    }
+
+    /// <summary>The positions <see cref="SaveOrdinals"/> copied.</summary>
+    public readonly struct SavedOrdinals(IndexKeyColumn[] keyColumns, int[] includedColumns, int[] includedColumnOrdinals, int[] columnstoreOrder)
+    {
+        public readonly IndexKeyColumn[] KeyColumns = keyColumns;
+        public readonly int[] IncludedColumns = includedColumns;
+        public readonly int[] IncludedColumnOrdinals = includedColumnOrdinals;
+        public readonly int[] ColumnstoreOrder = columnstoreOrder;
+    }
 
     private static int[] BuildKeyFullOrdinals(IndexKeyColumn[] keyColumns)
     {

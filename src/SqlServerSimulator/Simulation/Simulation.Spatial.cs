@@ -200,7 +200,7 @@ partial class Simulation
         foreach (var existing in table.SpatialIndexes)
             indexId = Math.Max(indexId, existing.IndexId + 1);
         var created = new SpatialIndex(
-            objectId, indexName, replaced?.IndexId ?? indexId, colOrdinal + 1, kind, scheme,
+            objectId, indexName, replaced?.IndexId ?? indexId, table.Columns[colOrdinal].ColumnId, kind, scheme,
             options.BoundingBox?[0], options.BoundingBox?[1], options.BoundingBox?[2], options.BoundingBox?[3],
             levels?[0], levels?[1], levels?[2], levels?[3],
             cellsPerObject);

@@ -144,6 +144,9 @@ internal sealed class HeapTable : SchemaObject
         }
     }
 
+    /// <summary>The position in <see cref="Columns"/> of the column <paramref name="columnId"/> names, or <c>-1</c> when the table has none.</summary>
+    public int OrdinalOfColumnId(int columnId) => Array.FindIndex(this.Columns, column => column.ColumnId == columnId);
+
     /// <summary>
     /// Highest <see cref="HeapColumn.ColumnId"/> ever handed out for this
     /// table — <c>sys.tables.max_column_id_used</c>. Monotonic: dropping a
@@ -327,6 +330,12 @@ internal sealed class HeapTable : SchemaObject
                 storageOrdinals[i] = -1;
             }
         }
+        // A group copies its key's slots and column types. A change of layout
+        // holds Sch-M, so any lock in one is the changing session's own, and it
+        // is released through its own resource; DDL that leaves the layout
+        // alone can run beside another session's key locks, and keeps them.
+        if (!this.StoredColumns.AsSpan().SequenceEqual(storedColumns))
+            this.KeyLockGroups.Clear();
         this.StoredColumns = storedColumns;
         this.Schema = schema;
         this.StorageOrdinals = storageOrdinals;
@@ -338,13 +347,16 @@ internal sealed class HeapTable : SchemaObject
     /// Swaps in <paramref name="heap"/>, whose rows an <c>ALTER TABLE</c> wrote
     /// under <paramref name="storedColumns"/>, which become its
     /// <see cref="Heap.ReclaimColumns"/>; the heap it replaces keeps its own,
-    /// for a rollback that puts it back. The images of rows the transaction
+    /// for a rollback that puts it back. The counters carry on from the heap
+    /// replaced, as rewriting a row is no modification of it
+    /// (<see cref="Heap.ContinueCounters"/>). The images of rows the transaction
     /// deleted (<see cref="SupersededKeyImages"/>) go: they name slots of the
     /// heap replaced, and its Sch-M keeps every other session's out.
     /// </summary>
     public void AdoptHeap(Heap heap, HeapColumn[] storedColumns)
     {
         heap.ReclaimColumns = HasOffRowCapableColumn(storedColumns) ? storedColumns : null;
+        heap.ContinueCounters(this.Heap);
         this.Heap = heap;
         this.SupersededKeyImages.Clear();
     }
@@ -854,6 +866,50 @@ internal sealed class HeapTable : SchemaObject
             if (ordinal >= 0 && ordinal < updated.Length)
                 updated[ordinal] = this.Heap.MutationGeneration;
         }
+    }
+
+    /// <summary>The per-column counters, which a column's position indexes.</summary>
+    public readonly struct ColumnCounters(long[]? modifications, long[]? updatedAt)
+    {
+        public readonly long[]? Modifications = modifications;
+        public readonly long[]? UpdatedAt = updatedAt;
+    }
+
+    /// <summary>The per-column counters as they stand, which a column drop replaces rather than edits.</summary>
+    public ColumnCounters Counters => new(this.columnModifications, this.columnUpdatedAt);
+
+    /// <summary>Moves the per-column counters from <paramref name="from"/>'s positions to <paramref name="to"/>'s.</summary>
+    public void MoveColumnCounters(HeapColumn[] from, HeapColumn[] to)
+    {
+        this.columnModifications = Moved(this.columnModifications, from, to, null);
+        this.columnUpdatedAt = Moved(this.columnUpdatedAt, from, to, null);
+    }
+
+    /// <summary>
+    /// Moves the per-column counters back to the positions of
+    /// <paramref name="columns"/>, a column that had gone taking up its count
+    /// in <paramref name="saved"/>.
+    /// </summary>
+    public void RestoreColumnCounters(ColumnCounters saved, HeapColumn[] columns)
+    {
+        this.columnModifications = Moved(this.columnModifications, this.Columns, columns, saved.Modifications);
+        this.columnUpdatedAt = Moved(this.columnUpdatedAt, this.Columns, columns, saved.UpdatedAt);
+    }
+
+    private static long[]? Moved(long[]? counts, HeapColumn[] from, HeapColumn[] to, long[]? otherwise)
+    {
+        if (counts is null && otherwise is null)
+            return null;
+        var moved = new long[to.Length];
+        for (var i = 0; i < to.Length; i++)
+        {
+            var at = Array.FindIndex(from, column => column.ColumnId == to[i].ColumnId);
+            var source = at < 0 ? otherwise : counts;
+            var position = at < 0 ? i : at;
+            if (source is not null && position < source.Length)
+                moved[i] = source[position];
+        }
+        return moved;
     }
 
     /// <summary>

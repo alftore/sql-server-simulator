@@ -467,7 +467,7 @@ partial class Simulation
         {
             throw SimulatedSqlException.IndexAlreadyExists(indexName, writtenTable, state: 201).AbortingAsUnderXactAbort();
         }
-        else if (isPrimary && table.XmlIndexes.Find(existing => existing.IsPrimary && existing.ColumnOrdinal == ordinal) is { } columnPrimary)
+        else if (isPrimary && table.XmlIndexes.Find(existing => existing.IsPrimary && existing.ColumnId == table.Columns[ordinal].ColumnId) is { } columnPrimary)
         {
             throw SimulatedSqlException.SecondPrimaryXmlIndex(columnPrimary.Name, table.Columns[ordinal].Name, writtenTable).AbortingAsUnderXactAbort();
         }
@@ -516,7 +516,7 @@ partial class Simulation
             nextIndexId = Math.Max(nextIndexId, existing.IndexId + 1);
         var index = new XmlIndex(
             indexName,
-            ordinal,
+            table.Columns[ordinal].ColumnId,
             isPrimary,
             usingPrimaryName,
             secondaryType,
@@ -777,7 +777,7 @@ partial class Simulation
 /// </summary>
 internal sealed class XmlIndex(
     string name,
-    int columnOrdinal,
+    int columnId,
     bool isPrimary,
     string? usingPrimaryIndexName,
     XmlSecondaryIndexType? secondaryType,
@@ -792,9 +792,8 @@ internal sealed class XmlIndex(
     /// internal table and its per-index statistics.</summary>
     public readonly int InternalTableObjectId = internalTableObjectId;
 
-    /// <summary>0-based column ordinal that the index targets. Translated
-    /// to 1-based <c>column_id</c> on the catalog-view surface.</summary>
-    public readonly int ColumnOrdinal = columnOrdinal;
+    /// <summary>The indexed column's <c>column_id</c> (<see cref="HeapColumn.ColumnId"/>), which a column drop leaves alone.</summary>
+    public readonly int ColumnId = columnId;
 
     public readonly bool IsPrimary = isPrimary;
 

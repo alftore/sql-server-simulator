@@ -43,10 +43,11 @@ internal sealed class FullTextBinding(HeapTable table, int[] columnOrdinals, Mul
     {
         if (this.Table.FullTextIndex is { } index)
         {
+            var columnId = this.Table.Columns[this.ColumnOrdinals[c]].ColumnId;
             foreach (var column in index.Columns)
             {
-                if (column.ColumnId == this.ColumnOrdinals[c] + 1)
-                    return column.TypeColumnId is int typeColumnId ? typeColumnId - 1 : -1;
+                if (column.ColumnId == columnId)
+                    return column.TypeColumnId is int typeColumnId ? this.Table.OrdinalOfColumnId(typeColumnId) : -1;
             }
         }
         return -1;
@@ -369,15 +370,15 @@ internal static class FullTextColumnSpec
         List<MultiPartName?> typeNames = [];
         List<FullTextLanguage> languages = [];
         MultiPartName? TypeColumnName(Schemas.FullTextIndexColumn column, string? columnQualifier) =>
-            column.TypeColumnId is int typeColumnId && typeColumnId - 1 < table.Columns.Length
-                ? Qualify(columnQualifier, table.Columns[typeColumnId - 1].Name)
+            column.TypeColumnId is int typeColumnId && table.OrdinalOfColumnId(typeColumnId) is >= 0 and var typeOrdinal
+                ? Qualify(columnQualifier, table.Columns[typeOrdinal].Name)
                 : null;
         if (spec.AllColumns)
         {
             foreach (var column in index.Columns)
             {
-                var ordinal = column.ColumnId - 1;
-                if (ordinal < 0 || ordinal >= table.Columns.Length)
+                var ordinal = table.OrdinalOfColumnId(column.ColumnId);
+                if (ordinal < 0)
                     continue;
                 ordinals.Add(ordinal);
                 names.Add(Qualify(qualifier, table.Columns[ordinal].Name));
@@ -403,7 +404,7 @@ internal static class FullTextColumnSpec
                 Schemas.FullTextIndexColumn? indexed = null;
                 foreach (var column in index.Columns)
                 {
-                    if (column.ColumnId == ordinal + 1)
+                    if (column.ColumnId == table.Columns[ordinal].ColumnId)
                     {
                         indexed = column;
                         break;

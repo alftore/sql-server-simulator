@@ -13,8 +13,9 @@ namespace SqlServerSimulator.Storage;
 /// column change builds a fresh <see cref="Heap"/> and column array and swaps
 /// them in, so holding the old references is enough to restore the rows. What
 /// they do mutate in place — names, the disabled / untrusted flags, a
-/// column's default, the constraint and index lists — is copied value by
-/// value.
+/// column's default, the constraint and index lists, the column positions a
+/// key, an index and this table's end of a foreign key hold — is copied value
+/// by value.
 /// </remarks>
 internal sealed class HeapTableSnapshot
 {
@@ -38,15 +39,21 @@ internal sealed class HeapTableSnapshot
     private readonly FullTextIndex? fullTextIndex;
     private readonly TableChangeTracking? changeTracking;
     private readonly KeyConstraint[] keyConstraints;
-    private readonly (string Name, bool IsDisabled, StorageOptions Options)[] keyState;
+    private readonly (string Name, bool IsDisabled, StorageOptions Options, int[] StorageOrdinals, int[] FullOrdinals)[] keyState;
     private readonly CheckConstraint[] checkConstraints;
     private readonly (string Name, bool IsNotTrusted, bool IsDisabled, string? Definition, bool IsSystemNamed)[] checkState;
     private readonly ForeignKey[] outgoingForeignKeys;
     private readonly ForeignKey[] incomingForeignKeys;
+
+    // This table's own end of each; the other end is the other table's, which
+    // a statement changing it snapshots.
+    private readonly int[][] outgoingOrdinals;
+    private readonly int[][] incomingOrdinals;
     private readonly (ForeignKey Key, string Name, bool IsNotTrusted, bool IsDisabled)[] foreignKeyState;
     private readonly Index[] indexes;
-    private readonly (string Name, bool IgnoreDupKey, bool IsDisabled, StorageOptions Options, int CompressionDelay, bool ColumnstoreArchive)[] indexState;
+    private readonly (string Name, bool IgnoreDupKey, bool IsDisabled, StorageOptions Options, int CompressionDelay, bool ColumnstoreArchive, Index.SavedOrdinals Ordinals)[] indexState;
     private readonly UserStatistic[] userStatistics;
+    private readonly HeapTable.ColumnCounters columnCounters;
     private readonly XmlIndex[] xmlIndexes;
     private readonly SpatialIndex[] spatialIndexes;
     private readonly JsonIndex[] jsonIndexes;
@@ -83,16 +90,19 @@ internal sealed class HeapTableSnapshot
         this.fullTextIndex = table.FullTextIndex;
         this.changeTracking = table.ChangeTracking;
         this.keyConstraints = [.. table.KeyConstraints];
-        this.keyState = Array.ConvertAll(this.keyConstraints, key => (key.Name, key.IsDisabled, StorageOptions.Of(key)));
+        this.keyState = Array.ConvertAll(this.keyConstraints, key => (key.Name, key.IsDisabled, StorageOptions.Of(key), (int[])[.. key.StorageOrdinals], (int[])[.. key.FullOrdinals]));
         this.checkConstraints = [.. table.CheckConstraints];
         this.checkState = Array.ConvertAll(this.checkConstraints, check => (check.Name, check.IsNotTrusted, check.IsDisabled, check.Definition, check.IsSystemNamed));
         this.outgoingForeignKeys = [.. table.OutgoingForeignKeys];
         this.incomingForeignKeys = [.. table.IncomingForeignKeys];
+        this.outgoingOrdinals = Array.ConvertAll(this.outgoingForeignKeys, static key => (int[])[.. key.ChildColumnOrdinals]);
+        this.incomingOrdinals = Array.ConvertAll(this.incomingForeignKeys, static key => (int[])[.. key.ReferencedColumnOrdinals]);
         this.foreignKeyState = [.. this.outgoingForeignKeys.Concat(this.incomingForeignKeys).Distinct()
             .Select(key => (key, key.Name, key.IsNotTrusted, key.IsDisabled))];
         this.indexes = [.. table.Indexes];
-        this.indexState = Array.ConvertAll(this.indexes, index => (index.Name, index.IgnoreDupKey, index.IsDisabled, StorageOptions.Of(index), index.CompressionDelay, index.ColumnstoreArchive));
+        this.indexState = Array.ConvertAll(this.indexes, index => (index.Name, index.IgnoreDupKey, index.IsDisabled, StorageOptions.Of(index), index.CompressionDelay, index.ColumnstoreArchive, index.SaveOrdinals()));
         this.userStatistics = [.. table.UserStatistics];
+        this.columnCounters = table.Counters;
         this.xmlIndexes = [.. table.XmlIndexes];
         this.spatialIndexes = [.. table.SpatialIndexes];
         this.jsonIndexes = [.. table.JsonIndexes];
@@ -120,6 +130,7 @@ internal sealed class HeapTableSnapshot
         table.FilegroupId = this.filegroupId;
         table.LobFilegroupId = this.lobFilegroupId;
         table.MaxColumnIdUsed = this.maxColumnIdUsed;
+        table.RestoreColumnCounters(this.columnCounters, this.columns);
         table.Columns = this.columns;
         for (var i = 0; i < this.columns.Length; i++)
         {
@@ -134,6 +145,8 @@ internal sealed class HeapTableSnapshot
             if (state.DefaultConstraint is { } defaultConstraint)
                 defaultConstraint.Name = state.DefaultName!;
         }
+        if (!ReferenceEquals(this.heap, table.Heap))
+            this.heap.ContinueCounters(table.Heap);
         table.Heap = this.heap;
         table.RecomputeStorageProjections();
         // A heap the change kept, being empty, took the new layout, and rows
@@ -153,8 +166,10 @@ internal sealed class HeapTableSnapshot
         for (var i = 0; i < this.keyConstraints.Length; i++)
         {
             var key = this.keyConstraints[i];
-            (key.Name, key.IsDisabled, var options) = this.keyState[i];
+            (key.Name, key.IsDisabled, var options, var storageOrdinals, var fullOrdinals) = this.keyState[i];
             options.RestoreTo(key);
+            storageOrdinals.CopyTo(key.StorageOrdinals, 0);
+            fullOrdinals.CopyTo(key.FullOrdinals, 0);
         }
         Refill(table.CheckConstraints, this.checkConstraints);
         for (var i = 0; i < this.checkConstraints.Length; i++)
@@ -180,6 +195,10 @@ internal sealed class HeapTableSnapshot
                 dropped.ChildTable.OutgoingForeignKeys.Add(dropped);
         }
         Refill(table.IncomingForeignKeys, this.incomingForeignKeys);
+        for (var i = 0; i < this.outgoingForeignKeys.Length; i++)
+            this.outgoingOrdinals[i].CopyTo(this.outgoingForeignKeys[i].ChildColumnOrdinals, 0);
+        for (var i = 0; i < this.incomingForeignKeys.Length; i++)
+            this.incomingOrdinals[i].CopyTo(this.incomingForeignKeys[i].ReferencedColumnOrdinals, 0);
         foreach (var (key, keyName, isNotTrusted, isDisabled) in this.foreignKeyState)
             (key.Name, key.IsNotTrusted, key.IsDisabled) = (keyName, isNotTrusted, isDisabled);
 
@@ -187,8 +206,9 @@ internal sealed class HeapTableSnapshot
         for (var i = 0; i < this.indexes.Length; i++)
         {
             var index = this.indexes[i];
-            (index.Name, index.IgnoreDupKey, index.IsDisabled, var options, index.CompressionDelay, index.ColumnstoreArchive) = this.indexState[i];
+            (index.Name, index.IgnoreDupKey, index.IsDisabled, var options, index.CompressionDelay, index.ColumnstoreArchive, var ordinals) = this.indexState[i];
             options.RestoreTo(index);
+            index.RestoreOrdinals(ordinals);
         }
         table.UserStatistics = [.. this.userStatistics];
         Refill(table.XmlIndexes, this.xmlIndexes);
